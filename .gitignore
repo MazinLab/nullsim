@@ -1,0 +1,95 @@
+# Agent / editor tooling state (per-machine, not part of the package)
+CLAUDE.md
+AGENTS.md
+.claude/
+.serena/
+
+# Per-developer ephemeral agent memory (regenerated every SDK run)
+**/notes/*_short_term.md
+
+# Pipeline cache (regenerated on demand)
+.nullsim_cache/
+results/
+
+# Test outputs (diagnostic plots, etc. — reproducible from tests)
+tests/output/
+/docs
+
+# Python bytecode + packaging artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+*.egg
+
+# Lint / type / test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Virtualenvs
+.env
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Phasing paper (local working dir, not tracked)
+phasingpaper/
+
+# Work-package checkpoint logs (build artifacts, not source)
+*_last.txt
+
+# Code-review reports (local working notes, not source)
+reviews/
+
+# Internal dev-workflow tooling (Claude Code / build pipeline; not part of the
+# published package, and references gitignored .claude/spec state).
+scripts/data_registry.py
+scripts/pipeline_graph.py
+scripts/render_fragments.py
+scripts/sync_derived_docs.py
+scripts/update_agent_state.py
+scripts/bootstrap_claude_workflow.sh
+scripts/verify_installation.sh
+
+# Local research/tuning scratch configs under examples/test/ — keep only the
+# documented and test-referenced examples; ignore the iteration sprawl.
+examples/test/*
+!examples/test/vertical_slice.toml
+!examples/test/kilo_maunakea.toml
+!examples/test/nayra_eelt_baseline.toml
+!examples/test/detection_space_example.toml
+!examples/test/mkid_native_spectro.toml
+!examples/test/kilo_vs_hwo_study.toml
+!examples/test/kilo_keck_quadrature_mesh.toml
+# Test fixtures: loaded by tests/examples/test_kilo_keck_quadrature_mesh.py
+# and tests/examples/test_kilo_keck_config.py.
+!examples/test/kilo_keck_6.toml
+!examples/test/kilo_keck_6_joint_crlb.toml

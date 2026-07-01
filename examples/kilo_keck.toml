@@ -1,0 +1,735 @@
+# SPEC §15.5 KILO Keck-only paper-baseline reference config.
+#
+# Two Keck telescopes (Keck I + Keck II) sharing a single Mauna Kea
+# enclosure, ~86.6 m inter-telescope baseline. N=12 sub-apertures per
+# Keck → 24 input modes → 276-MZI Clements mesh (576 real parameters).
+# This is the paper's primary Keck-only design: enough mesh DOFs to
+# support a 3rd-order kernel null (G(r) ~ r^6 near origin) suppressing
+# resolved-stellar-disk leakage well below 1e-5 at 1 mas.
+#
+# Source: kilo/config.py
+#         maunakea_telescopes() + keck_only_config() (KILO HEAD 47607de).
+#
+# Atmosphere defaults are the Q1-night MASS-cut Mauna Kea values
+# (r0_500nm=0.15 m, tau0=2.83 ms, v_wind=10 m/s) per Kornilov et al. 2012
+# and the KILO reference paper.
+#
+# Known KILO-physics gaps not yet ported (see task list):
+#   * Kernel-null field stack — KILO optimizes on a 6-row stack
+#     (on-axis stellar + 5 angular-derivative samples, order=3) so the
+#     null is BROAD (G(r) ~ r^6 near origin). nullsim's chip_optimizer
+#     today only nulls the on-axis field, so resolved-stellar-disk
+#     leakage at 1 mas is not suppressed below the chip's flat null.
+#   * Sub-sampled optimization wavelengths — KILO optimizes on
+#     n_wl_broadband=5 wavelengths and evaluates post-hoc at 41.
+#     nullsim optimizes on the full 20-bin grid, ~4x slower than KILO.
+#   * KILO's separate "spectro" port is now represented explicitly in
+#     nullsim as 5 bright + 18 dark + 1 spectro for this Keck baseline.
+
+[run]
+name = "kilo_keck"
+description = "KILO Keck-only paper baseline: Keck I + Keck II, N=12 sub-apertures."
+seed = 1
+
+[site]
+preset = "maunakea_site"
+
+[site.atmosphere]
+# KILO Q1-night MASS-cut Mauna Kea values. These override the generic
+# Maunakea preset and are materialized into the atmosphere, AO, and
+# fringe-tracking stages.
+r0_500nm_m = 0.15
+L0_m = 25.0
+wind_speed_m_s = 10.0
+tau0_500nm_s = 2.83e-3
+theta0_500nm_arcsec = 1.19
+atmospheric_transmission = 0.93
+
+[telescope]
+preset = "keck_telescope"
+n_apertures = 2
+
+[telescope.aperture]
+# Keck primary central obstruction ratio epsilon = 2.4 m / 10 m = 0.24.
+obscuration_fraction = 0.24
+central_obstruction_diameter_m = 2.4
+
+[telescope.optics]
+# Four-mirror Keck Nasmyth path plus the AO-bench science arm.
+mirror_transmission = 0.80
+ao_bench_transmission = 0.85
+
+[instrument]
+# 24 physical guided modes duplicated before the chip into 48 Clements inputs.
+# Output ports are ordered [bright tracker | dark science | spectro].
+n_modes = 48
+n_input_modes = 24
+n_bright_ports = 24
+n_dark_ports = 23
+n_spectro_ports = 1
+
+[grid]
+# J-band, 1.25 µm center × 0.15 µm bandwidth, 20 bins (KILO default).
+wavelength_center_um = 1.25
+wavelength_bandwidth_um = 0.15
+n_wavelength_bins = 20
+
+[scene.star]
+# KILO ObservationConfig default: J=4 host (e.g. a bright nearby M-dwarf).
+jmag = 4.0
+spectral_type = "M"
+angular_diameter_mas = 1.0
+distance_pc = 5.0
+
+[scene.planet]
+# KILO ObservationConfig defaults: contrast 1e-6 at 10 mas separation.
+contrast = 1.0e-6
+separation_mas = 10.0
+position_angle_deg = 0.0
+
+# exozodi: only consumed by background.space_zodi (HWO path); not modeled for
+# ground configs.
+
+[observation]
+hour_angle_h = 0.0
+# Tier 4.1: KILO paperv3 headline numbers (Y/J/H null-depth tables and
+# the contrast-curve panels in figures/) are at 4 h on-source. The
+# previous 1 h value gave contrast curves 2× worse in σ than the
+# paperv3 baseline.
+integration_time_s = 14400.0
+
+# ------------------------------------------------------------------
+# Pipeline
+# ------------------------------------------------------------------
+
+[[pipeline.stages]]
+id = "scene"
+type = "scene.point_source"
+# KILO ``DEFAULT_OBSERVATION_ALTITUDE_DEG = 60.0`` (kilo/transport.py
+# L654) — the paperv3 detection_space study runs off-zenith at airmass
+# 1.155 to model the realistic delay-line throughput / airmass scaling.
+# KILO_PARITY_PLAN §4.1; set 90.0 only for the original at-zenith
+# sanity run.
+altitude_deg = 60.0
+azimuth_deg = 0.0
+
+# Two Keck telescopes, manual ENU layout. Diameter, aperture count,
+# obstruction, mirror transmission, and AO-bench throughput come from
+# the [telescope] section above. These are KILO's geodetic-to-local-ENU
+# coordinates for Keck I/II relative to the two-telescope centroid
+# (kilo.array.telescope_enu_positions).
+# The baseline length is 86.62 m; importantly, it is not an east-west-only
+# surrogate. The kernel-null optimizer uses the x/y sub-aperture coordinates
+# directly in its derivative rows, so the orientation changes BFGS basins.
+[[pipeline.stages]]
+id = "array"
+type = "telescope.fixed_aperture"
+array_layout = "manual"
+aperture_positions_enu_m_explicit = [
+  [-26.8258640, -34.0022240, 0.0],
+  [ 26.8258640,  34.0022240, 0.0],
+]
+
+# Mauna Kea median atmosphere; values come from [site.atmosphere].
+[[pipeline.stages]]
+id = "atmosphere"
+type = "atmosphere.kolmogorov"
+
+# HAKA-class pyramid WFS on each Keck: 3000 actuators, 2 kHz loop, 50
+# sub-apertures across the 10 m primary.
+#
+# Sub-aperture diameter is *derived* from the Keck pupil geometry:
+# nullsim.physics.pupil_geometry.optimize_subaperture_positions packs 12
+# non-overlapping sub-apertures inside the hexagonal primary (10.95 m
+# corner-to-corner), avoiding the 2.4 m central obstruction and the six
+# spider vanes. This yields d_sub ≈ 1.929 m for Keck N=12, matching
+# KILO's keck_only_config to ~1 mm. The naive D/sqrt(N) ≈ 2.89 m would
+# ignore the obstruction and hex constraints.
+[[pipeline.stages]]
+id = "ao"
+type = "ao.pyramid_wfs"
+n_subapertures_per_aperture = 12
+pupil_template = "keck"
+# KILO_PARITY_PLAN §2.6: KILO Keck uses
+# ``n_across = int(sqrt(3000)) = 54`` → 54² = 2916 effective actuators.
+# nullsim's strict-square constraint maps this to n_actuators = 2916
+# (vs the pre-Phase-2 ``round(sqrt(3000))² = 3025``); ~3% fitting-error
+# and ~1.5% piston-OPD effect compared to the over-counted default.
+n_actuators = 2916
+# Natural-guide-star mode: the host star IS the WFS reference star, so
+# guide-star R magnitude tracks scene.star.jmag across the sweep. Use a
+# mid-M R-J color instead of the package's early-M generic color so the
+# faint end is not over-optimistic.
+derive_r_mag_from_scene_jmag = true
+r_minus_j_offset = 3.0
+excess_noise_sq = 1.0
+readout_noise_e_rms = 0.0
+
+[[pipeline.stages]]
+id = "injection"
+type = "injection.ideal"
+# Input mode count comes from [instrument].n_input_modes.
+# Apply Strehl × η_opt × (1 − R_Fresnel) to the seeded field. KILO
+# convention (``kilo/injection.py:194-223``) — KILO_PARITY_PLAN §0.3.
+# The defaults match ``sensitivity.detection_curve``'s planet-leg
+# coupling so the contrast ratio cancels cleanly across the two paths.
+apply_strehl_coupling = true
+apply_fresnel_injection_loss = true
+# Review 2026-06-10 Issue 18: the photonic inputs are packed sub-apertures
+# that avoid the 2.4 m obstruction and spiders by construction (pupil
+# packing in ao.pyramid_wfs), so each sub-aperture is an UNOBSTRUCTED
+# circular pupil with the full Ruilier coupling limit 0.8145. Without this
+# pin the materializer copies the full-pupil epsilon=0.24 from
+# [telescope.aperture], depressing absolute photon rates ~14% (contrast
+# cancels, but FT photon noise / characterization SNR / integration times
+# do not).
+central_obscuration_ratio = 0.0
+
+# PM980-XP fiber transport. Keep the same residual fabrication-scale
+# mismatch constants used in the NAYRA baseline: 0.1 mm RMS length
+# matching plus 0.01 rad common-mode phase scatter. The length mismatch
+# makes the chip-diagnostics physical-input curve show the realistic
+# chromatic transport perturbation instead of exactly overlaying the
+# phase-stripped clean-input metric.
+[[pipeline.stages]]
+id = "transport"
+type = "transport.pm980"
+length_m = 100.0
+length_matching_error_m = 0.0001
+phi_rms_rad = 0.01
+
+# Geometric path equalization across the 86.6 m baseline.
+[[pipeline.stages]]
+id = "delay_lines"
+type = "delay_lines.geometric"
+max_delay_m = 90.0
+# Baseline the proposed J-band free-space coarse delay line as a fixed
+# 2 dB loss. The arm without active geometric delay carries a matching
+# fixed attenuator, so both arms see the same throughput.
+fixed_delay_line_loss_db_per_telescope = [2.0, 2.0]
+fixed_delay_line_loss_mode = "attenuator"
+
+# Tap a fixed fraction of each physical guided-mode input for fast
+# photometric amplitude sensing before the quadrature fanout. The stage applies
+# the remaining science fraction to the field amplitudes, so detector rates,
+# bright-port piston sensing, and science throughput all see the same debit.
+[[pipeline.stages]]
+id = "amplitude_pickoff"
+type = "transport.photometric_pickoff"
+tap_fraction = 0.30
+
+# Duplicate each physical sub-aperture input before the science chip so the
+# mesh can dedicate 24 bright tracker outputs to physical-piston sensing while
+# the remaining 23 dark ports + 1 spectro port preserve the science null.
+[[pipeline.stages]]
+id = "quadrature_split"
+type = "injection.mode_splitter"
+copies = 2
+
+# Chip optimizer dials in the 48-mode duplicated-input unitary; chip stage
+# consumes the result via optimization_source="auto".
+[[pipeline.stages]]
+id = "chip_opt"
+type = "chip_optimization.torch"
+torch_device = "auto"
+# Duplicated-input port allocation:
+# ``[bright tracker | dark science | spectro]`` with
+# ``24 + 23 + 1 == 48``. Bright ports feed the fringe-tracker diagnostic;
+# dark + spectro ports carry the kernel-null science constraints.
+wl_design_um = 1.25
+target_null_depth = 1.0e-6
+# KILO paperv3 budget for kernel_null kernel_order=3 broadband case:
+# maxiter=5000, n_restarts=5 (natural_design.py L432-433). Tier 3
+# switched both bootstrap and broadband to full-Hessian BFGS matching
+# KILO; the 15000/10 budget was a pre-tier overshoot, costing ~6× the
+# work per cell for no demonstrated improvement.
+max_iter = 5000
+# KILO ``KILO_BB_SEED`` default (natural_design.py:651). Drives the
+# master RNG that produces per-restart x0 inits; aligning here gives
+# nullsim a bit-identical restart-init sequence to KILO at apples-to-
+# apples settings.
+seed = 42
+n_restarts = 5
+# KILO_PARITY_PLAN §3.4: KILO ``KILO_BB_PATIENCE`` defaults to 0
+# (patience disabled). Override here only if you've validated that
+# 25% of broadband cells genuinely converge cleanly enough to bail
+# early on no-improvement; default 0 lets every restart run.
+restart_patience = 0
+# KILO_PARITY_PLAN §3.2 + §6.4: 16-bit DAC quantization on the
+# optimizer's deployed u_stack. Without this knob set here the chip
+# stage's ``dac_bits=16`` is ignored (Tier 3.1 pass-through path) and
+# the production null sees no quantization at all. KILO
+# ``ChipConfig.dac_bits`` defaults to 20 (``kilo/config.py:231``);
+# paperv3 ``chip_diagnostics.pdf`` was generated at 16 for the
+# keck_only study, so we pin 16 here to track that specific figure.
+# Bump to 20 (matching the KILO library default) when comparing
+# against newer KILO product runs.
+dac_bits = 16
+# Torch backend doesn't support nested process-pool fan-out (the
+# objective closures don't pickle through spawn); 1 worker per cell.
+# Outer sweep-cell pool [run].n_workers still fans out across cells.
+n_workers = 1
+capture_convergence_history = true
+# KILO paperv3 keck_only_config: 3rd-order kernel null on the M=24
+# mesh — broad null G(r) ~ r^6 near origin, suppresses resolved-
+# stellar-disk leakage below 1e-5 at 1 mas (kilo/studies/natural_design
+# .py L432: n_restarts=5, maxiter=5000, kernel_order=3 for keck-only).
+# Requires state.geometry.aperture_positions_pupil_m from upstream
+# pyramid_wfs stage (auto-populated when n_subapertures_per_aperture > 1).
+kernel_order = 3
+# torch.compile the autograd objective: bench_chip_optimizer.py on
+# Apple Silicon CPU at M=24 / n_wl=5 measured 26 ms/grad eager vs
+# 1.6 ms/grad compiled (~16× per-grad steady-state). With ~35,000
+# grad evals per cell (bootstrap 5×2000 + broadband 5×5000), end-to-
+# end goes from ~15 min to ~1 min. Cold-first tracing is ~30 s on a
+# truly empty Inductor cache, but PyTorch caches the compiled graph
+# to disk (~/.cache/torch/inductor), so the cost is paid once per
+# machine and amortized across every subsequent run.
+compile_objective = true
+# Sub-sample wavelengths for the broadband chip optimization (KILO
+# convention: n_wl_broadband=5 in natural_design.py L611). The full
+# 20-bin grid is still used downstream for detector photon-rate
+# accuracy; the chip's wavelength response is smooth enough that 5
+# uniformly-spaced samples capture the broadband optimum and 4x
+# fewer per-iter ops let the optimizer drive to a deeper basin.
+n_wl_optimize = 5
+# Match the downstream sensitivity.detection_curve azimuth averaging so the
+# chip is optimized against the same representative delay-line states that
+# realized-null reporting uses.
+delay_state_n_azimuths = 6
+# KILO paperv3 bootstrap restart count = 5 (natural_design.py L432,
+# also used by chip_torch.py optimize_null_broadband). Tier 3 switched
+# both bootstrap and broadband to full-Hessian BFGS; the basin
+# multi-modality argument that motivated 30 restarts predates the BFGS
+# switch. Re-evaluate at 5 to match KILO and see if BFGS finds the deep
+# basin reliably without the extra restarts.
+bootstrap_n_restarts = 5
+# KILO_BB_THROUGHPUT_PENALTY_ALPHA convention. The null-only objective
+# drives chip_ideal to ~1e-6 but at the cost of planet throughput (sharp
+# kernel-null collapses the signal at small separations; empirically run
+# #10 had planet_throughput @ 30 mas ≈ 0.006 vs KILO 0.35, giving a ~6×
+# penalty on contrast despite our DEEPER null). Adding KILO's
+# ``-alpha × <planet_throughput_at_rep_seps>`` to the bootstrap objective
+# reshapes the loss surface so the chip preserves throughput.
+# Default 1e-3 matches KILO's saturation regime. A 2026-05-21 knob
+# search over J=4/8/10 selected the [3, 10] mas anchor pair: it keeps
+# the bright-star improvement from the 3 mas penalty without the
+# J=8/J=10 regression seen in the over-weighted alpha=3e-3 basin.
+throughput_penalty_alpha = 1.0e-3
+throughput_penalty_seps_mas = [3.0, 10.0]
+# Tier 3.3: dropped from 5.0e-2 to KILO_BB_THROUGHPUT_PENALTY_ALPHA = 1e-3
+# (kilo/studies/natural_design.py:606). The penalty is now also applied
+# inside the broadband objective (not just the single-λ bootstrap), so
+# the previous 50× over-weighting is no longer needed to land on
+# KILO's balanced null/throughput basin.
+# Broadband refine is REQUIRED post-tier-3.1. KILO always runs broadband
+# refine when kernel_null and len(wl_grid)>1 (natural_design.py:654).
+# The pre-tier rationale for disabling ("drift from bootstrap basin") was
+# specific to the monochromatic-deployment path that tier 3.1 replaced:
+# the chip now uses the optimizer's actual chromatic u_stack at every
+# wavelength, so off-design leakage that bootstrap ignores gets fully
+# realized in the contrast curve. Tier 3 also moved the throughput
+# penalty INTO the broadband objective, so it no longer drifts toward
+# null-only basins at the expense of throughput.
+#
+# Without this the physics-only baseline (2026-05-17) lands at
+# chip_ideal ≈ 4e-2 across all J (single-λ bootstrap optimum leaking
+# at the 19 off-design bins) — 6 OOM shallower than KILO's ~1e-7.
+broadband_refine = true
+# Add explicit finite-disk optimizer rows on top of the inherited
+# kernel_order=3 rows. The baseline evaluates the disk floor downstream; the
+# M48 duplicated-input architecture also optimizes against representative
+# finite-disk leakage samples so the extra tracker degrees of freedom do not
+# come at the cost of resolved-host leakage.
+disk_n_rings = 3
+disk_n_azimuths = 4
+disk_weight = 1.0
+# Preserve useful physical-piston sensitivity in the 24 tracker outputs while
+# the dark/spectro outputs optimize the science null. The floor is on the
+# fractional bright-port intensity-response singular values per nm of physical
+# piston.
+tracker_observability_weight = 1.0e-3
+tracker_observability_min_singular_per_nm = 1.0e-3
+tracker_observability_n_spectral_channels = 1
+
+# 48-mode duplicated-input kernel MZI mesh. KILO Keck layout: 24 tracker
+# bright + 23 dark + 1 spectro. The spectro port stays explicitly
+# labeled downstream so planet-detection dark ports and high-res
+# spectro diagnostics do not get silently merged.
+[[pipeline.stages]]
+id = "chip"
+type = "chip.kernel_mzi_mesh"
+wl_design_um = 1.25
+optimization_source = "auto"
+# Tier 4.3: paperv3 ``chip_diagnostics.pdf``
+# was generated at 16-bit for the keck_only study. KILO
+# ``ChipConfig.dac_bits`` defaults to 20 (``kilo/config.py:231``); 20
+# bits is ~10² × deeper phase resolution than the paperv3 figure and
+# artificially lowers the quantization floor. Kept at 16 here for
+# consistency with the chip_optimization stage's setting so the deployed
+# u_stack matches.
+dac_bits = 16
+# Realistic photonic-chip fabrication insertion loss (waveguide
+# propagation + fiber-to-chip coupling + MMI/MZI internal losses).
+# Applied wavelength-flat post-unitary; ratio-preserving so the chip
+# unitary's null depth is unchanged, but absolute throughput drops by
+# t = 10**(-2/10) ≈ 0.631× and integration time scales by 1/t ≈ 1.585×.
+# The previous `= 0.0` pin tracked the KILO paperv3 detection-space
+# references (lossless chip); see CHANGELOG for the 2026-05-19 flip.
+insertion_loss_db = -2.0
+
+# KILO MKID detector. Per-pixel cap 50 kHz (KILO default); n_pixels
+# scaled so bright ports have headroom on the J=4 host (~1e10 ct/s
+# unnulled across 20 wavelength bins). In the Phase B control concept the
+# tracker bright ports are SNSPD-read, while detector.mkid continues to model
+# the science ports; this stage still covers all ports for photon-rate
+# bookkeeping, so a split tracker-detector stage is not needed here.
+[[pipeline.stages]]
+id = "detector"
+type = "detector.mkid"
+# MKID quantum efficiency matches KILO DetectorConfig.mkid_efficiency
+# default (kilo/config.py L451). Was 0.9 pre-fix.
+qe = 0.7
+# Tier 4.2: KILO MKID per-pixel cap is 50 kHz (kilo/config.py:32). The
+# previous 5.0e15 was the unit-test override that effectively disabled
+# the cap. n_pixels_dark is used for each dark or spectro port.
+mkid_max_count_rate_hz = 5.0e4
+n_pixels_bright = 100000
+n_pixels_dark = 380
+# integration_time_s now materializes from [observation].integration_time_s
+# (review 2026-06-10 Issue 15) — the hand-duplicated 14400.0 here previously
+# shadowed an inert [observation] value.
+band = "J"
+resolving_power_ref = 30.0
+lambda_ref_um = 1.0
+
+# Maunakea J-band sky background. This produces a per-dark/spectro-port
+# background rate from the site sky surface brightness, dark-port spaxel
+# convention, collecting area per mode, and the current throughput/QE.
+# Downstream stages keep `n_sky_background_hz = 0.0` so the staged
+# background component remains the source of truth.
+[[pipeline.stages]]
+id = "background"
+type = "background.sky_surface_brightness"
+site_profile = "maunakea"
+band = "J"
+
+[[pipeline.stages]]
+id = "fringe_tracking"
+type = "fringe_tracking.closed_loop"
+# Phase 2: omit servo_bw_hz to use the KILO photon-limited optimum
+# (optimal_piston_servo_bandwidth, KILO fringe_tracking.py L286). The
+# pre-Phase-2 pin of 2000 Hz was a hand-tuned compromise that masked
+# the missing auto-optimization; the wrong f_char scale (full aperture
+# instead of subaperture) was also feeding a 5x-too-small f_char into
+# the lag formula.
+# servo_bw_hz = 2000.0
+fringe_visibility = 0.95
+n_spectral_channels = 20
+# Disturbance model (review 2026-06-09): inter-telescope von Karman piston
+# (B >> L0 saturation, Linfield+ 2001) and Keck vibration lines after
+# designed-in accelerometer feedforward (x5-6 demonstrated: Bohm+ 2014,
+# Ertel+ 2020; tones: Colavita+ 2013, Laugier+ 2024). Predictive gain x3
+# in variance (Nowak+ 2024, Choquet+ 2014), not the undemonstrated x20.
+inter_telescope_piston = true
+vibration_line_frequencies_hz = [12.0, 29.0, 58.0, 88.0, 150.0, 200.0]
+vibration_line_rms_nm = [30.0, 40.0, 25.0, 20.0, 10.0, 10.0]
+vibration_broadband_rms_nm = 30.0
+predictive_lag_reduction = 0.33
+servo_bandwidth_fraction = 0.05
+sample_rate_max_hz = 10000.0
+# Phase B: frame-free SNSPD photon-counting control. The 12 tracker bright
+# ports are read by SNSPD arrays (ns time tags, no read noise); the loop is
+# latency-limited, not frame-limited. Vibration lines are Kalman oscillator
+# states; the accelerometer feedforward transfer is continuously
+# photon-calibrated (fusion). See physics/fringe_tracking.py Phase B
+# primitives and tests/physics/notes/fringe_disturbances.md.
+control_model = "photon_kalman"
+loop_latency_s = 5.0e-5
+accelerometer_fusion = true
+fusion_broadband_suppression = 2.5
+fusion_coherent_fraction = 0.7
+line_tracking_residual_floor_nm = 2.0
+tracker_n_detectors_per_port = 4
+# Route the FT residual through the full KILO
+# ``piston_servo_residual`` decomposition (lag_reduced + photon +
+# uncorrectable_temporal + irreducible piston-filtered fitting +
+# WFS-noise) instead of the simpler ``fringe_tracking_phase_noise``
+# closed form. The 7× σ_OPD under-estimate at J=4 (0.19 nm vs KILO
+# 1.35 nm) was driven almost entirely by the missing irreducible
+# floor; this flag closes that gap.
+use_full_piston_servo_residual = true
+
+# Per-separation throughput + stellar-disk leakage + AO-realized null
+# (KILO performance.compute_planet_throughput_vs_separation, lines
+# 1010-1128, plus stellar_disk_null_floor and the
+# azimuth_averaged_realized_null_depth MC pattern). Produces the per-
+# separation curve performance.standard consumes for contrast(sep).
+# Without this stage performance falls back to a flat planet throughput
+# and the contrast curve cannot match KILO detection_space.pdf.
+[[pipeline.stages]]
+id = "sensitivity"
+type = "sensitivity.detection_curve"
+# Keep the same [bright|dark|spectro] partition used by chip_opt and
+# detector; performance.standard sums only dark_* labels for SNR while
+# still counting spectro photons in the stellar-rate normalization.
+n_pa_samples = 36
+include_angular_coupling = true
+# KILO paperv3 azimuth_averaged_realized_null_depth (transport.py L1739)
+# defaults to 6 azimuths x 200 realizations each. The pre-Phase-1
+# single-azimuth path used n_mc_realizations=200; that value is retained
+# as the back-compat alias but is now superseded by the per-azimuth
+# budget below.
+n_azimuths = 6
+n_realizations_per_azimuth = 200
+n_mc_realizations = 200
+mc_seed = 0
+apply_strehl_coupling = true
+# KILO ``coupling_efficiency`` (``kilo/injection.py:50-72``) folds in
+# the (1 − R_Fresnel) silica-tip reflection loss for every coupled
+# field. Enable here to match the upstream ``injection.ideal`` setting
+# (KILO_PARITY_PLAN §1.5).
+apply_fresnel_injection_loss = true
+# ao_piston_scale=1.0 (default). The pre-tier 0.064 was a calibration
+# knob compensating for nullsim's Conan-formula lag being inflated
+# 2-3 OOM by a bug fixed in tier 2a (closed_loop.py: standalone
+# (f_piston/f_servo)^(5/3) instead of multiplied by σ²_atmos).
+# Removing the scale lets the corrected formula stand on its own.
+ao_piston_scale = 1.0
+# KILO_PARITY_PLAN §2.2 + §2.4: derive both the scintillation residual
+# σ_I and the variance-weighted ``effective_systematic_bandwidth_hz``
+# from physics. Reads the per-sub bright-port WFS photon rate from
+# the upstream ``ao_residual`` component
+# (``wfs_photons_per_subap_per_frame × loop_frequency_hz``) and uses
+# ``optimize_amplitude_servo_bandwidth`` (KILO_PARITY_PLAN §2.1) to
+# pick the photon-limited optimum bandwidth per cell (~4 kHz at J=4,
+# ~380 Hz at J=8). Replaces both ``scintillation_index_per_sub`` and
+# ``effective_systematic_bandwidth_hz_override``.
+auto_amplitude_servo_residual = true
+# ``None`` triggers ``optimize_amplitude_servo_bandwidth``; set
+# explicitly to pin (e.g. legacy 5000.0). Omitted = auto.
+# auto_amp_servo_bandwidth_hz = 5000.0
+# Review 2026-06-10 Issue 17: pin the amplitude-servo predictive gain to
+# the same x3 variance the piston side adopted (predictive_lag_reduction
+# = 0.33 above, per Nowak+ 2024 / Choquet+ 2014). The package default of
+# x20 was the undemonstrated value this config explicitly rejected for
+# piston; amplitude prediction earns no better evidence.
+auto_amp_predictive_gain_variance = 3.0
+# Photon rate also auto-derived from the upstream AO component when
+# omitted (KILO_PARITY_PLAN §2.2).
+# auto_amp_servo_photon_rate_per_sub_hz = 1.0e6
+scintillation_index_per_sub = 0.0
+# IID per-mode residual fiber phase noise inside the realized-null MC.
+# Off by default: the upstream FT closed-loop stage already feeds a
+# realistic AO-piston σ_OPD into the MC (via ao_piston_opd_rms_per_sub_m),
+# and that residual already includes the FT-servo phase variance. Setting
+# this to KILO's nominal 0.01 rad on top double-counts the piston error
+# and inflates the realized null by ~7× at J=4 — the 2026-05-18
+# investigation showed this as the dominant 7× factor in the
+# detection-space gap. Use only to model genuine fiber thermal drift
+# residual on timescales the FT servo cannot correct.
+fiber_phase_noise_rms_rad = 0.0
+# Phase B setpoint controller, photon-limited auto mode (2026-06-10): the
+# dither amplitude and held setpoint are derived jointly from this run's
+# stellar rate and dark-port floor. The 1f lock-in signal scales as
+# dither*offset, so the held setpoint goes as 1/dither and the total
+# leakage has a real optimum (equal dither/bias partition). At J=4 this
+# lands near 0.5 nm RMS dither / 0.5 nm equivalent offset, total ~3e-6 —
+# 14x below the former fixed 2.5 nm / 1.0 nm placeholder (~4.6e-5). The
+# faint end degrades honestly as 1/sqrt(flux). trim_loop_bandwidth_hz is
+# the hardware-characterization input (chip setpoint drift rate).
+auto_setpoint_trim = true
+trim_loop_bandwidth_hz = 1.0
+# effective_null_override deliberately omitted. Prior values (1.95e-5,
+# then briefly 1.135e-7) forced the null to a hand-rolled constant,
+# masking the realized-null MC + disk-floor physics. With tier 1-4
+# fixes in place, the physics is now responsible for the null depth:
+# mc.mean_null_depth (AO piston + scintillation + fiber phase noise
+# through the actual chip u_stack) + stellar_disk_null_floor.
+# KILO paperv3 detection_space target: null_val_dark ≈ 7.28e-5
+# (kilo/paperv3/figures/detection_space_cache.json), null_depth_dark
+# ≈ 1.39e-4 at J-band (keck_only_results.json). NOT 1.135e-7 — that's
+# the calibration-time study floor, a different KILO product.
+
+[[pipeline.stages]]
+id = "fringe_observability"
+type = "diagnostics.fringe_observability"
+# Stress-test the duplicated-input tracker directly: 24 bright ports, one
+# independent count channel, and the actual deployed chip unitary. The M48
+# optimizer preserves enough physical-piston sensitivity in those bright rows
+# that the tracker no longer needs the provisional 10-channel AWG assumption.
+# Placing this diagnostic after sensitivity.detection_curve lets the new
+# amplitude-observability audit use the actual auto-optimized scintillation
+# amplitude-servo bandwidth, while the piston audit still uses the upstream
+# fringe_tracking.closed_loop sample time.
+n_spectral_channels = 1
+tracker_qe = 0.85
+tracker_count_rate_cap_hz_per_channel = 1.0e8
+dark_rate_hz_per_channel = 10.0
+n_monte_carlo = 256
+piston_rms_nm_for_mc = 50.0
+amplitude_postprocessing_n_monte_carlo = 256
+mc_seed = 42
+gauss_newton_max_iter = 10
+gauss_newton_piston_rms_grid_nm = [1.0, 3.0, 10.0, 30.0, 100.0]
+gauss_newton_sweep_n_monte_carlo = 32
+active_acquisition_n_monte_carlo = 64
+active_acquisition_n_passes = 3
+active_acquisition_response_iterations = 8
+active_acquisition_probe_step_nm = 10.0
+active_acquisition_max_response_step_nm = 80.0
+active_acquisition_scan_half_range_nm = 150.0
+active_acquisition_scan_steps = 61
+active_acquisition_lock_threshold_nm = 10.0
+cophasing_handoff_n_monte_carlo = 256
+cophasing_tracker_fraction = 1.0
+cophasing_visibility = 1.0
+cophasing_science_drift_rms_nm = 2.0
+cophasing_lock_threshold_nm = 10.0
+
+[[pipeline.stages]]
+id = "characterization"
+type = "characterization.spectro"
+wl_design_um = 1.25
+null_floor = 1.0e-5
+n_restarts = 3
+max_iter = 10000
+seed = 42
+tracker_observability_weight = 1.0e-3
+tracker_observability_min_singular_per_nm = 1.0e-3
+tracker_observability_crlb_weight = 1.0e-3
+tracker_observability_crlb_target_nm = 100.0
+broadband_n_wavelengths = 1
+dac_bits = 16
+band = "J"
+backend = "torch"
+spectrograph = "mkid"
+use_upstream_chip_params_start = false
+n_spectro_pixels = 1
+snr_min_per_bin = 3.0
+resolving_power_cap = 10000.0
+awg_resolving_power = 10000.0
+awg_throughput = 0.7
+awg_free_spectral_range_fraction = 1.0
+awg_order = 1
+awg_pixels_per_resolution_element = 2
+# Do not include finite-stellar-disk samples in the characterization retune
+# objective. They overconstrain the single spectro-port retune and can drive the
+# fixed-phase optimizer toward high broadband leakage. Disk leakage is still
+# evaluated below via disk_integral_* and reported in the characterization
+# tables/plots.
+disk_n_rings = 0
+disk_n_azimuths = 0
+disk_kernel_order = 0
+disk_integral_n_radial = 21
+disk_integral_n_pa = 16
+n_dark_count_hz = 0.0
+n_sky_background_hz = 0.0
+with_fringe_tracking = true
+# Photon-resolved NSC reduces only the instability term; Hanot et al. 2011
+# anchors a conservative end of demonstrated frame-based gains.
+nsc_systematic_reduction = 10.0
+
+[[pipeline.stages]]
+id = "characterization_curve"
+type = "characterization.detection_curve"
+wl_design_um = 1.25
+null_floor = 1.0e-5
+n_anchors = 12
+position_angle_deg = 0.0
+n_restarts = 3
+max_iter = 5000
+seed = 42
+tracker_observability_weight = 1.0e-3
+tracker_observability_min_singular_per_nm = 1.0e-3
+tracker_observability_crlb_weight = 1.0e-3
+tracker_observability_crlb_target_nm = 100.0
+dac_bits = 16
+backend = "torch"
+target_snr = 5.0
+band = "J"
+# Keep characterization-curve anchors on the same point-source retune objective
+# as the single target characterization stage; finite-disk leakage is
+# post-evaluated for the deployed stack.
+disk_n_rings = 0
+disk_n_azimuths = 0
+disk_kernel_order = 0
+disk_integral_n_radial = 21
+disk_integral_n_pa = 16
+n_dark_count_hz = 0.0
+n_sky_background_hz = 0.0
+with_fringe_tracking = true
+# Photon-resolved NSC reduces only the instability term; Hanot et al. 2011
+# anchors a conservative end of demonstrated frame-based gains.
+nsc_systematic_reduction = 10.0
+skip_jmags = [6.0, 10.0, 12.0]
+
+[[pipeline.stages]]
+id = "performance"
+type = "performance.standard"
+target_snr = 5.0
+with_fringe_tracking = true
+compute_contrast_curve = true
+# MKID dark count rate per port. KILO ``DetectorConfig.mkid_dark_rate``
+# defaults to 0.0 (``kilo/config.py:454``); pinned explicitly here so
+# the value is reproducible across runs rather than free-floating on a
+# Pydantic default (KILO_PARITY_PLAN §1.7).
+n_dark_count_hz = 0.0
+# Sky+thermal background per dark port. The upstream
+# ``background.sky_surface_brightness`` stage is the source of truth;
+# keeping this parameter at 0.0 tells performance.standard to consume
+# that staged background component instead of overriding it.
+n_sky_background_hz = 0.0
+# Fallback separations grid; ignored when the sensitivity stage above
+# is present (its 70-point KILO-paperv3 grid takes precedence).
+contrast_curve_separations_mas = [3.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0]
+# Photon-resolved NSC reduces only the instability term; Hanot et al. 2011
+# anchors a conservative end of demonstrated frame-based gains.
+nsc_systematic_reduction = 10.0
+
+# J-magnitude sweep covering the KILO sensitivity-paper headline regime
+# (bright nearby M-dwarfs through middle-of-the-pack F/G hosts).
+[[sweep]]
+param = "scene.star.jmag"
+values = [4.0, 6.0, 8.0, 10.0, 12.0]
+mode = "grid"
+
+[output]
+dir = "results/{run.name}/{timestamp}"
+paper = true
+plots = [
+    "detection_space",
+    "contrast_curve",
+    "null_transmission_map",
+    # Sanity-check ports from KILO paperv3 (figs 3, 4, 5, 7, 10).
+    "subaperture_layout",
+    "uv_coverage_grid",
+    "chip_diagnostics",
+    "chip_diagnostics_characterization",
+    "fringe_observability",
+    "cophasing_unitary",
+    "loss_budget",
+    "contrast_curves_multiband",
+    # Per-stage pipeline walk — surfaces every load-bearing quantity
+    # the run produced so silent regressions become visible without
+    # a deep dive.
+    "debug_report",
+]
+tables = ["performance_summary", "characterization_summary"]
+
+[output.null_transmission_map]
+fov_mas = 300.0
+n_pix = 201
+max_records = 1
+include_angular_coupling = true
+log_scale = true
+save_arrays = true
+
+[output.formats]
+plots = ["pdf", "png"]
+tables = ["json"]
+
+[cache]
+enabled = true
+dir = ".nullsim_cache"
+version = 1

@@ -1,0 +1,38 @@
+{
+  "metadata": {
+    "instrument": "NAYRA",
+    "band": "J",
+    "n_modes": 18,
+    "n_bright_ports": 4,
+    "n_dark_ports": 13,
+    "n_spectro_ports": 1,
+    "source_model": "nullsim NAYRA scalar baseline calibration-floor table. Values are deterministic design floors for runtime wiring until regenerated from nayra calibration_time products."
+  },
+  "analysis": {
+    "J3": {
+      "30min": {"best_null_depth": 4.0e-7},
+      "60min": {"best_null_depth": 3.2e-7},
+      "480min": {"best_null_depth": 1.2e-7}
+    },
+    "J5": {
+      "30min": {"best_null_depth": 6.5e-7},
+      "60min": {"best_null_depth": 5.0e-7},
+      "480min": {"best_null_depth": 2.0e-7}
+    },
+    "J7": {
+      "30min": {"best_null_depth": 1.2e-6},
+      "60min": {"best_null_depth": 9.0e-7},
+      "480min": {"best_null_depth": 3.6e-7}
+    },
+    "J9": {
+      "30min": {"best_null_depth": 2.5e-6},
+      "60min": {"best_null_depth": 1.8e-6},
+      "480min": {"best_null_depth": 7.0e-7}
+    },
+    "J12": {
+      "30min": {"best_null_depth": 7.0e-6},
+      "60min": {"best_null_depth": 5.0e-6},
+      "480min": {"best_null_depth": 2.0e-6}
+    }
+  }
+}

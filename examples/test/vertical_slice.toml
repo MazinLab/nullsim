@@ -1,0 +1,73 @@
+# SPEC §15.1 vertical-slice config: five trivial stages plus a J-mag sweep.
+#
+# This file is the reference example for the architecture-validation milestone.
+# It exercises the entire layer stack — TOML loading, schema validation, sweep
+# expansion, pipeline execution, caching, and registered outputs — with
+# placeholder physics that have known closed-form behavior.
+
+[run]
+name = "vertical_slice"
+description = "Architecture vertical slice from SPEC §15.1."
+seed = 1
+
+[grid]
+wavelength_center_um = 1.65
+wavelength_bandwidth_um = 0.30
+n_wavelength_bins = 3
+
+[scene.star]
+jmag = 5.0
+angular_diameter_mas = 1.0
+distance_pc = 5.0
+
+[scene.planet]
+contrast = 1.0e-7
+separation_mas = 100.0
+position_angle_deg = 0.0
+
+[scene.exozodi]
+level_zodi = 0.0
+
+[observation]
+hour_angle_h = 0.0
+integration_time_s = 3600.0
+
+[[pipeline.stages]]
+id = "scene"
+type = "scene.point_source"
+
+[[pipeline.stages]]
+id = "array"
+type = "telescope.fixed_aperture"
+diameter_m = 10.0
+
+[[pipeline.stages]]
+id = "injection"
+type = "injection.ideal"
+
+[[pipeline.stages]]
+id = "chip"
+type = "chip.identity"
+
+[[pipeline.stages]]
+id = "detector"
+type = "detector.ideal_counter"
+
+[[sweep]]
+param = "scene.star.jmag"
+values = [4.0, 6.0, 8.0, 10.0, 12.0]
+mode = "grid"
+
+[output]
+dir = "results/{run.name}/{timestamp}"
+plots = ["contrast_curve"]
+tables = ["performance_summary"]
+
+[output.formats]
+plots = ["pdf", "png"]
+tables = ["json"]
+
+[cache]
+enabled = true
+dir = ".nullsim_cache"
+version = 1

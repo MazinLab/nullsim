@@ -1,0 +1,20 @@
+name = "Maunakea"
+slug = "maunakea"
+latitude_deg = 19.826
+longitude_deg = -155.474
+altitude_m = 4145.0
+
+[atmosphere]
+r0_500nm_m = 0.20
+L0_m = 30.0
+wind_speed_m_s = 10.0
+tau0_500nm_s = 3.0e-3
+theta0_500nm_arcsec = 2.0
+atmospheric_transmission = 0.98
+
+[sky]
+profile = "maunakea"
+Y_mag_arcsec2 = 17.3
+J_mag_arcsec2 = 16.0
+H_mag_arcsec2 = 14.0
+K_mag_arcsec2 = 13.0

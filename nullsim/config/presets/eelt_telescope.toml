@@ -1,0 +1,13 @@
+name = "European Extremely Large Telescope"
+slug = "eelt"
+n_apertures = 1
+
+[aperture]
+diameter_m = 39.146
+obscuration_fraction = 0.11
+central_obstruction_diameter_m = 4.306
+
+[optics]
+mirror_transmission = 0.85
+ao_bench_transmission = 0.85
+n_pre_chip_mirrors = 5

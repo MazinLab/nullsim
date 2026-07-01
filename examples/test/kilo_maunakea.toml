@@ -1,0 +1,327 @@
+# SPEC §15.5 KILO Maunakea example config.
+#
+# Targets the KILO four-telescope Maunakea array (Keck I + II + Subaru + Gemini
+# North) at J band as encoded in kilo/config.py's `default_config()`. The
+# parameters below remain useful as a compact multi-telescope example, but
+# nullsim's tests no longer compare this config against frozen KILO outputs.
+#
+# Sub-pass A closure (§15.5/§15.6 multi-aperture pipeline gaps):
+#   * telescope.fixed_aperture now accepts n_apertures>=1 and an array layout
+#     (linear / y_array / manual), populating geometry.aperture_positions_enu_m
+#     for downstream delay_lines / metrology stages.
+#   * injection.ideal reads geometry.n_apertures and seeds the field at
+#     (n_apertures, n_wl, n_pol) so KILO four-telescope configs land an N=4
+#     mode field on the chip.
+#   * delay_lines.geometric consumes the ENU positions populated by the
+#     telescope stage.
+#
+# Sub-pass B closure:
+#   * chip_optimization.scipy now runs per-cell upstream of the chip and
+#     writes its result under state.results.components["chip_optimization"];
+#     chip.kernel_mzi_mesh consumes it via optimization_source="auto" with
+#     the same n_modes / n_bright_ports / n_dark_ports / wl_design_um. The
+#     identity-chip surrogate (zero params -> degenerate null) is retired.
+#
+# What still surrogates as of sub-pass B:
+#   * Per-aperture atmospheric piston / AO Strehl is a scalar shared across
+#     apertures (the field is broadcast uniformly out of injection.ideal);
+#     a per-aperture differentiation pass is future work.
+#   * The detector MKID stage caps each pixel at mkid_max_count_rate_hz,
+#     which clamps stellar_photon_rate_jband_jmag8_hz below the reference
+#     (sub-pass C: multi-pixel-per-port arrays).
+
+[run]
+name = "kilo_maunakea"
+description = "KILO Maunakea four-telescope reference config (SPEC §15.5)."
+seed = 1
+
+[grid]
+# KILO `default_config()` ships J-band centered at 1.25 um with 150 nm BW.
+wavelength_center_um = 1.25
+wavelength_bandwidth_um = 0.15
+n_wavelength_bins = 10
+
+[scene.star]
+# Fiducial bright host star.
+jmag = 8.0
+spectral_type = "F"
+angular_diameter_mas = 1.0
+distance_pc = 10.0
+
+[scene.planet]
+contrast = 1.0e-6
+separation_mas = 100.0
+position_angle_deg = 0.0
+
+[scene.exozodi]
+level_zodi = 1.0
+
+[observation]
+hour_angle_h = 0.0
+integration_time_s = 3600.0
+
+[[pipeline.stages]]
+id = "scene"
+type = "scene.point_source"
+# star/planet fields filled in from [scene.star] / [scene.planet] via
+# nullsim.config.stage_materialize bindings. altitude/azimuth are passed
+# explicitly because they are not (yet) wired into the materialize map and
+# delay_lines.geometric requires them.
+altitude_deg = 80.0
+azimuth_deg = 180.0
+
+[[pipeline.stages]]
+# Four-telescope Maunakea array. ~85 m mean baseline between the Keck I/II
+# pair and Subaru / Gemini-N is approximated by a Y-shape with ~85 m arms
+# (a faithful geodetic-to-ENU conversion lives in KILO; here we keep a
+# self-contained schematic so nullsim stays standalone). Aperture diameter
+# defaults to the Keck-class 10 m as the representative per-telescope size.
+id = "array"
+type = "telescope.fixed_aperture"
+diameter_m = 10.0
+n_apertures = 4
+array_layout = "y_array"
+spacing_m = 85.0
+# Keck/Subaru-class Nasmyth optics train ~0.80 J-band end-to-end.
+mirror_transmission = 0.80
+
+[[pipeline.stages]]
+# Maunakea atmosphere: r0=0.15 m and L0=25 m match KILO's defaults
+# (kilo/config.py AtmosphereConfig).
+id = "atmosphere"
+type = "atmosphere.kolmogorov"
+r0_500nm_m = 0.15
+L0_m = 25.0
+wind_speed_m_s = 10.0
+# Maunakea J-band band-averaged atmospheric transmission ~0.93.
+atmospheric_transmission = 0.93
+
+[[pipeline.stages]]
+# Pyramid WFS matched to Keck HAKA: ~3000 actuators, 2 kHz loop, 50
+# subapertures across. Natural-guide-star mode derives R from the target
+# J magnitude and spectral type; photon-counting EMCCD mode uses no
+# multiplication excess noise or read-noise floor.
+id = "ao"
+type = "ao.pyramid_wfs"
+n_actuators = 3025  # k**2 with k=55 (round(sqrt(3000))); strict-square per Code Review Issue 9
+loop_frequency_hz = 2000.0
+# KILO default_config samples each telescope's full primary as one SMF
+# patch for the AO piston-filter integral (kilo.atmosphere.ao_piston_opd_rms
+# is evaluated at d_sub = telescope.diameter). pupil_template="full_pupil"
+# tells the AO stage to derive d_sub = state.geometry.diameter_m directly
+# instead of pinning a constant.
+pupil_template = "full_pupil"
+n_subap_across = 50
+derive_r_mag_from_scene_jmag = true
+excess_noise_sq = 1.0
+readout_noise_e_rms = 0.0
+central_obstruction = 0.24
+tau0_500nm_s = 2.83e-3
+theta0_500nm_arcsec = 1.19
+v_wind_m_s = 10.0
+
+[[pipeline.stages]]
+# Seeds the n_apertures=4 unit field that the chip will mix. Leave the
+# Ruilier-Cassaing coupling disabled here because the downstream
+# injection.single_mode_fiber stage applies it once using the Keck
+# central obscuration.
+id = "injection_seed"
+type = "injection.ideal"
+apply_strehl_coupling = false
+
+[[pipeline.stages]]
+# Ruilier-Cassaing single-mode-fiber coupling; reads Strehl from the AO
+# stage and scales the (broadcast) per-aperture field. KILO uses a 24%
+# central obscuration for the Keck pupil.
+id = "injection"
+type = "injection.single_mode_fiber"
+central_obscuration_ratio = 0.24
+
+[[pipeline.stages]]
+# SMF-28e fiber run from telescope to chip. KILO `transport.compute_loss_budget`
+# uses tabulated SMF-28e attenuation; we ship a 10 m representative length
+# (the chip is colocated with the SMF injection bench in the KILO design).
+id = "smf28"
+type = "transport.smf28"
+length_m = 10.0
+phi_rms_rad = 0.01
+
+[[pipeline.stages]]
+# Geometric delay-line path equalization across the four-telescope array.
+# Reads geometry.aperture_positions_enu_m (now populated by the upgraded
+# telescope.fixed_aperture) and scene altitude/azimuth to compute the
+# per-aperture geometric optical path, then fiber-equalizes to the longest
+# path. 90 m max delay covers the worst-case baseline projection at low
+# elevation.
+id = "delay_lines"
+type = "delay_lines.geometric"
+max_delay_m = 90.0
+
+[[pipeline.stages]]
+# Sub-pass B: run the scipy chip optimizer per pipeline cell. L-BFGS-B
+# minimizes broadband dark-port leakage on the post-injection / post-
+# delay-line field; the result is written to
+# state.results.components["chip_optimization"] and consumed downstream
+# by `chip.kernel_mzi_mesh` via optimization_source="auto".
+#
+# Caveat: running the optimizer inside every sweep cell makes the full
+# parameter sweep slow (~100 inner iterations per cell). Production runs
+# should cache chip params at design or hoist this stage out of the
+# sweep. max_iter=100 keeps the test suite under a minute while still
+# converging on the m=4 mono problem.
+id = "chip_opt"
+type = "chip_optimization.scipy"
+n_modes = 4
+n_bright_ports = 3
+n_dark_ports = 1
+wl_design_um = 1.25
+target_null_depth = 1.0e-6
+max_iter = 100
+seed = 0
+capture_convergence_history = true
+
+[[pipeline.stages]]
+# Clements MZI mesh on the n_modes=4 field. Sub-pass B: params come from
+# the upstream chip_optimization.scipy stage above (auto = first key
+# starting with chip_optimization in state.results.components).
+id = "chip"
+type = "chip.kernel_mzi_mesh"
+n_modes = 4
+n_bright_ports = 3
+n_dark_ports = 1
+wl_design_um = 1.25
+optimization_source = "auto"
+# Chip insertion loss inherits the package default (-2.0 dB). Not pinned
+# here because adding any field to this TOML shifts the resolved
+# config_hash, which re-seeds the upstream stochastic stages
+# (atmosphere / transport.smf28 phase noise) and moves the scipy
+# chip-optimizer's L-BFGS-B local optimum for this small n_modes=4 case.
+# The -2 dB scalar applied AFTER the unitary is a pure attenuation that
+# preserves null-depth ratios; absolute throughput shifts by 0.631× and
+# integration time by ~1.585×.
+
+[[pipeline.stages]]
+# MKID detector matched to KILO defaults: 70% QE, 50 kHz per-pixel saturation
+# cap. With n_modes=4 and 3 bright + 1 dark port we have a real bright/dark
+# partition (no more NaN raw null), enabling performance.standard downstream.
+# Bright ports see ~1.4e8 ph/s on J=8 (well above the 50 kHz per-pixel cap),
+# so they need ~thousands of MKIDs to stay unsaturated; dark ports are
+# ~6 orders of magnitude dimmer and need far fewer. KILO `detect_mkid`
+# (kilo/detectors.py L256-287) takes `n_pixels` per port as an argument.
+id = "detector"
+type = "detector.mkid"
+qe = 0.7
+mkid_max_count_rate_hz = 5.0e4
+n_pixels_bright = 1000
+n_pixels_dark = 100
+n_bright_ports = 3
+n_dark_ports = 1
+n_modes = 4
+integration_time_s = 3600.0
+band = "J"
+
+[[pipeline.stages]]
+# Maunakea J-band sky background. This routes an explicit sky term into
+# performance.standard instead of leaving the baseline on the legacy
+# zero-background fallback.
+id = "background"
+type = "background.sky_surface_brightness"
+site_profile = "maunakea"
+band = "J"
+n_subapertures = 4
+
+[[pipeline.stages]]
+# Closed-loop fringe tracker matched to KILO `FringeTrackingConfig` defaults:
+# 2 kHz servo, fringe visibility 0.9, 10 spectral channels, n_spectral_eff=2.5
+# (kilo/fringe_tracking.py L25-65). Leave effective_baseline_m unset so
+# the fringe tracker uses the AO full-pupil diameter for the piston crossing
+# time instead of the inter-telescope array baseline.
+id = "fringe_tracking"
+type = "fringe_tracking.closed_loop"
+servo_bw_hz = 2000.0
+fringe_visibility = 0.9
+n_spectral_channels = 10
+n_spectral_eff = 2.5
+predictive_lag_reduction = 0.05  # KILO production default (Kalman/LQG ~20× lag-variance reduction)
+wind_speed_m_s = 10.0
+
+[[pipeline.stages]]
+# Calibration floor lookup: in the absence of a lookup table, falls back to
+# the default null-depth floor parameter. -6 (1e-6) is the design-spec
+# calibrated floor (KILO sensitivity-paper-grade).
+id = "calibration"
+type = "calibration.floor_lookup"
+default_floor_log10 = -6.0
+band = "J"
+
+[[pipeline.stages]]
+# Per-separation planet throughput + finite-stellar-disk leakage + AO/FT
+# realized-null Monte Carlo. This is the physics source for detection-space
+# and contrast-curve outputs; performance.standard consumes the curve instead
+# of falling back to a flat planet throughput.
+id = "sensitivity"
+type = "sensitivity.detection_curve"
+n_bright_ports = 3
+n_dark_ports = 1
+n_spectro_ports = 0
+n_pa_samples = 36
+include_angular_coupling = true
+n_azimuths = 6
+n_realizations_per_azimuth = 200
+n_mc_realizations = 200
+mc_seed = 0
+apply_strehl_coupling = true
+apply_fresnel_injection_loss = true
+auto_amplitude_servo_residual = true
+scintillation_index_per_sub = 0.0
+fiber_phase_noise_rms_rad = 0.0
+
+[[pipeline.stages]]
+# Standard performance stage: now runnable thanks to the n_bright_ports=3 +
+# n_dark_ports=1 chip/detector partition.
+id = "performance"
+type = "performance.standard"
+target_snr = 5.0
+with_fringe_tracking = true
+compute_contrast_curve = true
+n_dark_count_hz = 0.0
+
+[[sweep]]
+# J-magnitude sweep for sensitivity curves; mirrors KILO sensitivity paper
+# range.
+param = "scene.star.jmag"
+values = [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]
+mode = "grid"
+
+[output]
+dir = "results/{run.name}/{timestamp}"
+plots = [
+    "detection_space",
+    "contrast_curve",
+    "null_transmission_map",
+    "subaperture_layout",
+    "uv_coverage_grid",
+    "chip_diagnostics",
+    "loss_budget",
+    "contrast_curves_multiband",
+    "calibration_time",
+    "debug_report",
+]
+tables = ["performance_summary"]
+
+[output.formats]
+plots = ["pdf", "png"]
+tables = ["json"]
+
+[output.null_transmission_map]
+fov_mas = 300.0
+n_pix = 151
+max_records = 1
+include_angular_coupling = true
+log_scale = true
+save_arrays = true
+
+[cache]
+enabled = true
+dir = ".nullsim_cache"
+version = 1

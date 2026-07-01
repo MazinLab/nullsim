@@ -1,0 +1,7 @@
+name = "Minimal telescope"
+n_apertures = 1
+
+[aperture]
+diameter_m = 1.0
+obscuration_fraction = 0.0
+

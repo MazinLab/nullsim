@@ -1,0 +1,10 @@
+# Sample exoplanet catalog fixture for nullsim tests.
+# Modeled on the IPAC/NASA Exoplanet Archive download format. Five planets,
+# spanning the four SPEC §8.1 planet types and four discovery methods, with
+# realistic separations + contrast estimates.
+pl_name,ra,dec,pl_bmasse,pl_rade,pl_orbsmax,pl_orbeccen,sy_dist,separation_mas,contrast_estimate,discoverymethod
+Proxima Cen b,217.4289,-62.6795,1.27,1.08,0.04857,0.0,1.301,37.3,1.0e-7,Radial Velocity
+TRAPPIST-1 e,346.6223,-5.0414,0.692,0.92,0.02928,0.005,12.43,2.36,3.0e-8,Transit
+HD 209458 b,330.795,18.8843,219.0,15.46,0.04747,0.0,48.37,0.98,1.0e-4,Transit
+51 Peg b,344.3667,20.7689,150.0,13.5,0.0527,0.013,15.47,3.41,5.0e-5,Radial Velocity
+beta Pic b,86.821,-51.0664,4131.0,18.7,9.93,0.103,19.44,510.8,2.0e-4,Imaging

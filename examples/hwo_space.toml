@@ -1,0 +1,473 @@
+# SPEC §15.7 HWO-class space nuller — first new-instrument config.
+#
+# This is the first nullsim TOML with NO KILO/NAYRA reference equivalent.
+# The point of §15.7 is to demonstrate that nullsim is a general-purpose
+# pipeline (atmosphere/AO/fringe-tracking are *optional* stages, not
+# baked-in assumptions), not a re-implementation of the two ground-based
+# instruments. The sanity tests in `tests/examples/test_hwo_space_sanity.py`
+# only assert that the pipeline loads and runs end-to-end without crashing,
+# and that the headline outputs are produced.
+#
+# Scenario: an 8 m HWO-class space telescope observing a nearby solar analog
+# at 5 pc, looking for an Earth analog at the HWO design contrast
+# of 10⁻¹⁰. The primary is modeled as a circular unobstructed aperture
+# (no secondary and no spiders). λ = 0.8 µm with a 10% fractional
+# bandwidth is the default first-pass HWO operating point.
+# Integration time is 1 day (86400 s), the canonical HWO survey cadence.
+#
+# Shape differences from kilo_keck.toml / nayra_eelt.toml:
+#   * NO `atmosphere.kolmogorov` — space, no turbulence.
+#   * NO `ao.pyramid_wfs` — no atmospheric wavefront to correct. The
+#     baseline wavefront is seeded directly by `injection.ideal` with
+#     Strehl=1.0 (formation-flying metrology assumed to deliver
+#     near-diffraction-limited wavefronts; see §15.7 gap note below).
+#   * NO `fringe_tracking.closed_loop` — single-aperture monolithic
+#     primary, no inter-telescope OPD to servo. (A real formation-flying
+#     nuller would add a metrology stage here; see gap note.)
+#   * NO `delay_lines.geometric` — single aperture, no inter-telescope
+#     path equalization. Identical reasoning to NAYRA single-bench.
+#   * Detector cap is set far above the expected rates so the first pass
+#     is not saturation limited.
+#   * Space zodiacal backgrounds are included through `background.space_zodi`:
+#     local zodi defaults to an average V-band surface brightness, and exozodi
+#     uses a HOSTS-style level draw plus a simple inclined-disk multiplier.
+#   * Calibration floor and residual systematic are set to negligible
+#     positive values; HWO contrast is represented by the planet contrast,
+#     not by an imposed calibration floor.
+#
+# Known nullsim gaps that this config inherits (all from §15.5):
+#   * `injection.ideal` seeds a 36-mode broadcast placeholder so the
+#     downstream `chip.kernel_mzi_mesh` has a bright/dark partition. A
+#     real multi-sub-aperture field constructor for a monolithic HWO
+#     pupil would replace this. The 36-mode broadcast is sufficient for
+#     end-to-end plumbing, but it is not a true pupil-resolved nuller.
+#   * `chip.kernel_mzi_mesh` consumes a signed-real physical Clements
+#     decomposition of the upstream ideal kernel-projector result via
+#     `optimization_source = "auto"`, then propagates it with the fixed-OPD
+#     chromatic phase model. For the real HWO kernel projector this avoids
+#     internal pi phase flips that would otherwise dominate finite-bandwidth
+#     leakage.
+#
+# NEW gap unique to space-based scenarios (not yet a stage):
+#   * Formation-flying metrology / OPD budget. KILO models inter-
+#     telescope piston via the `fringe_tracking.closed_loop` stage;
+#     NAYRA models it via the AO loop on a monolithic pupil. HWO has
+#     neither — its OPD budget is set by metrology between separated
+#     spacecraft. This config simply omits an explicit formation-
+#     flying stage and lets `injection.ideal` provide a Strehl=1
+#     baseline, which is the intended no-metrology-error first pass. A
+#     future `metrology.formation_flying` stage would replace this with
+#     a residual-OPD model.
+
+[run]
+name = "hwo_space"
+description = "HWO-class space nuller, no atmosphere, MKID detector (SPEC §15.7)."
+seed = 1
+
+[instrument]
+# Shared port topology: 36 guided modes from the pupil sampler feed a
+# 36-mode mesh split 10 bright / 26 dark (no spectro port in this first
+# pass). Stage params below materialize from this section; per-stage
+# overrides are gone with the NAYRA-style [instrument] modernization.
+n_modes = 36
+n_input_modes = 36
+n_bright_ports = 10
+n_dark_ports = 26
+n_spectro_ports = 0
+
+[site.observability]
+# HWO is a space observatory. The known-planet overlay should not apply
+# a ground-site declination/altitude cut.
+all_sky = true
+
+[grid]
+# HWO default optical point: 0.8 µm center with 10% fractional bandwidth.
+# This puts λ/D ≈ 20.6 mas on an 8 m primary, and 200 mas (the planet
+# separation below) is ~9.7 λ/D — well
+# into the high-throughput regime for a nuller.
+wavelength_center_um = 0.8
+wavelength_bandwidth_um = 0.08
+# Odd bin count includes the 0.800 um design wavelength exactly, which is
+# important when evaluating finite-bandwidth physical chip chromaticity.
+n_wavelength_bins = 11
+
+[telescope]
+# Single circular unobstructed HWO primary. No secondary, no spiders,
+# and no separated formation-flying apertures in this first-pass config.
+n_apertures = 1
+
+[telescope.aperture]
+diameter_m = 8.0
+obscuration_fraction = 0.0
+
+[telescope.optics]
+# Clean space optics, band-averaged mirror train.
+mirror_transmission = 0.95
+
+[scene.star]
+# G2V solar analog at 5 pc. J≈2.13 is the Sun's 2MASS J absolute magnitude
+# shifted to 5 pc; angular diameter is the solar diameter at 5 pc.
+# The detector stage derives the 0.8 um I-band magnitude from this J
+# magnitude and spectral type instead of treating J as an optical magnitude.
+jmag = 2.13
+spectral_type = "G2V"
+angular_diameter_mas = 1.86
+distance_pc = 5.0
+
+[scene.planet]
+# HWO design goal: 10⁻¹⁰ planet/star contrast for an Earth analog. 1 AU at
+# 5 pc is 200 mas, ≈ 9.7 λ/D at 0.8 µm on an 8 m primary.
+contrast = 1.0e-10
+separation_mas = 200.0
+position_angle_deg = 60.0
+
+[scene.exozodi]
+# Fixed fallback exozodi level. The HWO zodi stage below opts into a
+# HOSTS-style sampled level for realism; this scene value is used only if
+# that stage is returned to exozodi_level_distribution="fixed".
+level_zodi = 1.0
+
+[observation]
+hour_angle_h = 0.0
+# 1-day integration — the canonical HWO per-target survey cadence.
+integration_time_s = 86400.0
+
+[[pipeline.stages]]
+id = "scene"
+type = "scene.point_source"
+
+[[pipeline.stages]]
+# Single 8 m unobstructed HWO-class primary. Diameter, aperture count,
+# central obstruction, and mirror transmission come from [telescope].
+id = "telescope"
+type = "telescope.fixed_aperture"
+
+[[pipeline.stages]]
+# First-pass 36-mode surrogate for a monolithic pupil. This supplies
+# pupil-frame coordinates to sensitivity.detection_curve so the contrast
+# curve uses separation-dependent planet throughput instead of the flat
+# performance.standard fallback. The mode centers are rescaled so the
+# hole pattern uses the full 8 m aperture. The nonredundant_circular layout is
+# a high-fill perturbation of dense circle packing: each subaperture circle is
+# kept inside the primary boundary, non-overlapping, and contributes its
+# physical collecting area, while the offsets break the worst mirror
+# degeneracies in the imaging output.
+id = "pupil_modes"
+type = "telescope.pupil_modes"
+n_modes = 36
+layout = "nonredundant_circular"
+span_fraction = 1.0
+normalize_max_baseline_to_span = false
+preserve_collecting_area = false
+
+# NOTE: no `atmosphere.kolmogorov` and no `ao.pyramid_wfs` — this is a
+# space telescope. `wavefront.space_residual` below records the first-pass
+# non-atmospheric WFE/pointing budget before injection. The picometer WFE
+# values are high-contrast stability placeholders, so the resulting Strehl
+# hit is intentionally negligible.
+
+[[pipeline.stages]]
+id = "space_wavefront"
+type = "wavefront.space_residual"
+static_wfe_rms_pm = 10.0
+dynamic_wfe_rms_pm = 5.0
+amplitude_jitter_fraction = 0.0
+pointing_jitter_rms_mas = 0.5
+
+[[pipeline.stages]]
+# Architecture-placeholder field constructor with a 36-mode broadcast so
+# the kernel-mesh chip below has a bright/dark partition. The upstream
+# space-wavefront stage provides a near-unity Strehl spectrum. A real
+# multi-sub-aperture injection stage would replace this with independent
+# modes; the broadcast keeps raw null depth degenerate but lets
+# performance.standard run. Leave apply_strehl_coupling=false because the
+# downstream injection.single_mode_fiber stage applies the Ruilier-Cassaing
+# SMF coupling exactly once.
+id = "injection_seed"
+type = "injection.ideal"
+apply_strehl_coupling = false
+
+[[pipeline.stages]]
+# Ruilier-Cassaing single-mode-fiber coupling. With Strehl=1.0 from
+# `injection.ideal`, coupling efficiency is the Ruilier-Cassaing
+# theoretical maximum for an unobstructed circular pupil.
+id = "injection"
+type = "injection.single_mode_fiber"
+
+[[pipeline.stages]]
+# Ideal kernel projector on the m=36 system. Ten bright/dump outputs exactly
+# carry the fourth-order stellar Taylor subspace, leaving 26 science dark
+# ports. The fourth-order null suppresses the finite-disk leakage from a
+# solar-diameter host at 5 pc; the stage decomposes the center-wavelength
+# projector into a signed-real Clements mesh, and the downstream chip stage
+# then applies fixed-OPD chromatic phase propagation across the 10% HWO band.
+id = "chip_opt"
+type = "chip_optimization.ideal_kernel"
+wl_design_um = 0.8
+kernel_order = 4
+target_null_depth = 1.0e-10
+deployment = "physical_real_clements"
+
+[[pipeline.stages]]
+# KILO/NAYRA-style dual-polarization front end: split the scalar
+# unpolarized HWO field into two incoherent PBS arms, then send each arm
+# to its own physical chip.
+id = "pbs"
+type = "polarization.pbs_split"
+input_interpretation = "unpolarized"
+insertion_loss_db = 0.5
+extinction_ratio_db = 30.0
+axis_offset_rad = 1.0e-3
+
+[[pipeline.stages]]
+# PM780-HP-class PM fiber is appropriate for the 800 nm HWO band. The
+# official attenuation spec is <=4 dB/km near 850 nm; for a <=2 m
+# instrument fiber this is only ~0.008 dB of propagation loss. Residual
+# phase and length-mismatch dispersion are set to zero for this first
+# no-metrology-error space baseline.
+id = "pm780_transport"
+type = "transport.pm780"
+length_m = 2.0
+attenuation_db_per_km = 4.0
+phi_rms_rad = 0.0
+length_matching_error_m = 0.0
+
+# NOTE: no `polarization.pm_fiber` Jones/PER degradation in the HWO first
+# pass. The NAYRA/KILO PM-fiber Jones model intentionally draws random
+# per-mode retardances and alignment errors; leaving it in would make this
+# space baseline polarization-limited before the zodi/noise budget is isolated.
+# The scalar PM780 stage above still carries the <=2 m propagation loss.
+
+# NOTE: no `delay_lines.geometric` — single aperture, no inter-telescope
+# path equalization. Identical reasoning to NAYRA single-bench.
+
+[[pipeline.stages]]
+# Thirty-six-mode Clements mesh: 10 bright + 26 dark ports. The broadcast-from-
+# 1-aperture injection above feeds equal amplitudes into all modes, so the chip
+# is still not a true pupil-resolved HWO nuller. The chip stage consumes the
+# ideal projector's signed-real physical Clements parameters, not an achromatic
+# U_stack, and propagates any remaining phi/alpha as fixed optical path delays
+# across the band.
+# deployment_mode="per_pol_arm" instantiates the design as two physical arms,
+# one per PBS arm, with independent input phase trims. A real multi-sub-
+# aperture sampler and physical broadband chip optimizer are the orthogonal
+# closures for true nulling.
+id = "chip"
+type = "chip.kernel_mzi_mesh"
+wl_design_um = 0.8
+optimization_source = "auto"
+deployment_mode = "per_pol_arm"
+chip_chromaticity_model = "parametric"
+phase_chromaticity_model = "fixed_opd_neff"
+phase_neff_ref = 2.4
+phase_group_index = 2.4
+
+[[pipeline.stages]]
+# MKID detector with 90% QE and saturation effectively disabled for this
+# zodi/background-limited baseline. A later HWO-degradation pass should
+# replace the high cap with a realistic space detector count-rate model.
+id = "detector"
+type = "detector.mkid"
+qe = 0.9
+mkid_max_count_rate_hz = 1.0e12
+n_pixels_bright = 100
+n_pixels_dark = 100
+band = "I"
+derive_band_mag_from_scene_jmag = true
+resolving_power_ref = 30.0
+lambda_ref_um = 1.0
+
+# NOTE: no `fringe_tracking.closed_loop` — no inter-telescope piston to
+# servo on a monolithic primary. A real formation-flying nuller would
+# add a `metrology.formation_flying` stage here (NEW gap; see header).
+
+[[pipeline.stages]]
+# Separation-dependent planet throughput + stellar-disk leakage for the
+# 36-mode monolithic-pupil surrogate above. With no atmosphere, AO, or
+# formation-flying residual stage, the realized-null MC is disabled. The
+# residual-starlight floor uses a lightweight wavelength- and separation-
+# dependent HWO I-band contrast surface as a stand-in for a future
+# wavefront-derived contrast map.
+# The grid is HWO-specific: at 0.8 µm on an 8 m primary, λ/D = 20.6 mas.
+# The sub-mas samples keep the finite-stellar-disk integral honest for a
+# 1.86 mas diameter star; the plotted science range still extends through
+# 1-500 mas and brackets a 1 AU orbit at 5 pc (200 mas).
+# A 0.5 mas RMS pointing/vibration blur is about 0.024 λ/D at this band,
+# small at the Earth-analog separation but enough to exercise the angular
+# convolution path near the inner working angle.
+id = "sensitivity"
+type = "sensitivity.detection_curve"
+separations_mas = [
+  0.05, 0.07, 0.1, 0.14, 0.2, 0.25, 0.35, 0.5, 0.7,
+  1.0, 1.17, 1.38, 1.61, 1.89, 2.22, 2.6, 3.05,
+  3.58, 4.2, 4.92, 5.77, 6.77, 7.94, 9.31, 10.9,
+  12.8, 15.0, 17.6, 20.6, 24.2, 28.4, 33.3, 39.1,
+  45.8, 53.7, 63.0, 73.9, 86.6, 102.0, 119.0, 140.0,
+  164.0, 192.0, 225.0, 264.0, 310.0, 364.0, 426.0, 500.0,
+]
+n_pa_samples = 72
+include_angular_coupling = true
+n_azimuths = 1
+n_realizations_per_azimuth = 0
+n_mc_realizations = 0
+mc_seed = 0
+residual_starlight_table_path = "data/hwo_reference/residual_contrast_i_band.csv"
+residual_starlight_combine_mode = "max"
+
+[[pipeline.stages]]
+# Space zodiacal backgrounds. The default local-zodi value is an average
+# V-band surface brightness converted to I-band with an approximate solar color;
+# this HWO example pins a low/ecliptic-pole value because deep direct-imaging
+# targets should avoid the high-zodi sky. Exozodi uses a HOSTS-like lognormal
+# dust-level draw and an inclined smooth-disk surface-brightness multiplier,
+# then routes through the same off-axis dark-port throughput that
+# sensitivity.detection_curve computed for the planet separation. The solid
+# angle defaults to 1 (lambda/D)^2.
+id = "zodi"
+type = "background.space_zodi"
+band = "I"
+local_zodi_v_mag_arcsec2 = 23.3
+derive_exozodi_mag_from_scene_jmag = true
+exozodi_level_distribution = "hosts2020_lognormal"
+exozodi_hosts2020_median_zodi = 3.0
+exozodi_hosts2020_sigma_dex = 0.47712125472
+exozodi_level_max_zodi = 100.0
+exozodi_morphology = "smooth_inclined_disk"
+exozodi_inclination_distribution = "isotropic"
+exozodi_max_inclination_deg = 80.0
+exozodi_max_surface_brightness_multiplier = 5.0
+routing = "scene_planet_throughput"
+
+[[pipeline.stages]]
+# Standard performance stage. opd_budget is now optional: when no FT or
+# AO stage has populated it (as here in a space config), _resolve_servo_bw
+# returns params.default_servo_bw_hz and records servo_bw_source so the
+# provenance is auditable. with_fringe_tracking=false because there is no
+# closed-loop fringe tracker in this pipeline. residual_speckle_stability_factor
+# treats 1% of the residual starlight floor as a quasi-static systematic term
+# without changing the mean leakage floor.
+id = "performance"
+type = "performance.standard"
+with_fringe_tracking = false
+residual_speckle_stability_factor = 0.01
+target_snr = 5.0
+compute_contrast_curve = true
+contrast_curve_reference_time_s = 86400.0
+# Fallback only; ignored when sensitivity.detection_curve is present.
+contrast_curve_separations_mas = [1.0, 5.0, 10.0, 20.6, 50.0, 100.0, 200.0, 500.0]
+planet_dark_throughput = 0.5
+
+[[sweep]]
+# Sweep over planet contrast difficulty: easy detection (1e-8) → HWO
+# design contrast (1e-10) → below-design contrast (1e-12). The sanity test
+# checks monotonic SNR-vs-contrast (deeper contrast → lower SNR).
+param = "scene.planet.contrast"
+values = [1.0e-12, 1.0e-11, 1.0e-10, 1.0e-9, 1.0e-8]
+mode = "grid"
+
+# Use the bundled NASA Exoplanet Archive snapshot for the paper-facing
+# detection_space overlay. The smaller sample catalog under tests/ is only a
+# fixture for plot/unit tests.
+[catalog.exoplanets]
+source_url = "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/TblView/nph-tblView"
+query = "select pl_name,ra,dec,pl_bmasse,pl_rade,pl_orbsmax,pl_orbeccen,sy_dist,discoverymethod from pscomppars where default_flag=1"
+retrieval_date = "2026-04-01"
+snapshot_path = "../nullsim/data/exoplanet_catalogs/nasa_exoplanet_archive_paperv3.csv"
+classification_rule_version = "v1"
+
+[output]
+dir = "results/{run.name}/{timestamp}"
+plots = [
+  "detection_space",
+  "contrast_curve",
+  "null_transmission_map",
+  "subaperture_layout",
+  "uv_coverage_grid",
+  "chip_diagnostics",
+  "loss_budget",
+  "contrast_curves_multiband",
+  "calibration_time",
+  "debug_report",
+  "imaging_reconstruction",
+]
+tables = ["performance_summary"]
+
+[output.detection_space]
+# Plot every sweep cell (the sweep is over planet contrast, not J mag) and
+# overlay the Guyon 2006 theoretically optimal coronagraph photon bound at
+# orders 2 (strict stellar-mode removal; stellar-size walled on a 1.86 mas
+# solar disk) and 4 (tip/tilt modes also removed, the order this config's
+# kernel projector enforces).
+headline_jmags = []
+ideal_coronagraph_orders = [2, 4]
+
+[output.formats]
+plots = ["pdf", "png"]
+tables = ["json"]
+
+[output.null_transmission_map]
+fov_mas = 500.0
+n_pix = 201
+max_records = 1
+include_angular_coupling = true
+log_scale = true
+save_arrays = true
+
+[output.imaging_reconstruction]
+# HWO has no Earth-rotation synthesis. Use spacecraft roll about the
+# line of sight to rotate the monolithic-pupil surrogate relative to the sky.
+rotation_mode = "spacecraft_roll"
+roll_span_deg = 120.0
+n_roll_steps = 25
+n_pix = 64
+fov_mas = 350.0
+max_wavelengths = 7
+max_records = 1
+seed = 1
+poisson = false
+save_arrays = true
+compute_nnls = true
+nnls_wavelength_mode = "resolved"
+nnls_candidate_pixels = 512
+nnls_regularization_fraction = 0.01
+chop_mode = "chip_phase"
+include_exozodi_glow = true
+exozodi_inner_radius_au = 0.2
+exozodi_outer_radius_au = 5.0
+exozodi_radial_power = 1.0
+exozodi_position_angle_deg = 60.0
+
+[[output.imaging_reconstruction.planets]]
+label = "Venus"
+separation_mas = 144.0
+position_angle_deg = 45.0
+flux_model = "reflected_light"
+radius_earth = 0.9499
+semi_major_axis_au = 0.723
+geometric_albedo = 0.67
+phase_angle_deg = 90.0
+
+[[output.imaging_reconstruction.planets]]
+label = "Earth"
+separation_mas = 200.0
+position_angle_deg = 60.0
+flux_model = "reflected_light"
+radius_earth = 1.0
+semi_major_axis_au = 1.0
+geometric_albedo = 0.20
+phase_angle_deg = 90.0
+
+[[output.imaging_reconstruction.planets]]
+label = "Mars"
+separation_mas = 304.0
+position_angle_deg = 315.0
+flux_model = "reflected_light"
+radius_earth = 0.532
+semi_major_axis_au = 1.524
+geometric_albedo = 0.15
+phase_angle_deg = 90.0
+
+[cache]
+enabled = true
+dir = ".nullsim_cache"
+version = 1

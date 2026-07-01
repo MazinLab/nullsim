@@ -1,0 +1,107 @@
+# KILO Keck N=6 joint phase+amplitude Fisher experiment.
+#
+# Variant A: replace the hard joint singular-value hinge with a softer CRLB
+# penalty. This should improve mixed phase/amplitude conditioning without
+# forcing every singular mode above a sharp floor.
+
+extends = "kilo_keck_6.toml"
+
+[run]
+name = "kilo_keck_6_joint_crlb"
+description = "KILO Keck N=6 quadrature mesh with soft joint phase+amplitude CRLB objective."
+
+[[pipeline.stages]]
+id = "chip_opt"
+amplitude_observability_weight = 0.0
+joint_observability_weight = 0.0
+joint_observability_min_singular_per_scaled_mode = 1.0e-2
+joint_observability_port_set = "bright_dark"
+joint_observability_n_spectral_channels = 1
+joint_observability_amplitude_scale = 0.0214
+joint_observability_crlb_weight = 1.0e-3
+joint_observability_crlb_target_per_scaled_mode = 100.0
+joint_observability_science_null_guard_weight = 0.0
+
+[[pipeline.stages]]
+id = "characterization"
+replace = true
+type = "characterization.spectro"
+n_modes = 24
+n_bright_ports = 12
+n_dark_ports = 11
+n_spectro_ports = 1
+wl_design_um = 1.25375
+null_floor = 1.0e-6
+n_restarts = 3
+max_iter = 10000
+n_workers = 4
+seed = 42
+tracker_observability_weight = 1.0e-2
+tracker_observability_min_singular_per_nm = 1.0e-3
+tracker_observability_crlb_weight = 1.0e-3
+tracker_observability_crlb_target_nm = 100.0
+dac_bits = 16
+backend = "torch"
+band = "J"
+broadband_n_wavelengths = 1
+spectrograph = "mkid"
+use_upstream_chip_params_start = false
+n_spectro_pixels = 1
+snr_min_per_bin = 3.0
+resolving_power_cap = 10000.0
+awg_resolving_power = 10000.0
+awg_throughput = 0.7
+awg_free_spectral_range_fraction = 1.0
+awg_order = 1
+awg_pixels_per_resolution_element = 2
+disk_n_rings = 3
+disk_n_azimuths = 4
+disk_kernel_order = 0
+disk_integral_n_radial = 21
+disk_integral_n_pa = 16
+n_dark_count_hz = 0.0
+n_sky_background_hz = 0.0
+with_fringe_tracking = true
+
+[[pipeline.stages]]
+id = "characterization_curve"
+replace = true
+type = "characterization.detection_curve"
+n_modes = 24
+n_bright_ports = 12
+n_dark_ports = 11
+n_spectro_ports = 1
+wl_design_um = 1.25375
+null_floor = 1.0e-6
+n_anchors = 12
+separation_min_mas = 0.5944725589892117
+separation_max_mas = 300.0
+position_angle_deg = 0.0
+n_restarts = 3
+max_iter = 2000
+n_workers = 4
+# Span the plotted detection-space range. The outer anchors may not beat
+# detection mode by 5x, but they should still be shown rather than suppressed.
+seed = 2060
+throughput_weight = 2.0
+bright_weight = 0.05
+snr_proxy_weight = 4.0
+tracker_observability_weight = 1.0e-2
+tracker_observability_min_singular_per_nm = 1.0e-3
+tracker_observability_crlb_weight = 1.0e-3
+tracker_observability_crlb_target_nm = 100.0
+use_upstream_chip_params_start = false
+dac_bits = 16
+backend = "torch"
+target_snr = 5.0
+band = "J"
+broadband_n_wavelengths = 5
+disk_n_rings = 3
+disk_n_azimuths = 4
+disk_kernel_order = 0
+disk_integral_n_radial = 21
+disk_integral_n_pa = 16
+n_dark_count_hz = 0.0
+n_sky_background_hz = 0.0
+with_fringe_tracking = true
+skip_jmags = [6.0, 10.0, 12.0]

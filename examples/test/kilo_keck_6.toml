@@ -1,0 +1,228 @@
+# KILO Keck reduced-subaperture quadrature-mesh architecture test.
+#
+# This config inherits the current KILO Keck quadrature baseline and reduces
+# each Keck pupil from 12 to 6 photonic subapertures:
+#
+#   12 physical aperture modes -> 24 Clements inputs
+#                              -> 12 tracker bright outputs
+#                              -> 11 dark science outputs + 1 spectro output
+#
+# The point is to test whether the duplicated-input quadrature tracker can
+# keep useful piston observability and science contrast with a much smaller,
+# more buildable MZI mesh than the 48-port version.
+
+extends = "../kilo_keck.toml"
+
+[run]
+name = "kilo_keck_6"
+description = "KILO Keck quadrature mesh with 6 subapertures per Keck telescope."
+
+[[pipeline.stages]]
+id = "ao"
+n_subapertures_per_aperture = 6
+
+[[pipeline.stages]]
+id = "injection"
+n_modes = 12
+
+[[pipeline.stages]]
+id = "chip_opt"
+n_modes = 24
+n_bright_ports = 12
+n_dark_ports = 11
+n_spectro_ports = 1
+# Spend reduced-M mesh degrees of freedom on science nulling, piston tracking,
+# and soft joint phase+amplitude Fisher conditioning. The joint CRLB term was
+# the best behaved variant in the N=6 characterization SNR search.
+amplitude_mismatch_weight = 0.0
+amplitude_mismatch_n_spectral_channels = 1
+amplitude_mismatch_probe_sigma_i = 0.0214
+amplitude_dump_min_fraction = 0.0
+amplitude_observability_weight = 0.0
+amplitude_observability_min_singular_per_fractional_intensity = 1.0e-2
+amplitude_observability_port_set = "bright_dark"
+amplitude_observability_n_spectral_channels = 1
+joint_observability_weight = 0.0
+joint_observability_min_singular_per_scaled_mode = 1.0e-2
+joint_observability_port_set = "bright_dark"
+joint_observability_n_spectral_channels = 1
+joint_observability_amplitude_scale = 0.0214
+joint_observability_crlb_weight = 1.0e-3
+joint_observability_crlb_target_per_scaled_mode = 100.0
+joint_observability_science_null_guard_weight = 0.0
+tracker_observability_weight = 1.0e-2
+tracker_observability_min_singular_per_nm = 1.0e-3
+tracker_observability_n_spectral_channels = 1
+tracker_observability_crlb_weight = 1.0e-3
+tracker_observability_crlb_target_nm = 100.0
+tracker_observability_rank_priority = true
+# The N=6 quadrature mesh ablation showed disk objective rows suppress
+# small-angle detection throughput more than the realized stellar disk floor.
+disk_n_rings = 0
+disk_n_azimuths = 0
+disk_weight = 0.0
+
+[[pipeline.stages]]
+id = "chip"
+n_modes = 24
+n_bright_ports = 12
+n_dark_ports = 11
+n_spectro_ports = 1
+
+[[pipeline.stages]]
+id = "detector"
+n_modes = 24
+n_bright_ports = 12
+n_dark_ports = 11
+n_spectro_ports = 1
+
+[[pipeline.stages]]
+id = "fringe_tracking"
+n_modes = 12
+
+[[pipeline.stages]]
+id = "fringe_observability_pre_sensitivity"
+type = "diagnostics.fringe_observability"
+before = "sensitivity"
+# Lightweight pre-sensitivity pass used only to build the bright-port CRLB
+# covariance that drives sensitivity.detection_curve. The heavier inherited
+# fringe_observability stage still runs after sensitivity for plots, nonlinear
+# diagnostics, amplitude post-processing, and cophasing handoff summaries.
+n_spectral_channels = 1
+tracker_qe = 0.85
+tracker_count_rate_cap_hz_per_channel = 1.0e8
+count_rate_source = "photon_rates"
+dark_rate_hz_per_channel = 10.0
+n_monte_carlo = 0
+piston_rms_nm_for_mc = 50.0
+amplitude_estimator_port_set = "bright_dark"
+amplitude_postprocessing_n_monte_carlo = 0
+gauss_newton_max_iter = 0
+active_acquisition_n_monte_carlo = 0
+cophasing_handoff_n_monte_carlo = 0
+mc_seed = 42
+
+[[pipeline.stages]]
+id = "fringe_observability"
+n_spectral_channels = 1
+amplitude_estimator_port_set = "bright_dark"
+
+[[pipeline.stages]]
+id = "sensitivity"
+n_bright_ports = 12
+n_dark_ports = 11
+n_spectro_ports = 1
+# Use the closed-loop fringe-tracker residual (fringe_tracking.closed_loop) as
+# the realized piston floor for the published detection curves: this is the
+# instrument's actual servo prediction (~0.7 nm at J=4, ~3.9 nm at J=8) and
+# yields a floor-limited null. The fringe-observability temporal-Kalman
+# one-step-prediction surrogate that previously drove this stage was built on
+# the open-loop AO prior and used the servo bandwidth as a prediction interval,
+# overestimating the piston ~4x at J=4. The fringe_observability stage still
+# runs (after sensitivity) for the single-frame CRLB / observability diagnostics.
+ao_piston_residual_source = "opd_budget"
+
+# Re-enable the characterization-mode products for the reduced quadrature
+# layout. The inherited M48 baseline omits these because its port split no
+# longer matches the old M24 KILO characterization anchors; this test config
+# is M24 again, but with 12 tracker outputs instead of 5.
+[[pipeline.stages]]
+id = "characterization"
+n_modes = 24
+n_bright_ports = 12
+n_dark_ports = 11
+n_spectro_ports = 1
+# Use the detector-grid bin that also lands on the 5-bin representative
+# characterization grid; targeting the off-grid 1.25 um midpoint penalizes a
+# fixed-OPD mesh at every evaluated slice.
+wl_design_um = 1.25375
+null_floor = 1.0e-6
+n_restarts = 3
+max_iter = 5000
+# Compile the eager torch objective (compile_objective). Restart parallelism
+# (n_workers > 1) is GIL bound for this optimizer and crashes under
+# torch.compile (dynamo MetricsContext is not thread safe), so keep restarts
+# serial; the compiled objective is the per-step win, not threads.
+compile_objective = true
+n_workers = 1
+seed = 42
+throughput_weight = 2.0
+bright_weight = 0.05
+snr_proxy_weight = 4.0
+tracker_observability_weight = 1.0e-2
+tracker_observability_min_singular_per_nm = 1.0e-3
+tracker_observability_crlb_weight = 1.0e-3
+tracker_observability_crlb_target_nm = 100.0
+enforce_null_constraint = true
+# The single-target spectro retune uses a cheap design-bin objective. Restart
+# selection and the published metrics still evaluate the full detector grid;
+# the detection-space characterization curve below is the primary SNR product.
+broadband_n_wavelengths = 1
+dac_bits = 16
+band = "J"
+backend = "torch"
+spectrograph = "mkid"
+use_upstream_chip_params_start = false
+n_spectro_pixels = 1
+snr_min_per_bin = 3.0
+resolving_power_cap = 10000.0
+awg_resolving_power = 10000.0
+awg_throughput = 0.7
+awg_free_spectral_range_fraction = 1.0
+awg_order = 1
+awg_pixels_per_resolution_element = 2
+# The known-planet spectro retune needs finite-disk samples in the objective:
+# the single spectro port otherwise finds a good on-axis row but leaves resolved
+# stellar leakage high enough to dominate characterization SNR.
+disk_n_rings = 3
+disk_n_azimuths = 4
+disk_kernel_order = 0
+disk_integral_n_radial = 21
+disk_integral_n_pa = 16
+n_dark_count_hz = 0.0
+n_sky_background_hz = 0.0
+with_fringe_tracking = true
+
+[[pipeline.stages]]
+id = "characterization_curve"
+n_modes = 24
+n_bright_ports = 12
+n_dark_ports = 11
+n_spectro_ports = 1
+wl_design_um = 1.25375
+null_floor = 1.0e-6
+n_anchors = 12
+separation_min_mas = 0.5944725589892117
+separation_max_mas = 300.0
+position_angle_deg = 0.0
+n_restarts = 3
+max_iter = 2000
+# See characterization above: compile the objective, keep restarts serial.
+compile_objective = true
+n_workers = 1
+# Span the plotted detection-space range. The outer anchors may not beat
+# detection mode by 5x, but they should still be shown rather than suppressed.
+seed = 2060
+throughput_weight = 2.0
+bright_weight = 0.05
+snr_proxy_weight = 4.0
+tracker_observability_weight = 1.0e-2
+tracker_observability_min_singular_per_nm = 1.0e-3
+tracker_observability_crlb_weight = 1.0e-3
+tracker_observability_crlb_target_nm = 100.0
+enforce_null_constraint = true
+use_upstream_chip_params_start = false
+dac_bits = 16
+backend = "torch"
+target_snr = 5.0
+band = "J"
+broadband_n_wavelengths = 5
+disk_n_rings = 3
+disk_n_azimuths = 4
+disk_kernel_order = 0
+disk_integral_n_radial = 21
+disk_integral_n_pa = 16
+n_dark_count_hz = 0.0
+n_sky_background_hz = 0.0
+with_fringe_tracking = true
+skip_jmags = [6.0, 10.0, 12.0]

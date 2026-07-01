@@ -1,0 +1,615 @@
+# NAYRA E-ELT reference config.
+#
+# Single 39.146 m E-ELT aperture at Cerro Armazones with N=18
+# sub-apertures within the pupil -> 18 input modes -> 153-MZI Clements
+# mesh (324 real parameters). Sub-apertures are packed inside the
+# circular E-ELT envelope avoiding the 0.11 fractional central
+# obstruction and six 0.5 m spider vanes.
+#
+# Source: nayra/
+#         config.py::nayra_config(n_sub=18, wavelength_band="J")
+#         frontend.py / array.py / atmosphere.py / wfs.py /
+#         injection.py / transport.py / chip.py / detectors.py /
+#         fringe_tracking.py / performance.py
+#
+# Parameter sources by domain:
+#   * Telescope/site → nayra/config.py::eelt_telescope() and
+#     atmosphere.py (Cerro Armazones: r0=0.157 m, tau0=5.5 ms,
+#     theta0=2.5", v_wind=9 m/s, L0=22 m).
+#   * AO → nayra/wfs.py::PyramidWFSConfig (3000 actuators, 3 kHz,
+#     80 sub-aps across, target-derived R-band guide star, unmodulated).
+#   * Chip -> nayra/chip.py (M=18 -> n_bright=4, n_dark=13,
+#     n_spectro=1 per the ceil((M-1)/4.25) rule with the AWG spectro
+#     port held back).
+#   * Detector → nayra/detectors.py (MKID QE 0.7, 100 kcps per-pixel
+#     cap; SNSPD QE 0.85, 100 Mcps).
+#   * Fringe tracking → nayra/fringe_tracking.py (predictive Kalman/LQG
+#     with 5% lag-variance residual, n_spectral_eff=2.5, fringe vis 0.9).
+#
+# NAYRA is a single-aperture single-bench instrument, so
+# `delay_lines.geometric` is omitted by design (no inter-telescope path
+# equalization). `telescope.fixed_aperture` correctly uses n_apertures=1;
+# the N sub-apertures live *inside* the pupil and are derived from the
+# pyramid_wfs stage's pupil-template geometry.
+
+[run]
+name = "nayra_eelt_baseline"
+description = "NAYRA single-aperture E-ELT kernel-nuller, J-primary, N=18 baseline."
+seed = 1
+# Outer sweep-cell pool size. Each chip-opt cell runs single-threaded
+# (torch + numpy default to one thread per spawn-fork child on macOS),
+# so we get one core per cell. Cap at 10 to leave 2 perf-cores free
+# on a 16-core / 12-perf-core machine.
+n_workers = 10
+
+[site]
+preset = "cerro_armazones_site"
+
+[telescope]
+preset = "eelt_telescope"
+
+[grid]
+# J-band primary science grid: 1.25 um center x 0.16 um bandwidth
+# (NAYRA nayra_config wavelength_band="J"). NAYRA observes J/H/K
+# simultaneously; the FT and amplitude-servo stages below scale their
+# photon budgets to the summed J/H/K science light while this run's
+# science outputs remain J-primary by default. 20 bins matches
+# NAYRA ChipConfig.n_wavelength_bins.
+wavelength_center_um = 1.25
+wavelength_bandwidth_um = 0.16
+n_wavelength_bins = 20
+
+[scene.star]
+# NAYRA headline baseline: J=5 F-type host at 5 pc. Studies sweep
+# J=3–12; the AO guide-star R magnitude is derived from J and this type.
+jmag = 5.0
+spectral_type = "F"
+angular_diameter_mas = 1.0
+distance_pc = 5.0
+
+[scene.planet]
+# Planet contrast 1e-6 at 10 mas separation (E-ELT lambda/D at J is ~6.6 mas,
+# so 10 mas is just outside the diffraction limit). Position angle 0°
+# matches NAYRA scripts/* convention.
+contrast = 1.0e-6
+separation_mas = 10.0
+position_angle_deg = 0.0
+
+[scene.exozodi]
+level_zodi = 1.0
+
+[observation]
+hour_angle_h = 0.0
+# NAYRA ObservationConfig default integration: 8 h on-source. Long
+# baseline for the 1e-8 to 1e-7 reflected-light contrast headline targets.
+integration_time_s = 28800.0
+
+# ------------------------------------------------------------------
+# Pipeline
+# ------------------------------------------------------------------
+
+[[pipeline.stages]]
+id = "scene"
+type = "scene.point_source"
+# Cerro Armazones latitude is -24.59° so a southern target near
+# dec=-25° transits at zenith. Run at zenith (airmass 1.0) to match
+# NAYRA's nominal atmospheric-transmission and r0/tau0 scaling.
+altitude_deg = 90.0
+azimuth_deg = 0.0
+
+[[pipeline.stages]]
+id = "six_chip_architecture"
+type = "instrument.nayra_six_chip"
+primary_band = "J"
+n_modes = 18
+n_bright_ports = 4
+n_dark_ports = 13
+n_spectro_ports = 1
+frontend_bulk_transmission = 0.85
+pbs_insertion_loss_db = 0.5
+pm_fiber_length_m = 5.0
+edge_coupler_loss_db = 0.3
+
+# Single E-ELT aperture. Diameter, aperture count, central obstruction,
+# mirror transmission, and AO-bench transmission come from
+# [telescope].preset = "eelt_telescope".
+[[pipeline.stages]]
+id = "array"
+type = "telescope.fixed_aperture"
+
+# Cerro Armazones atmosphere. r0, L0, effective wind speed, and J-band
+# atmospheric transmission come from [site].preset = "cerro_armazones_site".
+[[pipeline.stages]]
+id = "atmosphere"
+type = "atmosphere.kolmogorov"
+
+# Pyramid WFS matched to NAYRA defaults (nayra/wfs.py::PyramidWFSConfig):
+# 3000 actuators, 3 kHz loop, 80 sub-apertures across the 39 m pupil
+# (~0.49 m sub-aps matched to M4 0.54 m pitch), unmodulated for max
+# sensitivity. The natural guide star is the science target: derive R
+# from scene.star.jmag and scene.star.spectral_type. n_actuators=3025
+# (strict-square 55² = 3025) is the closest square to 3000 per nullsim.
+#
+# 18 photonic sub-apertures packed inside the circular E-ELT envelope
+# avoiding the 0.11 central obstruction and six ELT spider vanes; pupil
+# geometry helper derives d_sub = 6.22 m for M=18 from NAYRA's packed
+# E-ELT pupil model.
+[[pipeline.stages]]
+id = "ao"
+type = "ao.pyramid_wfs"
+n_actuators = 3025
+loop_frequency_hz = 3000.0
+n_subap_across = 80
+derive_r_mag_from_scene_jmag = true
+modulation_lambda_d = 0.0
+wfs_wavelength_um = 0.7
+wfs_bandwidth_um = 0.3
+dichroic_throughput = 0.95
+atmospheric_throughput = 0.93
+mirror_throughput = 0.86
+quantum_efficiency = 0.85
+excess_noise_sq = 1.0
+readout_noise_e_rms = 0.0
+n_subapertures_per_aperture = 18
+pupil_template = "eelt"
+
+[[pipeline.stages]]
+id = "injection"
+type = "injection.ideal"
+# 18 input modes from the M=18 sub-aperture sampler.
+n_modes = 18
+# Apply Strehl × η_opt × (1 − R_Fresnel) per NAYRA injection.py
+# (Ruilier-Cassaing optimal coupling 0.81 unobstructed, Fresnel 0.035
+# per silica fiber face).
+apply_strehl_coupling = true
+apply_fresnel_injection_loss = true
+
+# Warm front-end polarization chain. The J-primary run propagates the two
+# PBS arms through the downstream chip/detector as the field n_pol axis.
+# The `instrument.nayra_six_chip` manifest above records the sibling Y/H
+# chips; full simultaneous multiband orchestration is a factory-layer task.
+[[pipeline.stages]]
+id = "hwp"
+type = "polarization.hwp"
+hwp_angle_rad = 0.0
+design_wavelength_um = 1.25
+retardance_error_rms_rad = 0.02
+band_half_width_lambda = 0.25
+insertion_loss_db = 0.0
+
+[[pipeline.stages]]
+id = "pbs"
+type = "polarization.pbs_split"
+insertion_loss_db = 0.5
+extinction_ratio_db = 30.0
+axis_offset_rad = 1.0e-3
+
+# PM980-XP polarization-maintaining fiber from injection optics to the
+# photonic chip. NAYRA is a single-bench instrument so the fiber run is
+# very short (~5 m); PM fiber is used everywhere from the warm PBS arm
+# to the cryostat chip to preserve linear polarization. PM980-XP at
+# 1.25 µm is 1.4 dB/km, so a 5 m run loses ~0.007 dB (~0.16%) — well
+# below atmospheric and AO-bench terms. 0.1 mm RMS length-matching error
+# per fabrication-scatter spec. The `transport.pm980` stage is the
+# PM-fiber sibling of `transport.smf28` (same scalar loss + phase +
+# dispersion model, PM980-XP datasheet curve, different default).
+[[pipeline.stages]]
+id = "transport"
+type = "transport.pm980"
+length_m = 5.0
+length_matching_error_m = 0.0001
+phi_rms_rad = 0.01
+
+[[pipeline.stages]]
+id = "pm_fiber_jones"
+type = "polarization.pm_fiber"
+fiber_length_m = 5.0
+per_db_per_100m = 30.0
+per_db_floor = 30.0
+slow_axis_alignment_rms_rad = 17.0e-3
+
+# NOTE: no `delay_lines.geometric` stage — NAYRA is single-bench, no
+# inter-telescope path equalization needed (the N sub-apertures share
+# a common AO loop + metrology bench).
+
+# Chip optimizer dials in the 18-mode unitary; the chip stage consumes
+# the result via optimization_source="auto". Port allocation follows
+# NAYRA's resolve_port_counts: N=18 -> 4 bright / 13 dark / 1 spectro.
+[[pipeline.stages]]
+id = "chip_opt"
+type = "chip_optimization.torch"
+torch_device = "auto"
+n_modes = 18
+n_bright_ports = 4
+n_dark_ports = 13
+n_spectro_ports = 1
+wl_design_um = 1.25
+target_null_depth = 1.0e-6
+max_iter = 2000
+seed = 42
+n_restarts = 3
+restart_patience = 0
+# NAYRA ChipConfig.dac_bits default = 20 (kilo/config.py:231 inherited).
+# 20-bit phase steps ≈ 6 µrad → ~5e-9 quantization leakage floor,
+# well below the AO + FT realized null.
+dac_bits = 20
+n_workers = 1
+capture_convergence_history = true
+# N=18 NAYRA chip search (2026-05-20): pure on-axis K=0 gives the deepest
+# point null but an unusable resolved-stellar-disk floor. A lightly weighted
+# 1-ring x 4-azimuth finite-disk objective drives the chip null below the
+# AO-piston floor without overconstraining the 18-mode mesh.
+kernel_order = 0
+disk_n_rings = 1
+disk_n_azimuths = 4
+disk_weight = 0.02
+compile_objective = true
+n_wl_optimize = 21
+spectral_loss_mode = "off"
+bootstrap_n_restarts = 3
+# NAYRA inherits KILO's throughput-anchor convention (single 3 mas anchor).
+throughput_penalty_alpha = 1.0e-3
+throughput_penalty_seps_mas = [3.0]
+broadband_refine = true
+
+# 18-mode kernel MZI mesh (153 MZIs). NAYRA port layout: 4 bright + 13
+# dark + 1 spectro. The active J-band propagation uses NAYRA's two
+# physical PBS-arm chips: the shared optimized J-band design is deployed
+# separately in arms A/B with independent static input phase trims.
+[[pipeline.stages]]
+id = "chip"
+type = "chip.kernel_mzi_mesh"
+n_modes = 18
+n_bright_ports = 4
+n_dark_ports = 13
+n_spectro_ports = 1
+wl_design_um = 1.25
+optimization_source = "auto"
+dac_bits = 20
+deployment_mode = "per_pol_arm"
+
+# MKID detector matched to NAYRA defaults: QE 0.7, 100 kHz per-pixel
+# saturation cap (nayra/_kilo_adapter.py bumped from KILO's 50 kHz).
+# Bright-port photon load on the 39 m E-ELT at J=5 is ~6× a J=4 Keck
+# cell; n_pixels_bright = 1,000,000 gives generous headroom. Dark-port
+# load is ~6 orders of magnitude lower; the scalar MKID path assigns
+# the same dark-pixel pool to dark and spectro ports.
+[[pipeline.stages]]
+id = "detector"
+type = "detector.mkid"
+qe = 0.7
+mkid_max_count_rate_hz = 1.0e5
+n_pixels_bright = 1000000
+n_pixels_dark = 280
+n_bright_ports = 4
+n_dark_ports = 13
+n_spectro_ports = 1
+n_modes = 18
+integration_time_s = 28800.0
+band = "J"
+
+# Cerro Armazones/NAYRA sky background. This produces per-dark and
+# per-spectro port rates from the active J grid, upstream throughput,
+# effective sub-aperture area, and NAYRA's dark-port spaxel convention.
+[[pipeline.stages]]
+id = "background"
+type = "background.sky_surface_brightness"
+band = "J"
+
+# Closed-loop fringe tracker matched to NAYRA `FringeTrackingConfig`
+# (nayra/fringe_tracking.py): photon-limited servo bandwidth (omit
+# servo_bw_hz to invoke the photon-limited optimum), fringe vis 0.9,
+# 10 spectral channels, n_spectral_eff=2.5. predictive_lag_reduction
+# = 0.05 (NAYRA default: Kalman/LQG predictor removes 95% of the lag
+# variance vs KILO's 1.0 no-prediction default).
+[[pipeline.stages]]
+id = "fringe_tracking"
+type = "fringe_tracking.closed_loop"
+fringe_visibility = 0.9
+n_spectral_channels = 10
+n_spectral_eff = 2.5
+predictive_lag_reduction = 0.05
+simultaneous_science_bands = ["Y", "J", "H"]
+# Cerro Armazones zenith MKO-bandpass transmission for Y/J/H. The
+# current J-grid detector rates already include the J throughput; these
+# values make the FT photon budget a relative simultaneous-band scaling.
+simultaneous_science_band_transmissions = [0.985, 0.985, 0.97]
+# Leave effective_baseline_m unset so the fringe tracker uses the
+# AO-derived ELT sub-aperture diameter for the piston crossing time.
+use_full_piston_servo_residual = true
+n_modes = 18
+
+[[pipeline.stages]]
+id = "calibration"
+type = "calibration.floor_lookup"
+band = "J"
+lookup_table_path = "nullsim/data/nayra_reference/calibration_time_J_M18.json"
+# Deterministic NAYRA M=18 scalar baseline table. Regenerate from
+# nayra calibration-time products when the full six-chip optical model
+# lands; default remains as a conservative fallback outside the table.
+default_floor_log10 = -6.0
+
+# Per-separation throughput + stellar-disk leakage + AO-realized null
+# Monte Carlo. Produces the per-separation curve performance.standard
+# consumes for contrast(sep).
+[[pipeline.stages]]
+id = "sensitivity"
+type = "sensitivity.detection_curve"
+n_bright_ports = 4
+n_dark_ports = 13
+n_spectro_ports = 1
+n_pa_samples = 36
+include_angular_coupling = true
+n_azimuths = 6
+n_realizations_per_azimuth = 200
+n_mc_realizations = 200
+mc_seed = 0
+apply_strehl_coupling = true
+apply_fresnel_injection_loss = true
+ao_piston_scale = 1.0
+# Derive the scintillation residual and effective systematic bandwidth
+# from physics, with NAYRA-specific anchors. NAYRA scintillation index
+# σ_I = 0.05 @ H-band, 5 m sub-aperture, zenith (Roddier 1981 + ESO
+# Cerro Armazones C_n² profile) — bumped from the default 0.041
+# (Mauna Kea) anchor. Amplitude predictive gain variance 20.0 matches
+# NAYRA's Kalman/LQG amplitude servo.
+auto_amplitude_servo_residual = true
+auto_scintillation_anchor_h5m_zenith = 0.05
+auto_scintillation_height_km = 10.0
+auto_amp_predictive_gain_variance = 20.0
+simultaneous_science_bands = ["Y", "J", "H"]
+simultaneous_science_band_transmissions = [0.985, 0.985, 0.97]
+scintillation_index_per_sub = 0.0
+fiber_phase_noise_rms_rad = 0.0
+
+# Known-position spectro-port characterization. Re-optimizes the chip
+# for the (known) planet position from `scene.planet` and reports
+# spectro throughput, leakage, broadband SNR, maximum achievable
+# spectral resolving power, and the rate-binned high-R AWG spectrum.
+# Port split mirrors chip_optimization
+# (4 bright + 13 dark + 1 spectro = 18), keeping the spectro port
+# separate.
+[[pipeline.stages]]
+id = "characterization"
+type = "characterization.spectro"
+n_modes = 18
+n_bright_ports = 4
+n_dark_ports = 13
+n_spectro_ports = 1
+wl_design_um = 1.25
+null_floor = 5.0e-6
+n_restarts = 3
+max_iter = 10000
+seed = 42
+broadband_n_wavelengths = 1
+dac_bits = 20
+band = "J"
+backend = "torch"
+use_upstream_chip_params_start = false
+n_spectro_pixels = 1
+snr_min_per_bin = 3.0
+resolving_power_cap = 10000.0
+awg_resolving_power = 10000.0
+awg_throughput = 0.7
+awg_free_spectral_range_fraction = 1.0
+awg_order = 1
+awg_pixels_per_resolution_element = 2
+disk_n_rings = 3
+disk_n_azimuths = 4
+disk_kernel_order = 0
+disk_integral_n_radial = 21
+disk_integral_n_pa = 16
+n_dark_count_hz = 0.0
+n_sky_background_hz = 0.0
+with_fringe_tracking = true
+
+# Characterization-mode 5σ contrast curve at log-spaced separations.
+# skip_jmags trims the sweep to two representative cells (J=5 baseline,
+# J=9 mid-faint) so the characterization-anchor compute stays bounded.
+[[pipeline.stages]]
+id = "characterization_curve"
+type = "characterization.detection_curve"
+n_modes = 18
+n_bright_ports = 4
+n_dark_ports = 13
+n_spectro_ports = 1
+wl_design_um = 1.25
+null_floor = 5.0e-6
+n_anchors = 12
+position_angle_deg = 0.0
+n_restarts = 3
+max_iter = 5000
+seed = 42
+dac_bits = 20
+backend = "torch"
+target_snr = 5.0
+band = "J"
+disk_n_rings = 3
+disk_n_azimuths = 4
+disk_kernel_order = 0
+disk_integral_n_radial = 21
+disk_integral_n_pa = 16
+n_dark_count_hz = 0.0
+n_sky_background_hz = 0.0
+with_fringe_tracking = true
+skip_jmags = [3.0, 7.0, 12.0]
+
+[[pipeline.stages]]
+id = "performance"
+type = "performance.standard"
+target_snr = 5.0
+with_fringe_tracking = true
+compute_contrast_curve = true
+n_dark_count_hz = 0.0
+n_sky_background_hz = 0.0
+# Fallback separations grid; ignored when sensitivity.detection_curve
+# is present (its 70-point grid takes precedence).
+contrast_curve_separations_mas = [3.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0]
+
+# J-magnitude sweep covering NAYRA's documented J=3–12 study range with
+# the fiducial J=5 G2V baseline in the middle.
+[[sweep]]
+param = "scene.star.jmag"
+values = [3.0, 5.0, 7.0, 9.0, 12.0]
+mode = "grid"
+
+# Kernel-null order fixed at the best N=18 det-mode setting found in the
+# latest nullsim search. The finite-disk rows above carry the resolved-disk
+# suppression; higher Taylor orders overconstrained the 18-mode mesh.
+[[sweep]]
+param = "pipeline.stages.chip_opt.kernel_order"
+values = [0]
+mode = "grid"
+
+# NAYRA sub-aperture-count baseline. These axes are zipped singletons
+# because mode count, port allocation, and detector pixel count are
+# physically coupled.
+[[sweep]]
+param = "pipeline.stages.ao.n_subapertures_per_aperture"
+values = [18]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.six_chip_architecture.n_modes"
+values = [18]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.six_chip_architecture.n_bright_ports"
+values = [4]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.six_chip_architecture.n_dark_ports"
+values = [13]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.injection.n_modes"
+values = [18]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.chip_opt.n_modes"
+values = [18]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.chip_opt.n_bright_ports"
+values = [4]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.chip_opt.n_dark_ports"
+values = [13]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.chip.n_modes"
+values = [18]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.chip.n_bright_ports"
+values = [4]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.chip.n_dark_ports"
+values = [13]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.detector.n_modes"
+values = [18]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.detector.n_bright_ports"
+values = [4]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.detector.n_dark_ports"
+values = [13]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.detector.n_pixels_dark"
+values = [280]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.calibration.lookup_table_path"
+values = [
+    "nullsim/data/nayra_reference/calibration_time_J_M18.json",
+]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.fringe_tracking.n_modes"
+values = [18]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.sensitivity.n_bright_ports"
+values = [4]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.sensitivity.n_dark_ports"
+values = [13]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.characterization.n_modes"
+values = [18]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.characterization.n_bright_ports"
+values = [4]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.characterization.n_dark_ports"
+values = [13]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.characterization_curve.n_modes"
+values = [18]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.characterization_curve.n_bright_ports"
+values = [4]
+mode = "zip"
+
+[[sweep]]
+param = "pipeline.stages.characterization_curve.n_dark_ports"
+values = [13]
+mode = "zip"
+
+[output]
+dir = "results/{run.name}/{timestamp}"
+plots = [
+    "detection_space",
+    "contrast_curve",
+    "subaperture_layout",
+    # uv_coverage_grid omitted: NAYRA is single-aperture, no inter-telescope UV coverage.
+    "chip_diagnostics",
+    "loss_budget",
+    "contrast_curves_multiband",
+    "debug_report",
+]
+tables = ["performance_summary", "characterization_summary"]
+
+[output.formats]
+plots = ["pdf", "png"]
+tables = ["json"]
+
+[cache]
+enabled = true
+dir = ".nullsim_cache"
+version = 1

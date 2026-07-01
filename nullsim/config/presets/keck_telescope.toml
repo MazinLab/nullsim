@@ -1,0 +1,12 @@
+name = "Keck"
+slug = "keck"
+n_apertures = 1
+
+[aperture]
+diameter_m = 10.0
+obscuration_fraction = 0.30
+
+[optics]
+mirror_transmission = 0.92
+ao_bench_transmission = 0.85
+internal_transmission = 0.9

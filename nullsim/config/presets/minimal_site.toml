@@ -1,0 +1,8 @@
+name = "Minimal site"
+altitude_m = 0.0
+transmission_fraction = 1.0
+
+[weather]
+seeing_arcsec = 1.0
+coherence_time_s = 0.01
+

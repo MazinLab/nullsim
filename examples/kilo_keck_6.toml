@@ -1,0 +1,262 @@
+# KILO Keck reduced-subaperture quadrature-mesh — default KILO Keck config.
+#
+# This is the canonical KILO Keck paper config (run name "kilo_keck_6"). The
+# ablation/tuning siblings under examples/test/ extend the test/ copy of this
+# file, so that copy is retained as their parent.
+#
+# This config inherits the current KILO Keck quadrature baseline and reduces
+# each Keck pupil from 12 to 6 photonic subapertures:
+#
+#   12 physical aperture modes -> 24 Clements inputs
+#                              -> 12 tracker bright outputs
+#                              -> 11 dark science outputs + 1 spectro output
+#
+# The point is to test whether the duplicated-input quadrature tracker can
+# keep useful piston observability and science contrast with a much smaller,
+# more buildable MZI mesh than the 48-port version.
+
+extends = "kilo_keck.toml"
+
+[run]
+name = "kilo_keck_6"
+description = "KILO Keck quadrature mesh with 6 subapertures per Keck telescope."
+
+[instrument]
+n_modes = 24
+n_input_modes = 12
+n_bright_ports = 12
+n_dark_ports = 11
+n_spectro_ports = 1
+
+[[pipeline.stages]]
+id = "ao"
+n_subapertures_per_aperture = 6
+
+# KILO is a dual-polarization instrument: an achromatic HWP and a PBS at
+# each re-imaged pupil split the AO-corrected beam into two arms, each
+# feeding its own PM-fiber + delay-line + KILOPIC chip path
+# (kilo/config.py PBSConfig / HWPConfig / PMFiberConfig; the original
+# KILO code default PolarizationMode.SCALAR_LEGACY never enabled it).
+# The parent kilo_keck.toml stays scalar as the paperv3 parity
+# reference; this canonical config carries the physical dual-pol chain.
+# The shared optimized design deploys per PBS arm with independent
+# static input phase trims (chip deployment_mode below).
+[[pipeline.stages]]
+id = "hwp"
+type = "polarization.hwp"
+after = "injection"
+hwp_angle_rad = 0.0
+design_wavelength_um = 1.25
+retardance_error_rms_rad = 0.02
+band_half_width_lambda = 0.25
+insertion_loss_db = 0.0
+
+[[pipeline.stages]]
+id = "pbs"
+type = "polarization.pbs_split"
+after = "hwp"
+insertion_loss_db = 0.5
+extinction_ratio_db = 30.0
+axis_offset_rad = 1.0e-3
+
+# PM980-XP Jones propagation for the 100 m fiber run from the telescopes
+# to the lab (PER >= 30 dB per 100 m, <= 1 deg PM-to-chip slow-axis
+# alignment). The scalar loss/phase/dispersion of the same run stays in
+# the inherited transport.pm980 stage.
+[[pipeline.stages]]
+id = "pm_fiber_jones"
+type = "polarization.pm_fiber"
+after = "transport"
+fiber_length_m = 100.0
+per_db_per_100m = 30.0
+per_db_floor = 30.0
+slow_axis_alignment_rms_rad = 17.0e-3
+
+[[pipeline.stages]]
+id = "chip"
+deployment_mode = "per_pol_arm"
+
+# Each PBS-arm waveguide accepts a single polarization, so the per-port
+# single-mode sky etendue is n_pol * lambda^2 with n_pol = 1. Downstream
+# consumers multiply the per-port rate by the per-arm detector channel
+# count (2x the chip ports), recovering the same total sky as the scalar
+# n_pol = 2 convention; leaving the default 2 here double-counts sky.
+[[pipeline.stages]]
+id = "background"
+n_polarizations = 1
+
+[[pipeline.stages]]
+id = "chip_opt"
+# Spend reduced-M mesh degrees of freedom on science nulling, piston tracking,
+# and soft joint phase+amplitude Fisher conditioning. The joint CRLB term was
+# the best behaved variant in the N=6 characterization SNR search.
+#
+# throughput_penalty_alpha raised 1e-3 -> 1e-2 (2026-06-12 floor/tp grids,
+# runs kilo_keck_6_floor_tp_grid/20260612-094057 and kilo_keck_6_tp_full_a/
+# 20260612-100900): the stronger throughput reward is the restart-basin
+# stabilizer on this 24-mode mesh (3-seed J=4 spread 1.21x -> 1.01x, planet
+# dark throughput 0.068 -> 0.084). The tracker observability floor below
+# only works in combination with it: floor alone (NAYRA lesson) sells
+# planet throughput because kernel_order=3 rows leave no DOF slack.
+throughput_penalty_alpha = 1.0e-2
+# tp+floor is the paper baseline (kilo_keck_6_tp_full_b/20260612-100900):
+# det SNR >= the publication chip at every J (J=4 tie at 40.2, +34%/+11%/
+# +35% at J=6/8/10) while the fringe-tracking diagnostics central to the
+# phasing paper IMPROVE on publication (bright-port condition 11.7 -> 7.9,
+# per-frame CRLB 6.7 -> 4.9 nm, cophasing handoff lock 94% -> 99.6%).
+# tp-alone gives J=4 45.3 but condition 28 / 64% handoff lock - it buys
+# detection SNR by selling the tracker subspace.
+tracker_observability_min_singular_per_nm = 1.3e-2
+amplitude_mismatch_weight = 0.0
+amplitude_mismatch_n_spectral_channels = 1
+amplitude_mismatch_probe_sigma_i = 0.0214
+amplitude_dump_min_fraction = 0.0
+amplitude_observability_weight = 0.0
+amplitude_observability_min_singular_per_fractional_intensity = 1.0e-2
+amplitude_observability_port_set = "bright_dark"
+amplitude_observability_n_spectral_channels = 1
+joint_observability_weight = 0.0
+joint_observability_min_singular_per_scaled_mode = 1.0e-2
+joint_observability_port_set = "bright_dark"
+joint_observability_n_spectral_channels = 1
+joint_observability_amplitude_scale = 0.0214
+joint_observability_crlb_weight = 1.0e-3
+joint_observability_crlb_target_per_scaled_mode = 100.0
+joint_observability_science_null_guard_weight = 0.0
+tracker_observability_weight = 1.0e-2
+tracker_observability_n_spectral_channels = 1
+tracker_observability_crlb_weight = 1.0e-3
+tracker_observability_crlb_target_nm = 100.0
+tracker_observability_rank_priority = true
+# The N=6 quadrature mesh ablation showed disk objective rows suppress
+# small-angle detection throughput more than the realized stellar disk floor.
+disk_n_rings = 0
+disk_n_azimuths = 0
+disk_weight = 0.0
+
+[[pipeline.stages]]
+id = "fringe_observability"
+n_spectral_channels = 1
+amplitude_estimator_port_set = "bright_dark"
+# Match the fringe_tracking SNSPD budget: 4 ganged SNSPDs per port per
+# arm x 1e8 cps x 2 PBS arms = 8e8 cps per pooled tracker channel. The
+# inherited 1e8 cap modeled a single SNSPD and clipped 2/12 channels at
+# J=4 in the scalar publication run.
+tracker_count_rate_cap_hz_per_channel = 8.0e8
+
+[[pipeline.stages]]
+id = "sensitivity"
+# Use the closed-loop fringe-tracker residual (fringe_tracking.closed_loop) as
+# the realized piston floor for the published detection curves. The parent
+# config now routes disturbance-grounded photon-Kalman residuals through the
+# OPD budget, including the IID/common split used by the realized-null
+# covariance MC. The fringe_observability stage still runs after sensitivity
+# for single-frame CRLB / observability diagnostics, but this branch returns
+# before reading that payload.
+ao_piston_residual_source = "opd_budget"
+
+# Re-enable the characterization-mode products for the reduced quadrature
+# layout. The inherited M48 baseline omits these because its port split no
+# longer matches the old M24 KILO characterization anchors; this test config
+# is M24 again, but with 12 tracker outputs instead of 5.
+[[pipeline.stages]]
+id = "characterization"
+# Use the detector-grid bin that also lands on the 5-bin representative
+# characterization grid; targeting the off-grid 1.25 um midpoint penalizes a
+# fixed-OPD mesh at every evaluated slice.
+wl_design_um = 1.25375
+null_floor = 1.0e-6
+n_restarts = 3
+max_iter = 5000
+# Compile the eager torch objective (compile_objective). Restart parallelism
+# (n_workers > 1) is GIL bound for this optimizer and crashes under
+# torch.compile (dynamo MetricsContext is not thread safe), so keep restarts
+# serial; the compiled objective is the per-step win, not threads.
+compile_objective = true
+n_workers = 1
+seed = 42
+throughput_weight = 2.0
+bright_weight = 0.05
+snr_proxy_weight = 4.0
+tracker_observability_weight = 1.0e-2
+tracker_observability_min_singular_per_nm = 1.0e-3
+tracker_observability_crlb_weight = 1.0e-3
+tracker_observability_crlb_target_nm = 100.0
+enforce_null_constraint = true
+# Full 20-bin objective. The old single-design-bin economy (n_wl=1) produced
+# chips with a deep null at 1.25375 um but ~5e-4 mean broadband leak: restart
+# selection evaluates the full grid but can only pick among chromatically
+# optimized candidates, so the headline char SNR ate a ~100x leak-rate
+# penalty (2026-06-10 follow-up).
+broadband_n_wavelengths = 20
+dac_bits = 16
+band = "J"
+backend = "torch"
+spectrograph = "mkid"
+use_upstream_chip_params_start = false
+n_spectro_pixels = 1
+snr_min_per_bin = 3.0
+resolving_power_cap = 10000.0
+awg_resolving_power = 10000.0
+awg_throughput = 0.7
+awg_free_spectral_range_fraction = 1.0
+awg_order = 1
+awg_pixels_per_resolution_element = 2
+# The known-planet spectro retune needs finite-disk samples in the objective:
+# the single spectro port otherwise finds a good on-axis row but leaves resolved
+# stellar leakage high enough to dominate characterization SNR.
+disk_n_rings = 3
+disk_n_azimuths = 4
+disk_kernel_order = 0
+disk_integral_n_radial = 21
+disk_integral_n_pa = 16
+n_dark_count_hz = 0.0
+n_sky_background_hz = 0.0
+with_fringe_tracking = true
+
+[[pipeline.stages]]
+id = "characterization_curve"
+wl_design_um = 1.25375
+null_floor = 1.0e-6
+n_anchors = 12
+separation_min_mas = 0.5944725589892117
+separation_max_mas = 300.0
+position_angle_deg = 0.0
+n_restarts = 3
+max_iter = 2000
+# See characterization above: compile the objective, keep restarts serial.
+compile_objective = true
+n_workers = 1
+# Span the plotted detection-space range. The outer anchors may not beat
+# detection mode by 5x, but they should still be shown rather than suppressed.
+seed = 2060
+throughput_weight = 2.0
+bright_weight = 0.05
+snr_proxy_weight = 4.0
+tracker_observability_weight = 1.0e-2
+tracker_observability_min_singular_per_nm = 1.0e-3
+tracker_observability_crlb_weight = 1.0e-3
+tracker_observability_crlb_target_nm = 100.0
+enforce_null_constraint = true
+use_upstream_chip_params_start = false
+dac_bits = 16
+backend = "torch"
+target_snr = 5.0
+band = "J"
+# Full 20-bin objective: at theta > ~15 mas the planet's inter-telescope
+# phase winds >1 cycle across the J band, and the 5-sample objective aliases
+# it (optimizer overfits its samples; outer anchors collapse ~50x vs det
+# mode). The full-grid landscape is smooth enough that 3 restarts find the
+# good basin (2026-06-09 anchor experiment: n_wl=20 -> contrast 7.3e-8 /
+# SNR 68 at 31 mas vs 7e-5 in production; 10 restarts at n_wl=5 only
+# reached 1.4e-7).
+broadband_n_wavelengths = 20
+disk_n_rings = 3
+disk_n_azimuths = 4
+disk_kernel_order = 0
+disk_integral_n_radial = 21
+disk_integral_n_pa = 16
+n_dark_count_hz = 0.0
+n_sky_background_hz = 0.0
+with_fringe_tracking = true
+skip_jmags = [6.0, 10.0, 12.0]

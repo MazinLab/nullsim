@@ -1,0 +1,211 @@
+# Minimal opt-in example for MKID finite energy resolution and native
+# MKID spectrograph characterization.
+#
+# This is intentionally smaller than kilo_keck.toml: four input modes, one
+# spectro port, no sweep, and short optimizer settings. It demonstrates the
+# new detector response metadata and `characterization.spectro`
+# spectrograph="mkid" branch without changing the KILO parity examples.
+
+[run]
+name = "mkid_native_spectro"
+description = "Four-mode MKID-native spectroscopy demonstration."
+seed = 1
+
+[grid]
+wavelength_center_um = 1.25
+wavelength_bandwidth_um = 0.15
+n_wavelength_bins = 5
+
+[scene.star]
+jmag = 2.0
+spectral_type = "F"
+angular_diameter_mas = 0.5
+distance_pc = 10.0
+
+[scene.planet]
+# Deliberately bright injected companion used to make the native-MKID
+# resolving-power clamp visible in a short CI-scale demo run.
+contrast = 1.0
+separation_mas = 100.0
+position_angle_deg = 0.0
+
+[scene.exozodi]
+level_zodi = 1.0
+
+[observation]
+hour_angle_h = 0.0
+integration_time_s = 1800.0
+
+[[pipeline.stages]]
+id = "scene"
+type = "scene.point_source"
+altitude_deg = 80.0
+azimuth_deg = 180.0
+star_jmag = 2.0
+planet_contrast = 1.0
+
+[[pipeline.stages]]
+id = "array"
+type = "telescope.fixed_aperture"
+diameter_m = 10.0
+n_apertures = 4
+array_layout = "y_array"
+spacing_m = 40.0
+mirror_transmission = 0.80
+
+[[pipeline.stages]]
+id = "pupil_modes"
+type = "telescope.pupil_modes"
+n_modes = 4
+layout = "packed_circular"
+span_fraction = 1.0
+preserve_collecting_area = true
+
+[[pipeline.stages]]
+id = "atmosphere"
+type = "atmosphere.kolmogorov"
+r0_500nm_m = 0.15
+L0_m = 25.0
+wind_speed_m_s = 10.0
+atmospheric_transmission = 0.93
+
+[[pipeline.stages]]
+id = "ao"
+type = "ao.pyramid_wfs"
+n_actuators = 3025
+loop_frequency_hz = 2000.0
+pupil_template = "full_pupil"
+n_subap_across = 50
+derive_r_mag_from_scene_jmag = true
+excess_noise_sq = 1.0
+readout_noise_e_rms = 0.0
+central_obstruction = 0.24
+tau0_500nm_s = 2.83e-3
+theta0_500nm_arcsec = 1.19
+v_wind_m_s = 10.0
+
+[[pipeline.stages]]
+id = "injection_seed"
+type = "injection.ideal"
+n_modes = 4
+apply_strehl_coupling = false
+
+[[pipeline.stages]]
+id = "injection"
+type = "injection.single_mode_fiber"
+central_obscuration_ratio = 0.24
+
+[[pipeline.stages]]
+id = "smf28"
+type = "transport.smf28"
+length_m = 10.0
+phi_rms_rad = 0.01
+
+[[pipeline.stages]]
+id = "delay_lines"
+type = "delay_lines.geometric"
+max_delay_m = 90.0
+
+[[pipeline.stages]]
+id = "chip_opt"
+type = "chip_optimization.scipy"
+n_modes = 4
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+wl_design_um = 1.25
+target_null_depth = 1.0e-5
+max_iter = 30
+seed = 0
+
+[[pipeline.stages]]
+id = "chip"
+type = "chip.kernel_mzi_mesh"
+n_modes = 4
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+wl_design_um = 1.25
+optimization_source = "auto"
+
+[[pipeline.stages]]
+id = "detector"
+type = "detector.mkid"
+qe = 0.7
+mkid_max_count_rate_hz = 5.0e4
+n_pixels_bright = 5000
+n_pixels_dark = 500
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+n_modes = 4
+integration_time_s = 1800.0
+band = "J"
+resolving_power_ref = 30.0
+lambda_ref_um = 1.0
+
+[[pipeline.stages]]
+id = "fringe_tracking"
+type = "fringe_tracking.closed_loop"
+servo_bw_hz = 2000.0
+fringe_visibility = 0.9
+n_spectral_channels = 10
+n_spectral_eff = 2.5
+predictive_lag_reduction = 0.05
+wind_speed_m_s = 10.0
+
+[[pipeline.stages]]
+id = "calibration"
+type = "calibration.floor_lookup"
+default_floor_log10 = -6.0
+band = "J"
+
+[[pipeline.stages]]
+id = "sensitivity"
+type = "sensitivity.detection_curve"
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+separations_mas = [50.0, 100.0, 200.0]
+n_pa_samples = 12
+include_angular_coupling = true
+n_azimuths = 1
+n_realizations_per_azimuth = 0
+n_mc_realizations = 0
+mc_seed = 0
+
+[[pipeline.stages]]
+id = "characterization"
+type = "characterization.spectro"
+n_modes = 4
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+wl_design_um = 1.25
+null_floor = 1.0e-8
+n_restarts = 4
+max_iter = 1500
+seed = 2
+broadband_n_wavelengths = 1
+band = "J"
+spectrograph = "mkid"
+n_spectro_pixels = 1
+snr_min_per_bin = 3.0
+resolving_power_cap = 1000.0
+
+[[pipeline.stages]]
+id = "performance"
+type = "performance.standard"
+target_snr = 5.0
+
+[output]
+dir = "results/{run.name}/{timestamp}"
+tables = ["performance_summary", "characterization_summary"]
+
+[output.formats]
+tables = ["json"]
+
+[cache]
+enabled = true
+dir = ".nullsim_cache"
+version = 1

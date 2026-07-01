@@ -1,0 +1,87 @@
+# SPEC §15.4 detection_space example: trivial pipeline with a J-mag sweep,
+# a [catalog.exoplanets] block, and the headline output plot.
+#
+# Drives the same five-stage pipeline as vertical_slice.toml but adds:
+#   - [catalog.exoplanets] (versioned exoplanet snapshot)
+#   - output.plots = ["detection_space"] (the headline figure)
+# A catalog refresh changes the snapshot SHA-256, which propagates into
+# run_hash, which puts the next run in a brand-new output directory.
+
+[run]
+name = "detection_space_example"
+description = "Headline detection_space figure with a versioned catalog overlay."
+seed = 1
+
+[grid]
+wavelength_center_um = 1.65
+wavelength_bandwidth_um = 0.30
+n_wavelength_bins = 3
+
+[scene.star]
+jmag = 5.0
+angular_diameter_mas = 0.5
+distance_pc = 5.0
+
+[scene.planet]
+contrast = 1.0e-7
+separation_mas = 100.0
+position_angle_deg = 0.0
+
+[scene.exozodi]
+level_zodi = 0.0
+
+[observation]
+hour_angle_h = 0.0
+integration_time_s = 3600.0
+
+[[pipeline.stages]]
+id = "scene"
+type = "scene.point_source"
+
+[[pipeline.stages]]
+id = "array"
+type = "telescope.fixed_aperture"
+diameter_m = 10.0
+
+[[pipeline.stages]]
+id = "injection"
+type = "injection.ideal"
+
+[[pipeline.stages]]
+id = "chip"
+type = "chip.identity"
+
+[[pipeline.stages]]
+id = "detector"
+type = "detector.ideal_counter"
+
+[[sweep]]
+param = "scene.star.jmag"
+values = [4.0, 6.0, 8.0, 10.0, 12.0]
+mode = "grid"
+
+# Versioned exoplanet catalog snapshot. SPEC §8.1: every field here either
+# identifies the source (source_url, query, retrieval_date) or pins the
+# content (snapshot_path, snapshot_hash, classification_rule_version). The
+# computed content_hash enters run_hash so a refresh always produces a new
+# output directory — never a silent edit to the published figure.
+[catalog.exoplanets]
+source_url = "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/TblView/nph-tblView"
+query = "select pl_name,ra,dec,pl_bmasse,pl_rade,pl_orbsmax,pl_orbeccen,sy_dist,discoverymethod from pscomppars where default_flag=1"
+retrieval_date = "2026-04-01"
+snapshot_path = "../../tests/catalogs/fixtures/sample_catalog.csv"
+classification_rule_version = "v1"
+
+[output]
+dir = "results/{run.name}/{timestamp}"
+plots = ["detection_space", "contrast_curve"]
+tables = ["performance_summary"]
+
+[output.formats]
+plots = ["pdf", "png"]
+tables = ["json"]
+
+[cache]
+enabled = true
+dir = ".nullsim_cache"
+version = 1

@@ -1,0 +1,33 @@
+# SPEC §15.7 + §8.3 cross-config study: KILO Maunakea vs HWO-class space.
+#
+# Per SPEC §8.3 the study layer is a thin multiplexer that runs each
+# referenced config and dispatches its registered outputs against the
+# combined RunCollection. The schema below matches the SPEC §8.3
+# example (`[study]` table with a `runs` array of {config, label}
+# tables).
+#
+# STATUS: the `nullsim study` runner is deferred per task #36 sub-pass
+# 36d (study-layer multiplexer not yet implemented). This TOML is shipped
+# now so the §15.7 milestone has a concrete cross-config example on disk
+# and the schema is pinned for when the runner lands. Once implemented,
+#
+#     nullsim study run examples/test/kilo_vs_hwo_study.toml
+#
+# will execute both configs (cache-aware) and produce an overlaid
+# detection_space figure plus a combined contrast_curve.
+
+[study]
+name = "kilo_vs_hwo"
+description = "Cross-config overlay of KILO Maunakea (ground) vs HWO-class (space)."
+runs = [
+  { config = "kilo_maunakea.toml",    label = "KILO Maunakea (4×8.4 m, ground)" },
+  { config = "../hwo_space.toml",     label = "HWO-class (1×8 m, space)"        },
+]
+
+[output]
+plots = ["detection_space", "contrast_curve"]
+tables = ["performance_summary"]
+
+[output.formats]
+plots = ["pdf", "png"]
+tables = ["json"]

@@ -1,0 +1,20 @@
+name = "Cerro Armazones"
+slug = "cerro_armazones"
+latitude_deg = -24.589
+longitude_deg = -70.191
+altitude_m = 3064.0
+
+[atmosphere]
+r0_500nm_m = 0.157
+L0_m = 22.0
+wind_speed_m_s = 9.0
+tau0_500nm_s = 5.5e-3
+theta0_500nm_arcsec = 2.5
+atmospheric_transmission = 0.985
+
+[sky]
+profile = "cerro_armazones"
+Y_mag_arcsec2 = 17.0
+J_mag_arcsec2 = 15.5
+H_mag_arcsec2 = 13.0
+K_mag_arcsec2 = 12.0

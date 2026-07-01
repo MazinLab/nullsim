@@ -1,0 +1,119 @@
+# KILO Keck duplicated-input Clements mesh architecture test.
+#
+# Inherits the baseline KILO Keck config and inserts an equal-power splitter
+# before the chip optimizer so the normal KILO-style optimizer sees a 48-mode
+# Clements mesh:
+#
+#   24 physical aperture modes -> 48 Clements inputs
+#                              -> 24 tracker bright outputs
+#                              -> 23 dark science outputs + 1 spectro output
+#
+# The optimizer keeps the baseline KILO features: kernel_order=3 broadband
+# rows, throughput penalty, delay-state replay, DAC quantization, and
+# torch/Clements deployment. This config also enables finite-disk sample rows
+# on the chip optimizer so the duplicated architecture is directly penalized
+# for the resolved-host leakage that dominated the analytic placeholder.
+# In nullsim's area-normalized field convention the splitter duplicates field
+# amplitudes and publishes half-area output modes; downstream photon-rate and
+# optimizer paths then see the correct conserved power.
+# The inherited M24 calibration lookup is removed because it is not a valid
+# floor for this exploratory M48 port layout; performance is judged from the
+# physics stages until a matching calibration-time table exists.
+
+extends = "../kilo_keck.toml"
+
+[run]
+name = "kilo_keck_quadrature_mesh"
+description = "KILO Keck with a 48-mode duplicated-input Clements mesh."
+
+[[pipeline.stages]]
+id = "quadrature_split"
+copies = 2
+
+[[pipeline.stages]]
+id = "chip_opt"
+n_modes = 48
+n_bright_ports = 24
+n_dark_ports = 23
+n_spectro_ports = 1
+# Add explicit finite-disk optimizer rows on top of the inherited
+# kernel_order=3 rows. The baseline KILO config evaluates the disk floor
+# downstream but does not include disk samples in chip_opt.
+disk_n_rings = 3
+disk_n_azimuths = 4
+disk_weight = 1.0
+# Preserve the top 24 tracker outputs as a useful physical-piston sensor while
+# the dark/spectro outputs optimize the science null. The floor is on the
+# fractional bright-port intensity-response singular values per nm of physical
+# piston, evaluated in the same single independent tracker channel used by the
+# diagnostic below.
+tracker_observability_weight = 1.0e-3
+tracker_observability_min_singular_per_nm = 1.0e-3
+tracker_observability_n_spectral_channels = 1
+
+[[pipeline.stages]]
+id = "chip"
+n_modes = 48
+n_bright_ports = 24
+n_dark_ports = 23
+n_spectro_ports = 1
+
+[[pipeline.stages]]
+id = "detector"
+n_modes = 48
+n_bright_ports = 24
+n_dark_ports = 23
+n_spectro_ports = 1
+
+[[pipeline.stages]]
+id = "fringe_observability"
+# The duplicated-input Clements architecture has 24 tracker outputs. Start with
+# the minimum spectral count-channel requirement and let the diagnostic report
+# whether the optimized bright rows span all 23 differential piston modes.
+n_spectral_channels = 1
+gauss_newton_max_iter = 10
+gauss_newton_piston_rms_grid_nm = [1.0, 3.0, 10.0, 30.0, 100.0]
+gauss_newton_sweep_n_monte_carlo = 32
+active_acquisition_n_monte_carlo = 64
+active_acquisition_n_passes = 3
+active_acquisition_response_iterations = 8
+active_acquisition_probe_step_nm = 10.0
+active_acquisition_max_response_step_nm = 80.0
+active_acquisition_scan_half_range_nm = 150.0
+active_acquisition_scan_steps = 61
+active_acquisition_lock_threshold_nm = 10.0
+cophasing_handoff_n_monte_carlo = 256
+cophasing_tracker_fraction = 1.0
+cophasing_visibility = 1.0
+cophasing_science_drift_rms_nm = 2.0
+cophasing_lock_threshold_nm = 10.0
+
+[[pipeline.stages]]
+id = "sensitivity"
+n_bright_ports = 24
+n_dark_ports = 23
+n_spectro_ports = 1
+
+[[pipeline.stages]]
+id = "characterization"
+remove = true
+
+[[pipeline.stages]]
+id = "characterization_curve"
+remove = true
+
+[output]
+plots = [
+    "detection_space",
+    "contrast_curve",
+    "null_transmission_map",
+    "subaperture_layout",
+    "uv_coverage_grid",
+    "chip_diagnostics",
+    "fringe_observability",
+    "cophasing_unitary",
+    "loss_budget",
+    "contrast_curves_multiband",
+    "debug_report",
+]
+tables = ["performance_summary"]
