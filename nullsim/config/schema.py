@@ -418,6 +418,12 @@ class TopLevelConfig(StrictConfigModel):
     output: OutputConfig = Field(default_factory=OutputConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     catalog: CatalogConfig | None = None
+    # Opaque passthrough for the nullsimtd time-domain companion package:
+    # nullsim never interprets [timedomain.*]; nullsimtd validates it with
+    # its own schema. Present blocks fold into config_hash via the canonical
+    # dump; absent blocks are dropped by exclude_none, so pre-existing
+    # configs keep their hashes (and cache entries).
+    timedomain: dict[str, Any] | None = None
 
     @property
     def sweeps(self) -> tuple[SweepSpec, ...]:

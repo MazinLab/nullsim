@@ -747,3 +747,54 @@ def test_runtime_python_version_excludes_build_banner() -> None:
     assert "[Clang" not in value
     assert "[GCC" not in value
     assert "[MSC" not in value
+
+
+def test_load_config_accepts_timedomain_passthrough(tmp_path: Path) -> None:
+    config_text = _base_config() + """
+[timedomain.engine]
+dt_ms = 0.1
+duration_s = 5.0
+
+[timedomain.ao]
+loop_rate_hz = 1000
+"""
+    resolved_config = load_config(_write_config(tmp_path, config_text))
+    assert resolved_config.timedomain == {
+        "engine": {"dt_ms": 0.1, "duration_s": 5.0},
+        "ao": {"loop_rate_hz": 1000},
+    }
+
+
+def test_load_config_without_timedomain_leaves_field_none(tmp_path: Path) -> None:
+    resolved_config = load_config(_write_config(tmp_path, _base_config()))
+    assert resolved_config.timedomain is None
+    # exclude_none keeps the canonical text — and therefore config_hash —
+    # identical for configs that predate the passthrough section.
+    assert "timedomain" not in resolved_config.resolved_toml_text
+
+
+def test_timedomain_block_folds_into_config_hash(tmp_path: Path) -> None:
+    without_block = load_config(_write_config(tmp_path, _base_config()))
+    with_block = load_config(
+        _write_config(
+            tmp_path,
+            _base_config() + "\n[timedomain.engine]\ndt_ms = 0.1\n",
+        )
+    )
+    assert without_block.config_hash != with_block.config_hash
+
+
+def test_load_config_timedomain_merges_through_extends(tmp_path: Path) -> None:
+    parent = _write_config(
+        tmp_path,
+        _base_config() + "\n[timedomain.engine]\ndt_ms = 0.1\nduration_s = 5.0\n",
+    )
+    child = tmp_path / "child.toml"
+    child.write_text(
+        f'extends = "{parent.name}"\n\n[timedomain.engine]\nduration_s = 2.0\n',
+        encoding="utf-8",
+    )
+    resolved_config = load_config(child)
+    assert resolved_config.timedomain == {
+        "engine": {"dt_ms": 0.1, "duration_s": 2.0},
+    }
