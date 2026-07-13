@@ -467,12 +467,14 @@ ao_piston_residual_source = "fringe_observability"
 fringe_observability_predictive_model = "temporal_kalman"
 fringe_observability_temporal_wind_speed_m_s = 9.0
 # Derive the scintillation residual and effective systematic bandwidth
-# from physics, with NAYRA-specific anchors: sigma_I = 0.05 @ H-band,
-# 5 m sub-aperture, zenith (Roddier 1981 + ESO Cerro Armazones C_n^2
-# profile). Amplitude predictive gain pinned to the same x3 variance
-# the piston side adopted; the old x20 was undemonstrated.
+# from physics, with NAYRA-specific anchors: sigma_I(5 m, zenith) =
+# 2.2e-3 from the Kornilov et al. (2012) Armazones median
+# (S_2^2 ~ 2e-4 m^(7/3); achromatic in the aperture-averaged regime —
+# the old 0.05 anchor predated the 2026-07-13 audit and was ~20x the
+# measured value). Amplitude predictive gain pinned to the same x3
+# variance the piston side adopted; the old x20 was undemonstrated.
 auto_amplitude_servo_residual = true
-auto_scintillation_anchor_h5m_zenith = 0.05
+auto_scintillation_anchor_h5m_zenith = 0.0022
 auto_scintillation_height_km = 10.0
 auto_amp_predictive_gain_variance = 3.0
 simultaneous_science_bands = ["J", "H", "K"]

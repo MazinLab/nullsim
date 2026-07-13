@@ -3149,8 +3149,11 @@ class DetectionCurve(BaseStage):
         # When None and ``auto_amplitude_servo_residual=True``, derive
         # from the detector's bright-port rate divided by n_modes (the
         # bright_rate already includes all upstream throughput losses).
+        # Kornilov et al. (2012) Q1 Maunakea measurement: S_2^2 = 0.77e-4
+        # m^(7/3) -> sigma_I(5 m, zenith) = 1.3e-3, achromatic (2026-07-13
+        # audit; the old 0.041 was ~30x the measured value).
         auto_scintillation_anchor_h5m_zenith: float = PydanticField(
-            default=0.041, gt=0.0,
+            default=0.0013, gt=0.0,
         )
         auto_scintillation_height_km: float = PydanticField(default=10.0, gt=0.0)
         auto_high_altitude_wind_ms: float = PydanticField(default=35.0, gt=0.0)

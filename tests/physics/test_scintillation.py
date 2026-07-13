@@ -1,9 +1,9 @@
 """Tests for the atmospheric scintillation and amplitude-servo model.
 
-The implementation in ``nullsim/physics/scintillation.py`` is a direct
-port of KILO ``kilo/atmosphere.py`` (L95-481). These tests pin the
-KILO-equivalent analytic results so any drift from KILO physics shows
-up here.
+``nullsim/physics/scintillation.py`` was re-anchored to the measured
+aperture-averaged scintillation statistics in the 2026-07-13 audit
+(Kornilov et al. 2012 anchor, achromatic index, aperture-crossing
+timescale). These tests pin the corrected analytic results.
 """
 
 from __future__ import annotations
@@ -21,32 +21,41 @@ from nullsim.physics.scintillation import (
 
 
 def test_scintillation_index_matches_anchor_at_default_params() -> None:
-    """At λ=1.65 µm, d_sub=5 m, zenith, the result equals the H-band anchor."""
+    """At d_sub=5 m, zenith, the result equals the anchor (any wavelength)."""
     sigma = scintillation_index(
         wavelength_m=1.65e-6,
         sub_diameter_m=5.0,
-        scintillation_index_h5m_zenith=0.041,
+        scintillation_index_h5m_zenith=0.0013,
         scintillation_height_km=10.0,
         airmass=1.0,
     )
-    assert sigma == pytest.approx(0.041, rel=1.0e-12)
+    assert sigma == pytest.approx(0.0013, rel=1.0e-12)
 
 
-def test_scintillation_index_wavelength_scaling_minus_7_over_12() -> None:
-    """Halving λ (1.65→0.825 µm) scales σ_I by 2^(7/12)."""
+def test_scintillation_index_default_anchor_is_kornilov_q1() -> None:
+    """Default anchor = Kornilov+2012 Q1 Maunakea: sqrt(S_2^2 * 5^(-7/3))."""
+    sigma = scintillation_index(
+        wavelength_m=1.65e-6,
+        sub_diameter_m=5.0,
+    )
+    kornilov_q1_s2_squared_m73 = 0.77e-4
+    measured = math.sqrt(kornilov_q1_s2_squared_m73 * 5.0 ** (-7.0 / 3.0))
+    assert sigma == pytest.approx(measured, rel=0.05)
+
+
+def test_scintillation_index_is_achromatic_in_aperture_averaged_regime() -> None:
+    """The large-aperture index is wavelength-independent (Kenyon 2006)."""
     sigma_h = scintillation_index(
         wavelength_m=1.65e-6,
         sub_diameter_m=5.0,
-        scintillation_index_h5m_zenith=0.041,
+        scintillation_index_h5m_zenith=0.0013,
     )
     sigma_short = scintillation_index(
         wavelength_m=0.825e-6,
         sub_diameter_m=5.0,
-        scintillation_index_h5m_zenith=0.041,
+        scintillation_index_h5m_zenith=0.0013,
     )
-    assert sigma_short / sigma_h == pytest.approx(
-        2.0 ** (7.0 / 12.0), rel=1.0e-12
-    )
+    assert sigma_short == pytest.approx(sigma_h, rel=1.0e-12)
 
 
 def test_scintillation_index_subaperture_scaling_minus_7_over_6() -> None:
@@ -87,23 +96,20 @@ def test_scintillation_index_below_fresnel_radius_saturates() -> None:
         sigma = scintillation_index(
             wavelength_m=1.65e-6,
             sub_diameter_m=0.01,  # well below r_F ≈ 0.13 m at H, h=10 km
-            scintillation_index_h5m_zenith=0.041,
+            scintillation_index_h5m_zenith=10.0,  # force sigma above the cap
         )
     assert sigma == pytest.approx(SCINTILLATION_SATURATION_INDEX, rel=1.0e-12)
 
 
-def test_scintillation_timescale_uses_jet_stream_wind() -> None:
-    """τ = r_F / v_high; at H-band, h=10 km, v=35 m/s, ~3.7 ms."""
+def test_scintillation_timescale_is_aperture_crossing_time() -> None:
+    """τ = 0.5 d_sub / v_high; at 3.14 m, 35 m/s, ~45 ms (not r_F/v ~3.7 ms)."""
     tau = scintillation_timescale_for_servo_design(
-        wavelength_m=1.65e-6,
-        scintillation_height_km=10.0,
+        sub_diameter_m=3.14,
         high_altitude_wind_ms=35.0,
     )
-    r_fresnel = math.sqrt(1.65e-6 * 10.0e3)
-    expected_tau = r_fresnel / 35.0
-    assert tau == pytest.approx(expected_tau, rel=1.0e-12)
-    # Smoke check: expect ~3.7 ms.
-    assert 3.0e-3 < tau < 4.5e-3
+    assert tau == pytest.approx(0.5 * 3.14 / 35.0, rel=1.0e-12)
+    # Smoke check: tens of ms for a meter-class sub-aperture.
+    assert 0.02 < tau < 0.12
 
 
 def test_amplitude_servo_residual_photon_limited_for_faint_target() -> None:
@@ -141,8 +147,7 @@ def test_amplitude_servo_residual_temporal_dominates_for_bright_target() -> None
     )
     tau_loop = 1.0 / bandwidth
     tau_scint = scintillation_timescale_for_servo_design(
-        wavelength_m=1.65e-6,
-        scintillation_height_km=10.0,
+        sub_diameter_m=1.5,
         high_altitude_wind_ms=35.0,
     )
     expected_temporal = (
@@ -150,10 +155,9 @@ def test_amplitude_servo_residual_temporal_dominates_for_bright_target() -> None
         / math.sqrt(20.0)
     )
     assert res.sigma_I_temporal == pytest.approx(expected_temporal, rel=1.0e-12)
-    # Quadrature with the residual photon-noise floor (~3e-5 here vs
-    # temporal ~7e-3) shifts the combined σ from the pure temporal limit
-    # by ~2e-5. Tolerance loosened from 1e-6 → 1e-4.
-    assert res.sigma_I_residual == pytest.approx(expected_temporal, rel=1.0e-4)
+    # Quadrature with the residual photon-noise floor shifts the combined
+    # sigma from the pure temporal limit by ~(photon/temporal)^2/2 ~ 4e-4.
+    assert res.sigma_I_residual == pytest.approx(expected_temporal, rel=2.0e-3)
 
 
 def test_amplitude_servo_residual_saturates_at_open_loop() -> None:

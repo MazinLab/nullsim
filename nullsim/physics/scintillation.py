@@ -1,39 +1,51 @@
 """Atmospheric scintillation and amplitude-servo residual model.
 
-Direct port of KILO ``kilo/atmosphere.py`` functions:
+Originally a direct port of KILO ``kilo/atmosphere.py``; re-anchored to the
+measured aperture-averaged scintillation statistics in the 2026-07-13 audit
+(NullSimTD task #44). The audit found the KILO law wrong in three ways for
+meter-class sub-apertures, all inflating amplitude noise:
 
-- :func:`scintillation_index` (KILO L95-168): Roddier 1981 σ_I per
-  sub-aperture, scaled from a Maunakea H-band/5 m/zenith anchor by
-  λ^(-7/12), d_sub^(-7/6), airmass^(3/2). Saturation cap at 0.5.
-- :func:`scintillation_timescale_for_servo_design` (KILO L195-228):
-  r_F / v_high — jet-stream-driven timescale used to size the amplitude
-  fringe tracker. **Not** the boundary-layer τ from
-  ``scintillation_timescale``; that under-sizes the servo bandwidth.
-- :func:`amplitude_servo_residual_sigma_i` (KILO L311-481): residual σ_I
-  after a closed-loop amplitude servo. Combines a (τ_loop/τ_scint)^(5/6)
+- The 0.041/0.06 anchor was ~30x the Kornilov et al. (2012) Maunakea
+  measurement: their first-quartile S_2^2 = 0.77e-4 m^(7/3) gives
+  σ_I(5 m, zenith) = 1.3e-3 for any wavelength.
+- The λ^(-7/12) factor does not exist in the aperture-averaged regime —
+  the large-aperture index is achromatic (Kenyon et al. 2006; Dravins
+  et al. 1998; Kornilov et al. 2012 all state it explicitly).
+- The r_F/v Fresnel-crossing timescale belongs to the point-source
+  regime; aperture averaging removes exactly that fast structure, and the
+  surviving fluctuations decorrelate on the aperture crossing time
+  (~0.5 d/v; PSD knee at v/(π d), Dravins et al. 1998).
+
+Current model:
+
+- :func:`scintillation_index`: aperture-averaged Young/Roddier σ_I per
+  sub-aperture, σ_I ∝ d_sub^(-7/6) × airmass^(3/2), wavelength-independent,
+  anchored at the Kornilov Q1 Maunakea 5 m zenith value. Saturation cap
+  at 0.5 below the Fresnel radius.
+- :func:`scintillation_timescale_for_servo_design`: aperture crossing
+  time 0.5 d_sub / v_high (measured ACF e-fold 0.47 d/v in the Fresnel MC
+  against the kilo layer profile).
+- :func:`amplitude_servo_residual_sigma_i`: residual σ_I after a
+  closed-loop amplitude servo. Combines a (τ_loop/τ_scint)^(5/6)
   temporal residual (variance-reduced by predictive control) with the
   1/√N photon-noise floor in quadrature, saturated at the open-loop
   value.
 
 The residual σ_I per sub-aperture feeds
 :func:`nullsim.physics.realized_null.realized_null_depth_mc` as the
-``scintillation_index_per_sub`` parameter. The current KILO Keck baseline
-auto-optimizes the amplitude-servo bandwidth per target and assumes a
-predictive variance gain, so bright J-band cells can inject residuals near
-the percent level even when the open-loop sub-aperture scintillation is much
-larger. Diagnostics should report both values because the predictive gain is
-an instrument assumption, not a property of the chip.
+``scintillation_index_per_sub`` parameter. Diagnostics should report both
+open- and closed-loop values because the predictive gain is an instrument
+assumption, not a property of the chip.
 
 References:
     Roddier, F. "The effects of atmospheric turbulence in optical
         astronomy." Prog. Opt. 19, 281 (1981).
-    Dravins, D. et al. "Atmospheric intensity scintillation of stars."
-        PASP 109, 173 (1997).
-    Tokovinin, A. & Kornilov, V. "Accurate seeing measurements with
-        MASS and DIMM." MNRAS 381, 1179 (2007). Maunakea high-altitude
-        wind statistics.
-    Kornilov, V. et al. A&A 546, A41 (2012). Maunakea free-atmosphere
-        S_3 statistics.
+    Dravins, D. et al. "Atmospheric intensity scintillation of stars III."
+        PASP 110, 610 (1998). Large-aperture temporal statistics.
+    Kenyon, S. L. et al. PASP 118, 924 (2006). Aperture-averaged
+        σ_I² = 17.34 D^(-7/3) (cos γ)^(-3) ∫Cn²(h) h² dh, achromatic.
+    Kornilov, V. et al. A&A 546, A41 (2012). Measured Maunakea S_2/S_3
+        scintillation statistics (the anchor source).
     Poyneer, L. A. et al. JOSA A 24, 2645 (2007). On-sky predictive
         Fourier AO at GPI.
     van Kooten, M. A. M. et al. A&A 636, A81 (2020). SPHERE on-sky LQG.
@@ -65,22 +77,26 @@ def scintillation_index(
     *,
     wavelength_m: float,
     sub_diameter_m: float,
-    scintillation_index_h5m_zenith: float = 0.041,
+    scintillation_index_h5m_zenith: float = 0.0013,
     scintillation_height_km: float = 10.0,
     airmass: float = 1.0,
 ) -> float:
     """RMS fractional intensity per sub-aperture (open-loop).
 
-    Direct port of KILO ``atmosphere.scintillation_index``. The
-    aperture-averaging large-aperture (d_sub > r_F) regime scales as
-    σ_I ∝ λ^(-7/12) × d_sub^(-7/6) × airmass^(3/2), anchored at
-    Maunakea H-band, 5 m sub, zenith via
-    ``scintillation_index_h5m_zenith`` (KILO default 0.041 — the
-    Q1-night Kornilov+2012 anchor).
+    Aperture-averaged Young/Roddier regime (d_sub > r_F):
+    σ_I ∝ d_sub^(-7/6) × airmass^(3/2), **wavelength-independent**
+    (Kenyon et al. 2006 Eq. 7; the λ² of the Fresnel filter cancels the
+    k² prefactor once the aperture cuts off spatial frequencies below
+    1/r_F). Anchored at Maunakea, 5 m sub, zenith via
+    ``scintillation_index_h5m_zenith``: the default 1.3e-3 is the
+    Kornilov et al. (2012) first-quartile measurement
+    (S_2² = 0.77e-4 m^(7/3) → σ_I(5 m) = √(S_2² · 5^(-7/3))); their
+    median is 1.7e-3. Equivalent turbulence moment:
+    ∫Cn²h²dh = anchor² · 5^(7/3) / 17.34 ≈ 4.2e-6 m^(7/3) at the default.
 
-    Below the Fresnel radius r_F = √(λ h) the d^(-7/6) extrapolation
-    is unphysical and the result is clipped at
-    :data:`SCINTILLATION_SATURATION_INDEX`, with a warning.
+    ``wavelength_m`` only sets the Fresnel radius r_F = √(λ h) guard:
+    below r_F the d^(-7/6) extrapolation is unphysical and the result is
+    clipped at :data:`SCINTILLATION_SATURATION_INDEX`, with a warning.
     """
     if wavelength_m <= 0:
         raise ValueError(f"wavelength_m must be > 0, got {wavelength_m}")
@@ -89,10 +105,9 @@ def scintillation_index(
     if airmass < 1.0:
         raise ValueError(f"airmass must be >= 1.0, got {airmass}")
 
-    wl_scale = (1.65e-6 / wavelength_m) ** (7.0 / 12.0)
     d_scale = (5.0 / sub_diameter_m) ** (7.0 / 6.0)
     am_scale = airmass ** 1.5
-    sigma = scintillation_index_h5m_zenith * wl_scale * d_scale * am_scale
+    sigma = scintillation_index_h5m_zenith * d_scale * am_scale
 
     r_fresnel = math.sqrt(wavelength_m * scintillation_height_km * 1000.0)
     if sub_diameter_m < r_fresnel:
@@ -106,29 +121,35 @@ def scintillation_index(
     return float(min(sigma, SCINTILLATION_SATURATION_INDEX))
 
 
+# Measured e-folding of the aperture-averaged intensity ACF in units of the
+# aperture crossing time d/v: 0.47 in the 2026-07-13 Fresnel MC against the
+# kilo 3-layer profile, consistent with the MTF-lobe half-width ~0.5 D/V of
+# Dravins et al. (1998).
+_CROSSING_TIME_FRACTION: float = 0.5
+
+
 def scintillation_timescale_for_servo_design(
     *,
-    wavelength_m: float,
-    scintillation_height_km: float = 10.0,
+    sub_diameter_m: float,
     high_altitude_wind_ms: float = 35.0,
 ) -> float:
-    """Scintillation timescale at the jet-stream wind (s).
+    """Aperture-averaged scintillation correlation time (s).
 
-    Direct port of KILO
-    ``atmosphere.scintillation_timescale_for_servo_design``. Returns
-    r_F / v_high — the dominant scintillation-generating layer at
-    Maunakea is the tropopause jet stream (~10 km, 30-40 m/s), giving
-    ~3.7 ms at H-band. Use this — **not** the boundary-layer τ — to
-    size the amplitude fringe tracker.
+    Returns ``0.5 · d_sub / v_high`` — the aperture crossing time at the
+    jet-stream wind. Aperture averaging removes the Fresnel-scale
+    structure, so the surviving intensity fluctuations decorrelate when
+    the frozen-flow pattern crosses the sub-aperture (PSD knee at
+    v/(π d), Dravins et al. 1998), NOT at the point-source r_F/v
+    timescale the KILO port used (~3.7 ms; ~13x too fast for meter-class
+    sub-apertures — 2026-07-13 audit).
     """
-    if wavelength_m <= 0:
-        raise ValueError(f"wavelength_m must be > 0, got {wavelength_m}")
+    if sub_diameter_m <= 0:
+        raise ValueError(f"sub_diameter_m must be > 0, got {sub_diameter_m}")
     if high_altitude_wind_ms <= 0:
         raise ValueError(
             f"high_altitude_wind_ms must be > 0, got {high_altitude_wind_ms}"
         )
-    r_fresnel = math.sqrt(wavelength_m * scintillation_height_km * 1000.0)
-    return r_fresnel / high_altitude_wind_ms
+    return _CROSSING_TIME_FRACTION * sub_diameter_m / high_altitude_wind_ms
 
 
 @dataclass(frozen=True)
@@ -154,7 +175,7 @@ def optimize_amplitude_servo_bandwidth(
     wavelength_m: float,
     sub_diameter_m: float,
     photon_rate_per_sub_hz: float,
-    scintillation_index_h5m_zenith: float = 0.041,
+    scintillation_index_h5m_zenith: float = 0.0013,
     scintillation_height_km: float = 10.0,
     airmass: float = 1.0,
     predictive_gain_variance: float = 20.0,
@@ -212,8 +233,7 @@ def optimize_amplitude_servo_bandwidth(
         airmass=airmass,
     )
     tau_scint = scintillation_timescale_for_servo_design(
-        wavelength_m=wavelength_m,
-        scintillation_height_km=scintillation_height_km,
+        sub_diameter_m=sub_diameter_m,
         high_altitude_wind_ms=high_altitude_wind_ms,
     )
 
@@ -230,7 +250,7 @@ def amplitude_servo_residual_sigma_i(
     sub_diameter_m: float,
     servo_bandwidth_hz: float,
     photon_rate_per_sub_hz: float,
-    scintillation_index_h5m_zenith: float = 0.041,
+    scintillation_index_h5m_zenith: float = 0.0013,
     scintillation_height_km: float = 10.0,
     airmass: float = 1.0,
     predictive_gain_variance: float = 20.0,
@@ -273,8 +293,7 @@ def amplitude_servo_residual_sigma_i(
     )
     tau_loop = 1.0 / servo_bandwidth_hz
     tau_scint = scintillation_timescale_for_servo_design(
-        wavelength_m=wavelength_m,
-        scintillation_height_km=scintillation_height_km,
+        sub_diameter_m=sub_diameter_m,
         high_altitude_wind_ms=high_altitude_wind_ms,
     )
 
