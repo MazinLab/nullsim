@@ -1,0 +1,34 @@
+# Honest-conventions variant of kilo_keck_6 (2026-07-14 adjudication;
+# see NullSimTD changelog.d 2026-07-14). Three optimism-biasing
+# conventions are switched to their physically conservative versions:
+#
+# - chromatic_coupling_rolloff: flat SMF coupling peaks at the design
+#   wavelength (band mean) and rolls off toward the band edges instead
+#   of being pinned to the geometric limit at every wavelength.
+# - subaperture_fill_fraction 0.9964: the Keck inter-segment gaps under
+#   each 3.14 m subaperture circle are charged as a flux loss (true-gap
+#   geometry, measured in NullSimTD keck_subaperture_fill_fractions)
+#   instead of booking the full circular area.
+# - wfs_delivered_flux_fraction 0.95: the pyramid photon budget is
+#   attenuated for the light the residual aberration scatters off the
+#   detector acceptance (NullSimTD measured ~5% at the closed-loop
+#   operating point; the effect on AO residual is small since the loop
+#   is not photon-noise limited at J=4).
+#
+# The conventions are common-mode across the nuller arms in this model
+# (one coupling factor broadcast to all modes), so the realized null
+# depth should move little; the throughput/SNR chain carries the cost.
+
+extends = "kilo_keck_6.toml"
+
+[run]
+name = "kilo_keck_6_honest"
+
+[[pipeline.stages]]
+id = "injection"
+chromatic_coupling_rolloff = true
+
+[[pipeline.stages]]
+id = "ao"
+subaperture_fill_fraction = 0.9964
+wfs_delivered_flux_fraction = 0.95

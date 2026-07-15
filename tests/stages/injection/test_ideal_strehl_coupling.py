@@ -235,3 +235,46 @@ def test_injection_ideal_cache_key_changes_with_upstream_strehl(
     )
 
     assert cache.key_for(stage, state_lo) != cache.key_for(stage, state_hi)
+
+
+def test_chromatic_coupling_rolloff_peaks_at_design_wavelength() -> None:
+    """With ``chromatic_coupling_rolloff`` on, flat-wavefront coupling hits
+    the geometric limit only at the design wavelength and rolls off toward
+    the band edges as the pupil-plane mode radius (proportional to lambda for
+    a fixed fiber MFD) mismatches the fixed aperture. The pinned default
+    computes that degradation and normalizes it away."""
+
+    from nullsim.physics.ruilier_cassaing import (
+        OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO,
+        geometric_coupling_limit,
+    )
+
+    stage = IdealInjection(
+        params={"n_modes": 2, "chromatic_coupling_rolloff": True},
+        context=_ctx(),
+    )
+    out = stage.apply(_state(strehl=(1.0, 1.0, 1.0)))
+    power = np.abs(out.field.amplitudes[0, :, 0]) ** 2
+    # Design wavelength defaults to the band mean (1.25 um on this grid):
+    # exactly the geometric limit there.
+    assert power[1] == pytest.approx(UNOBSTRUCTED_GEOMETRIC_COUPLING_LIMIT, rel=1e-12)
+    assert power[0] < power[1]
+    assert power[2] < power[1]
+    # rho(lambda) = rho_design * (lambda_design / lambda), exactly.
+    rho = OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO
+    expected_blue = geometric_coupling_limit(
+        0.0, pupil_radius_to_mode_field_radius_ratio=rho * 1.25 / 1.2
+    )
+    np.testing.assert_allclose(power[0], expected_blue, rtol=1e-12)
+
+
+def test_chromatic_coupling_rolloff_off_stays_pinned() -> None:
+    """Default behavior unchanged: flat coupling equals the geometric limit
+    at every wavelength."""
+
+    stage = IdealInjection(params={"n_modes": 2}, context=_ctx())
+    out = stage.apply(_state(strehl=(1.0, 1.0, 1.0)))
+    power = np.abs(out.field.amplitudes[0, :, 0]) ** 2
+    np.testing.assert_allclose(
+        power, UNOBSTRUCTED_GEOMETRIC_COUPLING_LIMIT, rtol=1e-12
+    )

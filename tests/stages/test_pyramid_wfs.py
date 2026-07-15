@@ -610,3 +610,54 @@ def test_ao_populates_single_eelt_subaperture_positions(tmp_path: Path) -> None:
     assert result.state.geometry.effective_collecting_area_m2 < (
         result.state.geometry.collecting_area_m2
     )
+
+
+# ---------------------------------------------------------------------------
+# Honest-convention knobs (2026-07-14 conventions adjudication).
+# ---------------------------------------------------------------------------
+
+
+def test_subaperture_fill_fraction_charges_segment_gaps(tmp_path: Path) -> None:
+    """``subaperture_fill_fraction`` scales the packed collecting area and
+    per-mode areas: Keck segment gaps under each subaperture circle are a
+    real flux loss (measured 0.9964 fill for the 3.14 m KILO ring from
+    true-gap geometry), not a renormalizable convention."""
+
+    overrides = {
+        "piston_subaperture_diameter_m": None,
+        "n_subapertures_per_aperture": 12,
+        "pupil_template": "keck",
+    }
+    base = _run_pyramid_pipeline(tmp_path / "base", ao_overrides=dict(overrides))
+    filled = _run_pyramid_pipeline(
+        tmp_path / "filled",
+        ao_overrides={**overrides, "subaperture_fill_fraction": 0.9964},
+    )
+    base_packing = base.state.geometry.components["ao_subaperture_packing"]
+    filled_packing = filled.state.geometry.components["ao_subaperture_packing"]
+    assert filled.state.geometry.effective_collecting_area_m2 == pytest.approx(
+        0.9964 * base.state.geometry.effective_collecting_area_m2
+    )
+    assert filled_packing["mode_areas_m2"] == pytest.approx(
+        [0.9964 * a for a in base_packing["mode_areas_m2"]]
+    )
+    assert filled_packing["subaperture_fill_fraction"] == pytest.approx(0.9964)
+
+
+def test_wfs_delivered_flux_fraction_scales_photons(tmp_path: Path) -> None:
+    """``wfs_delivered_flux_fraction`` attenuates the WFS photon budget:
+    the default assumes the full photon budget always reaches the detector
+    regardless of the aberration being measured."""
+
+    base = _run_pyramid_pipeline(tmp_path / "base")
+    attenuated = _run_pyramid_pipeline(
+        tmp_path / "att",
+        ao_overrides={"wfs_delivered_flux_fraction": 0.95},
+    )
+    base_photons = base.state.wavefront.components["ao_residual"][
+        "wfs_photons_per_subap_per_frame"
+    ]
+    att_photons = attenuated.state.wavefront.components["ao_residual"][
+        "wfs_photons_per_subap_per_frame"
+    ]
+    assert att_photons == pytest.approx(0.95 * base_photons)

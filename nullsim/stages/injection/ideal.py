@@ -20,7 +20,9 @@ from pydantic import BaseModel, ConfigDict, Field as PydanticField
 
 from nullsim.physics.ruilier_cassaing import (
     FRESNEL_REFLECTION_LOSS,
+    OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO,
     coupling_efficiency,
+    geometric_coupling_limit,
 )
 from nullsim.pipeline import (
     BaseStage,
@@ -99,6 +101,16 @@ class IdealInjection(BaseStage):
         apply_strehl_coupling: bool = True
         apply_fresnel_injection_loss: bool = False
         central_obscuration_ratio: float = PydanticField(default=0.0, ge=0.0, lt=1.0)
+        # Honest-convention knob (2026-07-14 adjudication): the fiber MFD
+        # is fixed, so the pupil-plane mode radius scales with wavelength
+        # and flat coupling peaks at the design wavelength instead of
+        # sitting at the geometric limit everywhere. rho(lambda) =
+        # rho_design * (lambda_design / lambda); the design wavelength
+        # defaults to the band mean.
+        chromatic_coupling_rolloff: bool = False
+        coupling_design_wavelength_um: float | None = PydanticField(
+            default=None, gt=0.0
+        )
 
     def apply(self, state: SimulationState) -> SimulationState:
         params = self.params_model
@@ -114,6 +126,17 @@ class IdealInjection(BaseStage):
             apply_fresnel_loss=params.apply_fresnel_injection_loss,
             central_obscuration_ratio=params.central_obscuration_ratio,
         )
+        if params.chromatic_coupling_rolloff and params.apply_strehl_coupling:
+            coupling_per_wavelength = (
+                coupling_per_wavelength
+                * _chromatic_rolloff_per_wavelength(
+                    wavelength_grid_um=np.asarray(
+                        wavelength_grid_um, dtype=np.float64
+                    ),
+                    design_wavelength_um=params.coupling_design_wavelength_um,
+                    central_obscuration_ratio=params.central_obscuration_ratio,
+                )
+            )
 
         # KILO ``stellar_input_field`` convention (kilo/injection.py:222):
         # E_k = √(η_k × A_k). The collecting area per sub-aperture is
@@ -363,6 +386,52 @@ def _coupling_per_wavelength(
     if apply_fresnel_loss:
         base = base * (1.0 - FRESNEL_REFLECTION_LOSS)
     return base
+
+
+def _chromatic_rolloff_per_wavelength(
+    *,
+    wavelength_grid_um: NDArray[np.float64],
+    design_wavelength_um: float | None,
+    central_obscuration_ratio: float,
+) -> NDArray[np.float64]:
+    """Coupling rolloff factor eta(lambda) / eta(lambda_design).
+
+    A fixed fiber mode-field diameter maps to a pupil-plane Gaussian mode
+    whose radius scales with wavelength (w_pupil = lambda f / (pi w_fiber)),
+    so the Ruilier overlap ratio is rho(lambda) = rho_design *
+    (lambda_design / lambda). The factor is exactly 1 at the design
+    wavelength and second-order in the fractional detuning near the
+    Ruilier optimum.
+    """
+
+    design_um = (
+        float(design_wavelength_um)
+        if design_wavelength_um is not None
+        else float(np.mean(wavelength_grid_um))
+    )
+    rho_design = OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO
+    limit_at_design = float(
+        geometric_coupling_limit(
+            central_obscuration_ratio,
+            pupil_radius_to_mode_field_radius_ratio=rho_design,
+        )
+    )
+    factors = np.array(
+        [
+            float(
+                geometric_coupling_limit(
+                    central_obscuration_ratio,
+                    pupil_radius_to_mode_field_radius_ratio=(
+                        rho_design * design_um / float(wavelength_um)
+                    ),
+                )
+            )
+            / limit_at_design
+            for wavelength_um in wavelength_grid_um
+        ],
+        dtype=np.float64,
+    )
+    return factors
 
 
 __all__ = ["IdealInjection"]

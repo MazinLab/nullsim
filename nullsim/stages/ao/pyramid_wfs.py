@@ -148,6 +148,17 @@ class PyramidWFS(BaseStage):
         n_subapertures_per_aperture: int | None = Field(default=None, gt=0)
         pupil_template: Literal["circular", "keck", "eelt", "full_pupil"] | None = None
         pupil_central_obstruction_diameter_m: float = Field(default=0.0, ge=0.0)
+        # Honest-convention knobs (2026-07-14 adjudication).
+        # Segment-gap fill fraction inside each packed subaperture circle:
+        # the packed-circle collecting area otherwise books the full
+        # pi*(d_sub/2)^2 although the Keck mosaic's inter-segment gaps
+        # fall inside the circles (true-gap fill 0.9964 for the 3.14 m
+        # KILO ring).
+        subaperture_fill_fraction: float = Field(default=1.0, gt=0.0, le=1.0)
+        # Delivered-flux attenuation of the WFS photon budget: the
+        # default assumes the full budget always reaches the detector
+        # regardless of the aberration being measured.
+        wfs_delivered_flux_fraction: float = Field(default=1.0, gt=0.0, le=1.0)
 
     def apply(self, state: SimulationState) -> SimulationState:
         params = self.params_model
@@ -274,10 +285,11 @@ def _populate_aperture_positions_pupil_m(state, params):
         for s in range(n_sub):
             out[t * n_sub + s] = enu_arr[t, :2] + sub_positions[s]
 
+    fill = float(params.subaperture_fill_fraction)
     effective_collecting_area_m2 = (
-        float(n_modes) * math.pi * (float(d_sub) / 2.0) ** 2
+        float(n_modes) * math.pi * (float(d_sub) / 2.0) ** 2 * fill
     )
-    mode_area_m2 = math.pi * (float(d_sub) / 2.0) ** 2
+    mode_area_m2 = math.pi * (float(d_sub) / 2.0) ** 2 * fill
     full_collecting_area_m2 = state.geometry.collecting_area_m2
     fill_fraction = (
         None
@@ -312,6 +324,7 @@ def _populate_aperture_positions_pupil_m(state, params):
                 else float(full_collecting_area_m2)
             ),
             "effective_to_full_collecting_area_fraction": fill_fraction,
+            "subaperture_fill_fraction": fill,
             "effective_area_source": "packed_subaperture_circles",
         },
     )
@@ -682,6 +695,7 @@ def _wfs_photons_per_subap_per_frame(
         * params.mirror_throughput
         * params.dichroic_throughput
         * params.quantum_efficiency
+        * params.wfs_delivered_flux_fraction
     )
     n_subap = max(1, _n_subap_illuminated(params))
     return rate_at_detector_hz / (n_subap * params.loop_frequency_hz)
