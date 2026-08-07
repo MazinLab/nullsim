@@ -416,6 +416,124 @@ def test_characterization_summaries_mask_infeasible_snr_and_rates(
     assert math.isnan(characterization["planet_signal_rate_hz"])
 
 
+def _characterization_record(
+    tmp_path: Path, extra_components: dict[str, dict[str, object]] | None = None
+) -> RunRecord:
+    """A record carrying a characterization.spectro row plus optional extras."""
+    record = _record(tmp_path)
+    state = record.result.state
+    results = state.results.add_component(
+        "characterization.spectro",
+        {
+            "snr": 5.0,
+            "max_spectral_resolution": 100.0,
+            "optimization_success": True,
+        },
+    )
+    for name, payload in (extra_components or {}).items():
+        results = results.add_component(name, payload)
+    return RunRecord(
+        config=record.config,
+        result=RunResult(
+            state=replace(state, results=results),
+            diagnostics=record.result.diagnostics,
+            timings=record.result.timings,
+            cache_hit_count=record.result.cache_hit_count,
+            config_hash=record.result.config_hash,
+        ),
+        run_dir=record.run_dir,
+        coord_tuple=record.coord_tuple,
+    )
+
+
+def test_characterization_summary_publishes_hdc_ccf_columns(tmp_path: Path) -> None:
+    """HDC CCF scalars must surface as hdc_* columns on the spectro row."""
+    record = _characterization_record(
+        tmp_path,
+        {
+            "characterization.hdc_ccf": {
+                "ccf_snr": 12.5,
+                "ccf_snr_photon_limited": 18.0,
+                "n_effective_lines": 340.0,
+                "resolving_power_used": 25000.0,
+                "ccf_systematic_rejection": 3.0e-3,
+            }
+        },
+    )
+    collection = RunCollection(
+        config=_resolved_stub(), records=(record,), output_dir=tmp_path
+    )
+
+    path = characterization_summary(collection, tmp_path, ("json",))[0]
+    row = json.loads(path.read_text(encoding="utf-8"))[0]
+
+    assert row["hdc_ccf_snr"] == pytest.approx(12.5)
+    assert row["hdc_ccf_snr_photon_limited"] == pytest.approx(18.0)
+    assert row["hdc_n_effective_lines"] == pytest.approx(340.0)
+    assert row["hdc_resolving_power"] == pytest.approx(25000.0)
+    assert row["hdc_systematic_rejection"] == pytest.approx(3.0e-3)
+
+
+def test_characterization_summary_hdc_columns_nan_without_component(
+    tmp_path: Path,
+) -> None:
+    """Without an hdc_ccf component the hdc_* columns degrade to NaN."""
+    collection = RunCollection(
+        config=_resolved_stub(),
+        records=(_characterization_record(tmp_path),),
+        output_dir=tmp_path,
+    )
+
+    path = characterization_summary(collection, tmp_path, ("json",))[0]
+    row = json.loads(path.read_text(encoding="utf-8"))[0]
+
+    for column in (
+        "hdc_ccf_snr",
+        "hdc_ccf_snr_photon_limited",
+        "hdc_n_effective_lines",
+        "hdc_resolving_power",
+        "hdc_systematic_rejection",
+    ):
+        assert math.isnan(row[column]), column
+
+
+def test_characterization_summary_hdc_columns_survive_spectro_nonconvergence(
+    tmp_path: Path,
+) -> None:
+    """HDC columns gate on component presence, not optimizer convergence."""
+    record = _record(tmp_path)
+    state = record.result.state
+    results = state.results.add_component(
+        "characterization.spectro",
+        {"snr": 5.0, "optimization_success": False},
+    ).add_component(
+        "characterization.hdc_ccf",
+        {"ccf_snr": 7.5},
+    )
+    patched = RunRecord(
+        config=record.config,
+        result=RunResult(
+            state=replace(state, results=results),
+            diagnostics=record.result.diagnostics,
+            timings=record.result.timings,
+            cache_hit_count=record.result.cache_hit_count,
+            config_hash=record.result.config_hash,
+        ),
+        run_dir=record.run_dir,
+        coord_tuple=record.coord_tuple,
+    )
+    collection = RunCollection(
+        config=_resolved_stub(), records=(patched,), output_dir=tmp_path
+    )
+
+    path = characterization_summary(collection, tmp_path, ("json",))[0]
+    row = json.loads(path.read_text(encoding="utf-8"))[0]
+
+    assert row["converged"] is False
+    assert row["hdc_ccf_snr"] == pytest.approx(7.5)
+    assert math.isnan(row["hdc_resolving_power"])
+
+
 def test_performance_summary_rejects_unknown_format(tmp_path: Path) -> None:
     """An unsupported file format must raise a clear ValueError."""
     collection = RunCollection(

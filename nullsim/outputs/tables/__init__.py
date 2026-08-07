@@ -242,6 +242,7 @@ def characterization_summary(
                     "mkid_min_snr_per_bin": payload.get("mkid_min_snr_per_bin"),
                 }
             )
+            row.update(_hdc_columns(record))
             rows.append(row)
     frame = pd.DataFrame(rows)
 
@@ -265,6 +266,30 @@ def characterization_summary(
                 )
         written_paths.append(output_path)
     return tuple(written_paths)
+
+
+_HDC_PREFIX = "characterization.hdc_ccf"
+
+# Table column -> hdc_ccf payload key. The HDC stage runs no optimizer, so
+# these gate on component presence only, unlike the spectro columns that the
+# convergence check masks.
+_HDC_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("hdc_ccf_snr", "ccf_snr"),
+    ("hdc_ccf_snr_photon_limited", "ccf_snr_photon_limited"),
+    ("hdc_n_effective_lines", "n_effective_lines"),
+    ("hdc_resolving_power", "resolving_power_used"),
+    ("hdc_systematic_rejection", "ccf_systematic_rejection"),
+)
+
+
+def _hdc_columns(record: RunRecord) -> dict[str, float]:
+    """HDC cross-correlation scalars, NaN when the component is absent."""
+
+    columns: dict[str, float] = {}
+    for column, key in _HDC_COLUMNS:
+        value = _find_payload_value(record, _HDC_PREFIX, key)
+        columns[column] = float("nan") if value is None else float(value)
+    return columns
 
 
 def _payload_first(payload: dict[str, Any], *keys: str) -> Any:
