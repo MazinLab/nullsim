@@ -38,13 +38,12 @@ import statistics
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.optimize import minimize
 
 from nullsim.pipeline import Field, RunContext, SimulationState, Throughput
 from nullsim.stages.chip_optimization import (
@@ -373,7 +372,8 @@ class BackendResult:
 
 
 def _build_backend_specs(prob: BenchProblem) -> list[BackendSpec]:
-    from nullsim.stages.chip_optimization import torch as torch_backend  # lazy
+    # Lazy: importing the torch backend at module scope would make the whole
+    # benchmark script unimportable on a machine without torch.
     from nullsim.stages.chip_optimization.torch import ChipOptimizationTorch
 
     specs: list[BackendSpec] = []

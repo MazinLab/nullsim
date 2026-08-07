@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from math import asin, cos, pi, sin
+from math import cos, pi, sin
 from pathlib import Path
 from collections.abc import Iterable, Sequence
 
