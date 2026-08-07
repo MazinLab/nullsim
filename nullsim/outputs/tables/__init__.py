@@ -242,7 +242,7 @@ def characterization_summary(
                     "mkid_min_snr_per_bin": payload.get("mkid_min_snr_per_bin"),
                 }
             )
-            row.update(_hdc_columns(record))
+            row.update(_hdc_columns(record, name, converged))
             rows.append(row)
     frame = pd.DataFrame(rows)
 
@@ -270,9 +270,7 @@ def characterization_summary(
 
 _HDC_PREFIX = "characterization.hdc_ccf"
 
-# Table column -> hdc_ccf payload key. The HDC stage runs no optimizer, so
-# these gate on component presence only, unlike the spectro columns that the
-# convergence check masks.
+# Table column -> hdc_ccf payload key.
 _HDC_COLUMNS: tuple[tuple[str, str], ...] = (
     ("hdc_ccf_snr", "ccf_snr"),
     ("hdc_ccf_snr_photon_limited", "ccf_snr_photon_limited"),
@@ -282,12 +280,46 @@ _HDC_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _hdc_columns(record: RunRecord) -> dict[str, float]:
-    """HDC cross-correlation scalars, NaN when the component is absent."""
+def _find_hdc_payload(
+    record: RunRecord, spectro_name: str
+) -> dict[str, Any] | None:
+    """Return the hdc_ccf payload computed from ``spectro_name``.
 
+    The HDC stage records which spectro component it consumed in
+    ``upstream_spectro_component``; match on it so a run with several spectro
+    components does not smear one HDC result across unrelated rows. Payloads
+    predating that key cannot be associated, so they fall back to first-match.
+    """
+
+    fallback: dict[str, Any] | None = None
+    for name, payload in record.result.state.results.components.items():
+        if not name.startswith(_HDC_PREFIX) or not isinstance(payload, dict):
+            continue
+        upstream = payload.get("upstream_spectro_component")
+        if upstream == spectro_name:
+            return payload
+        if upstream is None and fallback is None:
+            fallback = payload
+    return fallback
+
+
+def _hdc_columns(
+    record: RunRecord, spectro_name: str, converged: bool
+) -> dict[str, float]:
+    """HDC cross-correlation scalars for one spectro row.
+
+    NaN when no HDC component belongs to this row. Also NaN when the upstream
+    spectro optimization did not converge: the CCF metrics are built from that
+    solution's throughput, leakage, and photon budgets, so a failed or
+    constraint-violating retune makes a finite CCF number describe a candidate
+    the pipeline never accepted. Same reasoning as the masked ``snr`` and
+    per-port rate columns on this row.
+    """
+
+    payload = _find_hdc_payload(record, spectro_name) if converged else None
     columns: dict[str, float] = {}
     for column, key in _HDC_COLUMNS:
-        value = _find_payload_value(record, _HDC_PREFIX, key)
+        value = payload.get(key) if payload is not None else None
         columns[column] = float("nan") if value is None else float(value)
     return columns
 

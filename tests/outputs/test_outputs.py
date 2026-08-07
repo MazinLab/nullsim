@@ -457,6 +457,7 @@ def test_characterization_summary_publishes_hdc_ccf_columns(tmp_path: Path) -> N
                 "n_effective_lines": 340.0,
                 "resolving_power_used": 25000.0,
                 "ccf_systematic_rejection": 3.0e-3,
+                "upstream_spectro_component": "characterization.spectro",
             }
         },
     )
@@ -497,10 +498,15 @@ def test_characterization_summary_hdc_columns_nan_without_component(
         assert math.isnan(row[column]), column
 
 
-def test_characterization_summary_hdc_columns_survive_spectro_nonconvergence(
+def test_characterization_summary_hdc_columns_mask_on_spectro_nonconvergence(
     tmp_path: Path,
 ) -> None:
-    """HDC columns gate on component presence, not optimizer convergence."""
+    """HDC scalars are built from the spectro solution, so they mask with it.
+
+    A failed retune makes a finite CCF number describe a candidate solution the
+    pipeline never accepted, so the hdc_* columns follow the same masking as
+    ``snr`` and the per-port rates on that row.
+    """
     record = _record(tmp_path)
     state = record.result.state
     results = state.results.add_component(
@@ -508,7 +514,11 @@ def test_characterization_summary_hdc_columns_survive_spectro_nonconvergence(
         {"snr": 5.0, "optimization_success": False},
     ).add_component(
         "characterization.hdc_ccf",
-        {"ccf_snr": 7.5},
+        {
+            "ccf_snr": 7.5,
+            "resolving_power_used": 25000.0,
+            "upstream_spectro_component": "characterization.spectro",
+        },
     )
     patched = RunRecord(
         config=record.config,
@@ -530,8 +540,83 @@ def test_characterization_summary_hdc_columns_survive_spectro_nonconvergence(
     row = json.loads(path.read_text(encoding="utf-8"))[0]
 
     assert row["converged"] is False
-    assert row["hdc_ccf_snr"] == pytest.approx(7.5)
+    assert math.isnan(row["hdc_ccf_snr"])
     assert math.isnan(row["hdc_resolving_power"])
+
+
+def test_characterization_summary_hdc_columns_join_on_upstream_component(
+    tmp_path: Path,
+) -> None:
+    """Each spectro row takes only the HDC result computed from that row."""
+    record = _record(tmp_path)
+    state = record.result.state
+    # Second-instance naming follows stages/_utils.unique_component_name:
+    # base name first, then base.<instance_id>.
+    results = state.results
+    for suffix, snr in (("", 5.0), (".spectro_b", 6.0)):
+        results = results.add_component(
+            f"characterization.spectro{suffix}",
+            {"snr": snr, "optimization_success": True},
+        )
+    for suffix, ccf_snr in (("", 11.0), (".hdc_b", 22.0)):
+        results = results.add_component(
+            f"characterization.hdc_ccf{suffix}",
+            {
+                "ccf_snr": ccf_snr,
+                "upstream_spectro_component": (
+                    "characterization.spectro"
+                    if suffix == ""
+                    else "characterization.spectro.spectro_b"
+                ),
+            },
+        )
+    patched = RunRecord(
+        config=record.config,
+        result=RunResult(
+            state=replace(state, results=results),
+            diagnostics=record.result.diagnostics,
+            timings=record.result.timings,
+            cache_hit_count=record.result.cache_hit_count,
+            config_hash=record.result.config_hash,
+        ),
+        run_dir=record.run_dir,
+        coord_tuple=record.coord_tuple,
+    )
+    collection = RunCollection(
+        config=_resolved_stub(), records=(patched,), output_dir=tmp_path
+    )
+
+    path = characterization_summary(collection, tmp_path, ("json",))[0]
+    rows = json.loads(path.read_text(encoding="utf-8"))
+
+    by_component = {row["component"]: row for row in rows}
+    assert set(by_component) == {
+        "characterization.spectro",
+        "characterization.spectro.spectro_b",
+    }
+    assert by_component["characterization.spectro"]["hdc_ccf_snr"] == pytest.approx(
+        11.0
+    )
+    assert by_component["characterization.spectro.spectro_b"][
+        "hdc_ccf_snr"
+    ] == pytest.approx(22.0)
+
+
+def test_characterization_summary_hdc_columns_fall_back_without_upstream_key(
+    tmp_path: Path,
+) -> None:
+    """Payloads predating upstream_spectro_component still populate the row."""
+    record = _characterization_record(
+        tmp_path, {"characterization.hdc_ccf": {"ccf_snr": 9.0}}
+    )
+    collection = RunCollection(
+        config=_resolved_stub(), records=(record,), output_dir=tmp_path
+    )
+
+    path = characterization_summary(collection, tmp_path, ("json",))[0]
+    row = json.loads(path.read_text(encoding="utf-8"))[0]
+
+    assert row["hdc_ccf_snr"] == pytest.approx(9.0)
 
 
 def test_performance_summary_rejects_unknown_format(tmp_path: Path) -> None:
