@@ -204,7 +204,7 @@ the strings used in TOML under `[[pipeline.stages]]`.
 | `performance.pdi` | `stages/performance/pdi.py` | `results` | `results` | Polarimetric differential imaging SNR. |
 | `characterization.spectro` | `stages/characterization/spectro.py` | `results`, `geometry`, `scene`, `throughput`, `field` | `results` | Known-position spectro-port retuning and SNR (AWG or MKID-native accounting). |
 | `characterization.detection_curve` | `stages/characterization/detection_curve.py` | `results`, `geometry`, `scene`, `throughput`, `field` | `results` | Characterization-mode contrast curve anchors (shares Params with `characterization.spectro`). |
-| `characterization.hdc_ccf` | `stages/characterization/hdc_ccf.py` | `results`, `scene` | `results` | High dispersion coronagraphy matched-filter cross-correlation on the spectro port (Wang et al. 2017); needs an upstream `characterization.spectro`. |
+| `characterization.hdc_ccf` | `stages/characterization/hdc_ccf.py` | `results`, `scene` | `results` | High dispersion coronagraphy matched-filter cross-correlation on the spectro port (Wang et al. 2017); needs an upstream AWG-mode `characterization.spectro`. Rejects MKID-native spectro payloads (phase 1). |
 | `diagnostics.fringe_observability` | `stages/diagnostics/fringe_observability.py` | `field`, `photon_rates`, `results`, `geometry` | `results` | Fringe-tracker piston/amplitude observability audit (SVD/CRLB, acquisition, cophasing handoff). |
 
 Contract notes (subtleties that are easy to get wrong):

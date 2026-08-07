@@ -28,6 +28,12 @@ _EPS_SYSTEMATIC = 1.0e-3
 _SERVO_BW_HZ = 100.0
 _INTEGRATION_TIME_S = 3600.0
 _PLANET_RV_KMS = 30.0
+# Band edges as the stage derives them: midpoint edges around the coarse grid.
+_BIN_WIDTH_UM = (_WL_MAX_UM - _WL_MIN_UM) / (_N_WAVELENGTHS - 1)
+_BAND_LO_UM = _WL_MIN_UM - 0.5 * _BIN_WIDTH_UM
+_BAND_HI_UM = _WL_MAX_UM + 0.5 * _BIN_WIDTH_UM
+_BAND_CENTRE_UM = 0.5 * (_BAND_LO_UM + _BAND_HI_UM)
+_BAND_WIDTH_UM = _BAND_HI_UM - _BAND_LO_UM
 
 
 def _context(tmp_path: Path) -> RunContext:
@@ -45,6 +51,7 @@ def _spectro_payload(
     awg_throughput: float = 1.0,
     free_spectral_range_fraction: float = 1.0,
     dark_rate_hz_per_bin: float = 0.0,
+    planet_rate_scale: float = 1.0,
     with_fringe_tracking: bool | None = True,
 ) -> dict[str, object]:
     """A synthetic ``characterization.spectro`` payload on a flat 8-bin band."""
@@ -90,7 +97,7 @@ def _spectro_payload(
         "spectrograph": "awg",
         "awg_resolving_power": 3000.0,
         "awg_n_bins": 200,
-        "awg_total_planet_rate_hz": planet_rate_hz * detected,
+        "awg_total_planet_rate_hz": planet_rate_hz * detected * planet_rate_scale,
         "awg_total_leakage_rate_hz": leak_rate_hz * detected,
         "awg_total_sky_rate_hz": (10.0 / _INTEGRATION_TIME_S) * detected,
         "awg": {
@@ -99,6 +106,16 @@ def _spectro_payload(
             "dark_rate_hz_per_bin_total": dark_rate_hz_per_bin,
             "throughput": awg_throughput,
             "free_spectral_range_fraction": free_spectral_range_fraction,
+            # awg_wavelength_grid centres a span of
+            # band_bandwidth x free_spectral_range_fraction on the design
+            # wavelength; mirror that so the stage can restrict channels to it.
+            "bin_edges_m": np.linspace(
+                (_BAND_CENTRE_UM - 0.5 * _BAND_WIDTH_UM * free_spectral_range_fraction)
+                * 1.0e-6,
+                (_BAND_CENTRE_UM + 0.5 * _BAND_WIDTH_UM * free_spectral_range_fraction)
+                * 1.0e-6,
+                201,
+            ),
         },
     }
     if with_fringe_tracking is not None:
@@ -176,6 +193,7 @@ def test_hdc_ccf_publishes_expected_payload_keys(payload: dict[str, object]) -> 
         "telluric_masked_fraction",
         # Per-channel arrays.
         "ccf_channel_centers_um",
+        "ccf_channel_edges_um",
         "ccf_planet_rate_hz_per_channel",
         "ccf_leak_rate_hz_per_channel",
         "ccf_variance_rate_hz_per_channel",
@@ -216,6 +234,15 @@ def test_hdc_ccf_publishes_expected_payload_keys(payload: dict[str, object]) -> 
         "planet_template_provenance",
         "star_template_provenance",
         "telluric_template_provenance",
+        "planet_template_sha256",
+        "star_template_sha256",
+        "telluric_template_sha256",
+        "coarse_wavelength_um",
+        "coarse_bin_width_um",
+        "coarse_stellar_rate_hz",
+        "coarse_planet_throughput",
+        "coarse_leak_fraction",
+        "observed_band_um",
         "ccf_model",
         "snr_vs_resolving_power_model",
         "snr_vs_rv_model",
@@ -505,7 +532,7 @@ def test_hdc_ccf_headline_snr_is_independent_of_the_diagnostic_scans(
         assert left[key] == right[key]
 
 
-def _mkid_payload(*, n_spectro_pixels: int, per_pixel_dark_hz: float) -> dict:
+def _mkid_payload() -> dict:
     payload = _spectro_payload()
     for key in (
         "awg_total_planet_rate_hz",
@@ -519,43 +546,222 @@ def _mkid_payload(*, n_spectro_pixels: int, per_pixel_dark_hz: float) -> dict:
     payload["spectrograph"] = "mkid"
     payload["mkid_resolving_power"] = 3000.0
     payload["mkid_pixels_per_resolution_element"] = 1
-    payload["mkid_n_spectro_pixels"] = n_spectro_pixels
-    # Mirrors per_bin_snr: dark_rate_hz_per_pixel * n_spectro_pixels per bin.
-    payload["mkid_dark_rate_hz_per_bin_total"] = per_pixel_dark_hz * n_spectro_pixels
-    # D scales with n_spectro_ports (== 1 on the MKID branch), NOT with pixels.
-    payload["D"] = per_pixel_dark_hz * _INTEGRATION_TIME_S
     return payload
 
 
-def test_hdc_ccf_mkid_dark_scales_with_spectro_pixels(tmp_path: Path) -> None:
-    """MKID dark follows n_spectro_pixels, which the band-total D does not."""
+def _flat_flambda_stellar_csv(tmp_path: Path) -> Path:
+    """A PHOENIX-like snapshot whose F_lambda is exactly flat.
 
-    per_channel = []
-    for n_pixels in (1, 4):
-        state = SimulationState.empty({"wavelength_grid_um": (1.25,)})
-        state = replace(
-            state,
-            scene=Scene(
-                star_jmag=4.0,
-                star_spectral_type="M2V",
-                planet_contrast=_PLANET_CONTRAST,
-                planet_radial_velocity_kms=_PLANET_RV_KMS,
-            ),
-            results=SimulationState.empty({}).results.add_component(
-                "characterization.spectro",
-                _mkid_payload(n_spectro_pixels=n_pixels, per_pixel_dark_hz=0.5),
-            ),
-        )
-        result = _stage(
-            _context(tmp_path), snr_vs_r_points=0, rv_scan_points=0
-        ).apply(state)
-        payload = result.results.components["characterization.hdc_ccf"]
-        per_channel.append(float(payload["dark_rate_hz_per_channel"]))
-        assert "mkid_dark_rate_hz_per_bin_total" in str(
-            payload["detection_budget_source"]
-        )
+    The packaged files store a PHOTON-flux shape ``F_lambda * lambda``, so a
+    flat-F_lambda star is stored as values proportional to lambda.
+    """
 
-    assert per_channel == [0.5, 2.0]
+    from nullsim.physics.spectra import constant_r_grid
+
+    grid = constant_r_grid(1.0, 1.5, 30_000.0)
+    path = tmp_path / "flat_flambda.csv"
+    lines = [
+        "# kind: stellar_flux",
+        "# resolving_power: 30000",
+        "# source: synthetic flat-F_lambda test template",
+        "wavelength_um,value",
+    ]
+    lines += [f"{w:.10e},{w:.10e}" for w in grid]
+    path.write_text("\n".join(lines))
+    return path
+
+
+def test_hdc_ccf_stellar_template_does_not_retilt_the_coarse_density(
+    tmp_path: Path,
+) -> None:
+    """No double lambda tilt: photon-flux shape must be converted to F_lambda.
+
+    The coarse detected rates already carry the photon-rate lambda tilt (the
+    zero-point model is flat in F_lambda), so multiplying by a stored
+    photon-flux shape would give lambda^2 * F_lambda. With a flat-F_lambda
+    star and a flat coarse rate density, the channelized leak density must come
+    out flat.
+    """
+
+    result = _stage(
+        _context(tmp_path),
+        star_template=str(_flat_flambda_stellar_csv(tmp_path)),
+        snr_vs_r_points=0,
+        rv_scan_points=0,
+    ).apply(_state())
+    payload = result.results.components["characterization.hdc_ccf"]
+
+    centers = np.asarray(payload["ccf_channel_centers_um"], dtype=np.float64)
+    leak = np.asarray(payload["ccf_leak_rate_hz_per_channel"], dtype=np.float64)
+    # Channel widths grow like lambda on a log grid; divide them out to recover
+    # the underlying rate density, which must be flat.
+    edges = np.asarray(payload["ccf_channel_edges_um"], dtype=np.float64)
+    density = leak / np.diff(edges)
+    interior = slice(2, -2)  # skip LSF edge roll-off
+    density = density[interior] / float(np.mean(density[interior]))
+    slope = np.polyfit(centers[interior], density, 1)[0]
+    tilt_across_band = abs(slope) * (centers[-1] - centers[0])
+    assert tilt_across_band < 0.01, (
+        f"stellar shape retilted the coarse density by {tilt_across_band:.3%} "
+        "across the band; expected <1%"
+    )
+
+
+def test_hdc_ccf_systematic_rejection_is_scale_invariant(tmp_path: Path) -> None:
+    """The rejection factor must not move with the template normalization.
+
+    Exact invariance is a property of the metric itself, so it is pinned on the
+    helper with the weights scaled directly. End to end, scaling the planet
+    rate by 10 also feeds back weakly through the per-channel variance (the
+    planet is part of v), so that leg only checks the factor stays put to a
+    few percent and never goes negative.
+    """
+
+    from nullsim.physics.hdc import ChannelSpectra
+    from nullsim.stages.characterization.hdc_ccf import _ccf_systematic_rejection
+
+    rng = np.random.default_rng(0)
+    n = 32
+    edges = np.linspace(1.2, 1.3, n + 1)
+    channels = ChannelSpectra(
+        channel_centers_um=0.5 * (edges[:-1] + edges[1:]),
+        channel_edges_um=edges,
+        planet_rate_hz=rng.uniform(0.1, 1.0, n),
+        leak_rate_hz=rng.uniform(10.0, 20.0, n),
+        sky_rate_hz=np.zeros(n),
+        dark_rate_hz=np.zeros(n),
+    )
+    weights = rng.uniform(-1.0, 1.0, n)
+
+    class _Budget:
+        def __init__(self, scale: float) -> None:
+            self.template_weights = weights * scale
+            self.systematic_ccf_leakage = float(
+                np.sum(self.template_weights * channels.leak_rate_hz * 0.3)
+            )
+
+    unscaled = _ccf_systematic_rejection(_Budget(1.0), channels)
+    scaled = _ccf_systematic_rejection(_Budget(10.0), channels)
+    assert unscaled >= 0.0
+    assert scaled == pytest.approx(unscaled, rel=1.0e-12)
+
+    baseline = _stage(
+        _context(tmp_path), snr_vs_r_points=0, rv_scan_points=0
+    ).apply(_state())
+    brighter = _stage(
+        _context(tmp_path), snr_vs_r_points=0, rv_scan_points=0
+    ).apply(_state(planet_rate_scale=10.0))
+    left = float(
+        baseline.results.components["characterization.hdc_ccf"][
+            "ccf_systematic_rejection"
+        ]
+    )
+    right = float(
+        brighter.results.components["characterization.hdc_ccf"][
+            "ccf_systematic_rejection"
+        ]
+    )
+    assert left >= 0.0 and right >= 0.0
+    assert right == pytest.approx(left, rel=0.05)
+
+def test_hdc_ccf_partial_fsr_restricts_the_channel_span(tmp_path: Path) -> None:
+    """With FSR < 1 the detector never sees the blocked wavelengths."""
+
+    full = _stage(_context(tmp_path), snr_vs_r_points=0, rv_scan_points=0).apply(
+        _state()
+    )
+    half = _stage(_context(tmp_path), snr_vs_r_points=0, rv_scan_points=0).apply(
+        _state(free_spectral_range_fraction=0.5)
+    )
+    full_payload = full.results.components["characterization.hdc_ccf"]
+    half_payload = half.results.components["characterization.hdc_ccf"]
+
+    full_lo, full_hi = full_payload["observed_band_um"]
+    half_lo, half_hi = half_payload["observed_band_um"]
+    assert (half_hi - half_lo) == pytest.approx(
+        0.5 * _BAND_WIDTH_UM, rel=1.0e-6
+    )
+    assert half_lo > full_lo and half_hi < full_hi
+    # Channels only tile the dispersed span, so there are about half as many
+    # and the dark budget scales with them instead of the full band.
+    assert int(half_payload["n_channels"]) == pytest.approx(
+        0.5 * int(full_payload["n_channels"]), rel=0.02
+    )
+    centers = np.asarray(
+        half_payload["ccf_channel_centers_um"], dtype=np.float64
+    )
+    assert centers.min() >= half_lo and centers.max() <= half_hi
+
+
+def test_hdc_ccf_binds_each_instance_to_its_own_spectro(tmp_path: Path) -> None:
+    """spectro_a -> hdc_a -> spectro_b -> hdc_b must not both bind spectro_a."""
+
+    state = _state()
+    first = _stage(
+        _context(tmp_path), snr_vs_r_points=0, rv_scan_points=0
+    ).apply(state)
+    # A second spectro component lands after the first HDC payload.
+    with_second = replace(
+        first,
+        results=first.results.add_component(
+            "characterization.spectro.b", _spectro_payload(awg_throughput=0.5)
+        ),
+    )
+    second = _stage(
+        _context(tmp_path), snr_vs_r_points=0, rv_scan_points=0
+    ).apply(with_second)
+
+    payloads = [
+        payload
+        for name, payload in second.results.components.items()
+        if name.startswith("characterization.hdc_ccf")
+    ]
+    assert len(payloads) == 2
+    assert payloads[0]["upstream_spectro_component"] == "characterization.spectro"
+    assert payloads[1]["upstream_spectro_component"] == "characterization.spectro.b"
+
+
+def test_hdc_ccf_upstream_spectro_param_selects_explicitly(tmp_path: Path) -> None:
+    state = _state()
+    state = replace(
+        state,
+        results=state.results.add_component(
+            "characterization.spectro.b", _spectro_payload(awg_throughput=0.5)
+        ),
+    )
+    result = _stage(
+        _context(tmp_path),
+        upstream_spectro="characterization.spectro",
+        snr_vs_r_points=0,
+        rv_scan_points=0,
+    ).apply(state)
+    payload = result.results.components["characterization.hdc_ccf"]
+    assert payload["upstream_spectro_component"] == "characterization.spectro"
+
+    missing = _stage(_context(tmp_path), upstream_spectro="characterization.nope")
+    with pytest.raises(ValueError, match="is not present on state.results"):
+        missing.apply(state)
+
+
+def test_hdc_ccf_rejects_mkid_native_spectroscopy(tmp_path: Path) -> None:
+    """Phase 1 refuses MKID rather than applying a constant-R LSF to it."""
+
+    state = SimulationState.empty({"wavelength_grid_um": (1.25,)})
+    state = replace(
+        state,
+        scene=Scene(
+            star_jmag=4.0,
+            star_spectral_type="M2V",
+            planet_contrast=_PLANET_CONTRAST,
+            planet_radial_velocity_kms=_PLANET_RV_KMS,
+        ),
+        results=state.results.add_component(
+            "characterization.spectro", _mkid_payload()
+        ),
+    )
+    stage = _stage(_context(tmp_path))
+    with pytest.raises(ValueError, match="does not support MKID"):
+        stage.apply(state)
 
 
 @pytest.mark.parametrize("resolving_power", [100.0, 300.0, 1000.0, 3000.0])
@@ -590,8 +796,12 @@ def test_hdc_ccf_sky_loses_the_same_uncovered_band_share(
     )
     sky_fraction = retained("ccf_sky_rate_hz_per_channel", "sky_rate_hz_total")
 
+    # The bug being pinned: sky used to keep 100%. It now forfeits the same
+    # share the other components do, to within the LSF's edge-clamp asymmetry
+    # (the leak carries the stellar tilt, sky is flat, and at coarse R the
+    # kernel is a sizeable fraction of the band).
     assert sky_fraction < 1.0
-    assert sky_fraction == pytest.approx(leak_fraction, rel=2.0e-3)
+    assert sky_fraction == pytest.approx(leak_fraction, rel=5.0e-3)
 
     if resolving_power >= 3000.0:
         # At a sane kernel width every component agrees. At very coarse R the

@@ -3,9 +3,9 @@
 Sits downstream of ``characterization.spectro``. That stage publishes the
 retuned chip's per-wavelength planet throughput, static stellar leakage, and
 detected stellar photon rates on the (coarse) detector wavelength grid, plus
-the spectrograph description (AWG resolving power and bin count, or the MKID
-native resolving power). This stage takes those broadband budgets, dresses
-them with real spectral shapes -- a planet albedo, a stellar photosphere, and
+the AWG spectrograph description (resolving power, bin count, dispersed span,
+and the detected band totals behind it). This stage takes those broadband
+budgets, dresses them with real spectral shapes -- a planet albedo, a stellar photosphere, and
 an optional telluric transmission -- channelizes them at the spectrograph
 resolving power, and evaluates the matched-filter cross-correlation budget of
 `nullsim.physics.hdc`.
@@ -55,6 +55,12 @@ Model choices worth knowing before reading the payload:
   the per-channel variance. Without that subtraction the statistic would peak
   in the stellar rest frame, which is a statement about the star, not the
   planet.
+
+Phase 1 supports AWG-dispersed spectro ports only. MKID-native spectroscopy is
+refused with a clear error: an MKID has constant energy resolution rather than
+constant resolving power, so it needs the energy-response-matrix line-spread
+operator from ``nullsim.physics.mkid`` rather than the Gaussian constant-R
+convolution used here. See `_reject_unsupported_spectrograph`.
 
 Deterministic: the stage draws no random numbers.
 """
@@ -143,7 +149,11 @@ class HdcCcfStage(BaseStage):
         star_template: str | None = None
         # None (or "none") means no atmosphere: the right setting for space.
         telluric_template: str | None = None
-        # None takes the AWG/MKID resolving power from the spectro payload.
+        # Name an upstream characterization.spectro component explicitly.
+        # None binds to the most recently added compatible one, which is the
+        # one immediately upstream in pipeline order.
+        upstream_spectro: str | None = None
+        # None takes the AWG resolving power from the spectro payload.
         resolving_power: float | None = PydanticField(default=None, gt=0.0)
         telluric_mask_threshold: float = PydanticField(default=0.8, ge=0.0, le=1.0)
         # Analysis grid resolving power = grid_oversampling * instrument R.
@@ -158,15 +168,25 @@ class HdcCcfStage(BaseStage):
 
     def apply(self, state: SimulationState) -> SimulationState:
         params = self.params_model
-        spectro_name, spectro = _find_spectro_component(state)
+        spectro_name, spectro = _find_spectro_component(
+            state, params.upstream_spectro
+        )
+        _reject_unsupported_spectrograph(spectro, spectro_name)
 
-        band = _CoarseBand.from_spectro(spectro)
         resolving_power, resolving_power_source = _resolve_resolving_power(
             spectro, params.resolving_power
         )
         spectro_integration_time_s = _spectro_integration_time_s(spectro)
         detection_budget = _DetectionBudget.from_spectro(
             spectro, spectro_integration_time_s
+        )
+        # The detector only sees the AWG's dispersed span. With a
+        # free-spectral-range fraction below 1 that is narrower than the
+        # detector band, and channelizing across the whole band would let
+        # blocked lines into the statistic and charge dark for channels the
+        # AWG never illuminates.
+        band = _CoarseBand.from_spectro(spectro).restricted_to(
+            detection_budget.observed_band_um
         )
         eps_systematic = float(spectro["eps_systematic"])
         servo_bw_hz = float(spectro["servo_bw_hz"])
@@ -273,12 +293,8 @@ class HdcCcfStage(BaseStage):
             "ccf_photon_var_counts": float(budget.photon_var_counts),
             "ccf_systematic_var_counts": float(budget.systematic_var_counts),
             "systematic_ccf_leakage": float(budget.systematic_ccf_leakage),
-            "ccf_systematic_rejection": (
-                float(
-                    budget.systematic_ccf_leakage / detection_budget.leak_rate_hz
-                )
-                if detection_budget.leak_rate_hz > 0.0
-                else 0.0
+            "ccf_systematic_rejection": _ccf_systematic_rejection(
+                budget, channels
             ),
             "self_subtraction_factor": float(budget.self_subtraction_factor),
             "n_effective_lines": float(budget.n_effective_lines),
@@ -288,6 +304,9 @@ class HdcCcfStage(BaseStage):
                 telluric_per_channel, float(params.telluric_mask_threshold)
             ),
             "ccf_channel_centers_um": channels.channel_centers_um.astype(
+                np.float64, copy=True
+            ),
+            "ccf_channel_edges_um": channels.channel_edges_um.astype(
                 np.float64, copy=True
             ),
             "ccf_planet_rate_hz_per_channel": channels.planet_rate_hz.astype(
@@ -357,6 +376,33 @@ class HdcCcfStage(BaseStage):
                 templates.telluric.provenance
                 if templates.telluric is not None
                 else "none (no telluric absorption applied)"
+            ),
+            "planet_template_sha256": _template_sha256(templates.planet.path),
+            "star_template_sha256": _template_sha256(templates.star.path),
+            "telluric_template_sha256": (
+                _template_sha256(templates.telluric.path)
+                if templates.telluric is not None
+                else None
+            ),
+            # The coarse upstream arrays this stage interpolated, so a reader
+            # can reproduce the densities without re-reading the spectro
+            # component. Ordered ascending in wavelength like the band.
+            "coarse_wavelength_um": band.wavelength_um.astype(
+                np.float64, copy=True
+            ),
+            "coarse_bin_width_um": band.bin_width_um.astype(np.float64, copy=True),
+            "coarse_stellar_rate_hz": band.stellar_rate_hz.astype(
+                np.float64, copy=True
+            ),
+            "coarse_planet_throughput": band.planet_throughput.astype(
+                np.float64, copy=True
+            ),
+            "coarse_leak_fraction": band.leak_fraction.astype(
+                np.float64, copy=True
+            ),
+            "observed_band_um": (
+                float(band.lambda_min_um),
+                float(band.lambda_max_um),
             ),
             "ccf_model": _CCF_MODEL,
             "snr_vs_resolving_power_model": (
@@ -440,9 +486,8 @@ class HdcCcfStage(BaseStage):
         dependencies: list[ExternalDependency] = []
         for role, path in entries:
             source = f"characterization.hdc_ccf.{role}"
-            try:
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            except OSError:
+            digest = _template_sha256(path)
+            if digest is None:
                 dependencies.append(ExternalDependency(source=source, path=path))
                 continue
             dependencies.append(
@@ -475,11 +520,17 @@ _CCF_MODEL = (
     "it gets telluric line structure riding on an unattenuated continuum. "
     "The absolute (unnormalized) transmission is what the telluric channel "
     "mask thresholds on. "
-    "ccf_systematic_rejection = systematic_ccf_leakage / detected leak rate is "
-    "the template-projected fraction of the dark-port leak: the "
-    "null-instability amplitude eps_systematic multiplies that projection "
-    "rather than the whole band leak, which is where the HDC systematic gain "
-    "comes from."
+    "ccf_systematic_rejection = |sum_i w_i Ltilde_i| / sum_i w_i L_i is the "
+    "fraction of the template-projected leak that SURVIVES continuum "
+    "filtering: filtered over unfiltered leak projection under the same "
+    "matched-filter weights, so the arbitrary weight normalization cancels and "
+    "the ratio is non-negative and normally in [0, 1]. Small means the leak's "
+    "spectral structure is nearly orthogonal to the planet template, which is "
+    "where the HDC systematic gain comes from -- the null-instability "
+    "amplitude eps_systematic multiplies that surviving projection rather than "
+    "the whole band leak. Do not read it as a ratio to the raw dark-port leak "
+    "rate: that earlier definition scaled with the weight normalization and "
+    "could go negative."
 )
 
 
@@ -512,6 +563,40 @@ class _CoarseBand:
         self.leak_fraction = leak_fraction
         self.lambda_min_um = float(wavelength_um[0] - 0.5 * bin_width_um[0])
         self.lambda_max_um = float(wavelength_um[-1] + 0.5 * bin_width_um[-1])
+
+    def restricted_to(
+        self, observed_band_um: tuple[float, float] | None
+    ) -> _CoarseBand:
+        """Narrow the observed limits to a spectrograph's dispersed span.
+
+        The coarse arrays are untouched -- they are still the interpolation
+        source over the full detector grid -- but every band-limited operation
+        (the density window, the shape normalizations, the analysis grid, and
+        the channel edges) now works over the intersection with what the
+        spectrograph actually disperses onto the detector.
+        """
+
+        if observed_band_um is None:
+            return self
+        lo = max(self.lambda_min_um, float(observed_band_um[0]))
+        hi = min(self.lambda_max_um, float(observed_band_um[1]))
+        if not hi > lo:
+            raise ValueError(
+                "characterization.hdc_ccf: the spectrograph's dispersed span "
+                f"[{observed_band_um[0]:.4g}, {observed_band_um[1]:.4g}] um does "
+                f"not overlap the detector band [{self.lambda_min_um:.4g}, "
+                f"{self.lambda_max_um:.4g}] um."
+            )
+        narrowed = _CoarseBand(
+            wavelength_um=self.wavelength_um,
+            bin_width_um=self.bin_width_um,
+            stellar_rate_hz=self.stellar_rate_hz,
+            planet_throughput=self.planet_throughput,
+            leak_fraction=self.leak_fraction,
+        )
+        narrowed.lambda_min_um = lo
+        narrowed.lambda_max_um = hi
+        return narrowed
 
     @classmethod
     def from_spectro(cls, spectro: dict[str, Any]) -> _CoarseBand:
@@ -574,7 +659,12 @@ class _Template:
     spacing fixes that without changing the content.
     """
 
-    __slots__ = ("spectrum", "spectral_resolving_power", "grid_resolving_power")
+    __slots__ = (
+        "spectrum",
+        "spectral_resolving_power",
+        "grid_resolving_power",
+        "path",
+    )
 
     def __init__(
         self,
@@ -582,10 +672,37 @@ class _Template:
         spectrum: TemplateSpectrum,
         spectral_resolving_power: float,
         grid_resolving_power: float,
+        path: Path,
     ) -> None:
         self.spectrum = spectrum
         self.spectral_resolving_power = spectral_resolving_power
         self.grid_resolving_power = grid_resolving_power
+        self.path = path
+
+    def as_energy_flux_shape(self) -> _Template:
+        """Divide out the photon-flux lambda factor: F_lambda * lambda -> F_lambda.
+
+        See the call site in `_Templates.load` for why the stellar template has
+        to be an energy-flux shape rather than the photon-flux shape the
+        snapshots store.
+        """
+
+        spectrum = self.spectrum
+        return _Template(
+            spectrum=TemplateSpectrum(
+                wavelength_um=spectrum.wavelength_um,
+                values=spectrum.values / spectrum.wavelength_um,
+                kind=spectrum.kind,
+                provenance=(
+                    f"{spectrum.provenance}; converted from the stored "
+                    "photon-flux shape (F_lambda * lambda) to an energy-flux "
+                    "shape (F_lambda) by characterization.hdc_ccf"
+                ),
+            ),
+            spectral_resolving_power=self.spectral_resolving_power,
+            grid_resolving_power=self.grid_resolving_power,
+            path=self.path,
+        )
 
     @property
     def provenance(self) -> str:
@@ -648,7 +765,21 @@ class _Templates:
         planet = _load_cropped(
             params.planet_template, "albedo", config_dir, lo, hi, "planet"
         )
-        star = _load_cropped(star_name, "stellar_flux", config_dir, lo, hi, "star")
+        # The packaged PHOENIX snapshots store a PHOTON-flux shape, F_lambda *
+        # lambda (scripts/generate_hdc_spectra.py drops h c). The coarse
+        # detected rates this shape multiplies are ALREADY photon rates, and
+        # they already carry the photon-rate lambda tilt: photometry's
+        # zero-point model is flat in F_lambda across a band, so
+        # photon_rate_per_m2_per_bin gives a rate density proportional to
+        # lambda * F_flat. Multiplying that by a photon-flux shape would apply
+        # the lambda tilt twice and give lambda^2 * F_lambda -- a ~13% spurious
+        # slope across J. Convert the template to an ENERGY-flux shape here, so
+        # coarse (proportional to lambda * F_flat) times a normalized F_lambda
+        # shape lands on lambda * F_lambda, which is the photon rate density of
+        # the actual stellar spectrum.
+        star = _load_cropped(
+            star_name, "stellar_flux", config_dir, lo, hi, "star"
+        ).as_energy_flux_shape()
         telluric = (
             _load_cropped(
                 telluric_name, "transmission", config_dir, lo, hi, "telluric"
@@ -1116,8 +1247,47 @@ def _ccf_vs_rv(
     )
 
 
-def _find_spectro_component(state: SimulationState) -> tuple[str, dict[str, Any]]:
-    for name, payload in state.results.components.items():
+def _find_spectro_component(
+    state: SimulationState, requested: str | None = None
+) -> tuple[str, dict[str, Any]]:
+    """Locate the upstream spectro component this stage should consume.
+
+    With ``upstream_spectro`` set, the named component must exist and carry the
+    required keys. Otherwise the MOST RECENTLY ADDED compatible component wins:
+    components are inserted in pipeline order, so in a
+    ``spectro_a -> hdc_a -> spectro_b -> hdc_b`` pipeline that binds each HDC
+    stage to the spectro run immediately before it. Taking the first match
+    instead would have bound both HDC stages to ``spectro_a``.
+    """
+
+    components = state.results.components
+    if requested is not None:
+        payload = components.get(requested)
+        if payload is None:
+            available = sorted(
+                name for name in components if name.startswith(_SPECTRO_PREFIX)
+            )
+            raise ValueError(
+                "characterization.hdc_ccf upstream_spectro "
+                f"{requested!r} is not present on state.results. "
+                f"Available characterization.spectro components: {available}."
+            )
+        if not isinstance(payload, dict) or not _REQUIRED_SPECTRO_KEYS.issubset(
+            payload
+        ):
+            missing = sorted(
+                _REQUIRED_SPECTRO_KEYS - set(payload)
+                if isinstance(payload, dict)
+                else _REQUIRED_SPECTRO_KEYS
+            )
+            raise ValueError(
+                "characterization.hdc_ccf upstream_spectro "
+                f"{requested!r} is not a usable characterization.spectro "
+                f"payload; missing keys {missing}."
+            )
+        return requested, payload
+
+    for name, payload in reversed(list(components.items())):
         if not name.startswith(_SPECTRO_PREFIX) or not isinstance(payload, dict):
             continue
         if _REQUIRED_SPECTRO_KEYS.issubset(payload):
@@ -1130,19 +1300,13 @@ def _find_spectro_component(state: SimulationState) -> tuple[str, dict[str, Any]
         "the same retuned chip throughput, leakage, and photon rates."
     )
 
-
 def _resolve_resolving_power(
     spectro: dict[str, Any], override: float | None
 ) -> tuple[float, str]:
     if override is not None:
         return float(override), "characterization.hdc_ccf resolving_power param"
-    spectrograph = str(spectro.get("spectrograph", "awg")).lower()
-    if spectrograph == "mkid":
-        value = spectro.get("mkid_resolving_power")
-        key = "mkid_resolving_power"
-    else:
-        value = spectro.get("awg_resolving_power")
-        key = "awg_resolving_power"
+    value = spectro.get("awg_resolving_power")
+    key = "awg_resolving_power"
     if value is None or not (float(value) > 0.0):
         raise ValueError(
             "characterization.hdc_ccf could not resolve a spectrograph "
@@ -1202,6 +1366,7 @@ class _DetectionBudget:
         "leak_rate_hz",
         "sky_rate_hz",
         "dark_rate_hz_per_channel",
+        "observed_band_um",
         "source",
     )
 
@@ -1212,21 +1377,25 @@ class _DetectionBudget:
         leak_rate_hz: float,
         sky_rate_hz: float,
         dark_rate_hz_per_channel: float,
+        observed_band_um: tuple[float, float] | None,
         source: str,
     ) -> None:
         self.planet_rate_hz = planet_rate_hz
         self.leak_rate_hz = leak_rate_hz
         self.sky_rate_hz = sky_rate_hz
         self.dark_rate_hz_per_channel = dark_rate_hz_per_channel
+        # Wavelength span the spectrograph actually disperses onto the
+        # detector, in microns. None means "the whole detector band".
+        self.observed_band_um = observed_band_um
         self.source = source
 
     @classmethod
     def from_spectro(
         cls, spectro: dict[str, Any], integration_time_s: float
     ) -> _DetectionBudget:
-        spectrograph = str(spectro.get("spectrograph", "awg")).lower()
-        if spectrograph == "mkid":
-            return cls._from_mkid(spectro, integration_time_s)
+        # MKID payloads are rejected upstream of here by
+        # _reject_unsupported_spectrograph; only the AWG branch is supported
+        # in phase 1.
         return cls._from_awg(spectro, integration_time_s)
 
     @classmethod
@@ -1258,6 +1427,7 @@ class _DetectionBudget:
             int(awg.get("pixels_per_resolution_element", 1) or 1), 1
         )
         dark_per_bin_hz = max(float(awg["dark_rate_hz_per_bin_total"]), 0.0)
+        observed_band_um = _awg_observed_band_um(awg)
         return cls(
             planet_rate_hz=max(float(spectro["awg_total_planet_rate_hz"]), 0.0),
             leak_rate_hz=max(float(spectro["awg_total_leakage_rate_hz"]), 0.0),
@@ -1265,67 +1435,82 @@ class _DetectionBudget:
             dark_rate_hz_per_channel=(
                 dark_per_bin_hz * pixels_per_resolution_element
             ),
+            observed_band_um=observed_band_um,
             source=(
                 "AWG-detected band totals from characterization.spectro "
                 "(awg_total_* keys already carry the AWG throughput and "
                 "free-spectral-range fraction); dark = "
                 f"{pixels_per_resolution_element} AWG bins per resolution "
                 "element x awg['dark_rate_hz_per_bin_total'], fixed per "
-                "channel. A free-spectral-range fraction below 1 enters as a "
-                "band-integrated factor, exactly as characterization.spectro "
-                "models it, not as a wavelength window."
+                "channel. Channels are built over the AWG's dispersed span "
+                + (
+                    f"[{observed_band_um[0]:.5g}, {observed_band_um[1]:.5g}] um "
+                    if observed_band_um is not None
+                    else "(unavailable; the whole detector band is used) "
+                )
+                + "from awg['bin_edges_m'], so a free-spectral-range fraction "
+                "below 1 removes the blocked wavelengths from the statistic "
+                "instead of leaving their lines in it."
             ),
         )
 
-    @classmethod
-    def _from_mkid(
-        cls, spectro: dict[str, Any], integration_time_s: float
-    ) -> _DetectionBudget:
-        # The MKID branch of characterization.spectro passes
-        # spectro_throughput=1.0 to per_bin_snr: native dispersion adds no
-        # spectrograph throughput term, so the optical rates entering the
-        # detector are the published band totals.
-        #
-        # Dark must come from the per-pixel metadata, not from the band-total
-        # D. per_bin_snr charges ``dark_rate_hz_per_pixel * n_spectro_pixels``
-        # per bin, while D scales with n_spectro_ports; the two agree only at
-        # the default of one spectro pixel, and D undercounts the dark budget
-        # whenever n_spectro_pixels > 1.
-        dark_per_bin = spectro.get("mkid_dark_rate_hz_per_bin_total")
-        if dark_per_bin is not None:
-            dark_rate_hz_per_channel = max(float(dark_per_bin), 0.0)
-            dark_source = (
-                "dark = mkid_dark_rate_hz_per_bin_total "
-                "(dark_rate_hz_per_pixel x n_spectro_pixels), charged per "
-                "channel the way per_bin_snr charges it per bin at one bin "
-                "per resolution element"
-            )
-        else:
-            # Older payloads predate the per-bin key. D over the integration
-            # time is dark_rate_hz_per_pixel for the single spectro port that
-            # spectro's validator enforces on the MKID branch, which is the
-            # per-bin rate only when n_spectro_pixels == 1.
-            dark_rate_hz_per_channel = (
-                max(float(spectro.get("D", 0.0) or 0.0), 0.0) / integration_time_s
-            )
-            dark_source = (
-                "dark from the band-total D over the integration time "
-                "(payload predates mkid_dark_rate_hz_per_bin_total); this "
-                "undercounts the per-bin dark when n_spectro_pixels > 1"
-            )
-        return cls(
-            planet_rate_hz=max(float(spectro["planet_signal_rate_hz"]), 0.0),
-            leak_rate_hz=max(float(spectro["leakage_rate_hz"]), 0.0),
-            sky_rate_hz=max(float(spectro.get("Sky", 0.0) or 0.0), 0.0)
-            / integration_time_s,
-            dark_rate_hz_per_channel=dark_rate_hz_per_channel,
-            source=(
-                "MKID native dispersion: characterization.spectro applies no "
-                "spectrograph throughput, so planet_signal_rate_hz and "
-                f"leakage_rate_hz are the detected band totals; {dark_source}."
-            ),
-        )
 
+def _awg_observed_band_um(awg: dict[str, Any]) -> tuple[float, float] | None:
+    """Wavelength span the AWG disperses onto the detector, in microns.
+
+    ``awg_wavelength_grid`` centres a span of ``band_bandwidth_m x
+    free_spectral_range_fraction`` on the design wavelength, so with a partial
+    free spectral range the detector never sees the rest of the band.
+    """
+
+    edges_m = awg.get("bin_edges_m")
+    if edges_m is None:
+        return None
+    edges = np.asarray(edges_m, dtype=np.float64)
+    if edges.ndim != 1 or edges.size < 2:
+        return None
+    lo = float(np.min(edges)) * 1.0e6
+    hi = float(np.max(edges)) * 1.0e6
+    if not (hi > lo > 0.0):
+        return None
+    return (lo, hi)
+
+
+def _reject_unsupported_spectrograph(
+    spectro: dict[str, Any], spectro_name: str
+) -> None:
+    """Refuse the MKID branch: phase 1 has no energy-response-matrix path.
+
+    Everything downstream of the analysis grid here assumes a Gaussian
+    line-spread function of *constant resolving power* -- that is what
+    ``convolve_to_resolving_power`` applies and what a constant-R channel grid
+    tiles. An MKID does not work that way: its resolving power runs as
+    ``R(lambda) = R_ref * lambda_ref / lambda`` (``physics/mkid.py``), i.e.
+    constant energy resolution, so its channels are uniform in photon energy
+    rather than in ``ln lambda`` and its line-spread function broadens toward
+    the red across a single band. Running the constant-R machinery on an MKID
+    payload would silently mis-state both the channel grid and the smoothing.
+
+    The design spec's MKID path is ``physics/mkid.energy_response_matrix`` used
+    as the line-spread operator; that is phase 2 work. Until then this is an
+    explicit refusal rather than a quiet approximation.
+    """
+
+    spectrograph = str(spectro.get("spectrograph", "awg")).lower()
+    if spectrograph != "mkid":
+        return
+    raise ValueError(
+        "characterization.hdc_ccf does not support MKID-native spectroscopy "
+        f"(upstream component {spectro_name!r} has spectrograph='mkid'). The "
+        "stage applies a constant-resolving-power Gaussian line-spread "
+        "function on a constant-R channel grid, but an MKID has constant "
+        "energy resolution: R(lambda) = R_ref * lambda_ref / lambda. Handling "
+        "it correctly needs the energy-response-matrix line-spread operator "
+        "from nullsim.physics.mkid, which is deferred to phase 2 of the HDC "
+        "module. Use an AWG spectro configuration "
+        "(characterization.spectro spectrograph=\"awg\") for HDC "
+        "cross-correlation in the meantime."
+    )
 
 def _resolve_fringe_tracking(
     spectro: dict[str, Any],
@@ -1516,6 +1701,7 @@ def _load_cropped(
         ),
         spectral_resolving_power=_template_resolving_power(spectrum),
         grid_resolving_power=grid_resolving_power,
+        path=path,
     )
 
 
@@ -1649,6 +1835,35 @@ def _r_scan_values(
     return np.logspace(
         math.log10(_R_SCAN_MIN), math.log10(r_max), int(n_points)
     ).astype(np.float64)
+
+
+def _template_sha256(path: Path) -> str | None:
+    """SHA-256 of a template file, or None when it cannot be read."""
+
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _ccf_systematic_rejection(budget: Any, channels: ChannelSpectra) -> float:
+    """Fraction of the template-projected leak that survives continuum filtering.
+
+    ``|sum_i w_i Ltilde_i| / sum_i w_i L_i``: the same weights appear in both
+    sums, so the arbitrary scale of the matched-filter template cancels and the
+    result is a genuine dimensionless rejection factor. The numerator is taken
+    in absolute value because the filtered leak projection is signed -- an
+    absorption-dominated residual flips it -- while what the systematic term
+    cares about is its magnitude.
+
+    The earlier definition divided by the raw band leak rate instead, which
+    scaled with the weight normalization and could be negative.
+    """
+
+    unfiltered = float(np.sum(budget.template_weights * channels.leak_rate_hz))
+    if unfiltered <= 0.0:
+        return 0.0
+    return abs(float(budget.systematic_ccf_leakage)) / unfiltered
 
 
 def _telluric_masked_fraction(
