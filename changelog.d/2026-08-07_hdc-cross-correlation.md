@@ -51,3 +51,8 @@ Framing and the sqrt(N_lines) scaling follow Wang, Mawet, Ruane, Hu & Benneke
 - **New example config `examples/test/hdc_ccf_smoke.toml`**: four-mode M2V
   host with an AWG spectro port at R = 5000, exercising the whole path end to
   end in a few seconds.
+- **New example config `examples/test/hdc_ccf_systematics.toml`**: the same
+  instrument with a quasi-static 1e-3 null instability on the leaked
+  starlight. The broadband band SNR falls to 3.1 while the cross-correlation
+  holds 33.1, which is the regime HDC is for; the smoke config is photon
+  limited and ties.
