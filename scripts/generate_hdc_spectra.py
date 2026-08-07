@@ -9,13 +9,24 @@ Families and their upstream sources:
 
 ``earth``, ``venus``
     NASA Planetary Spectrum Generator (Villanueva et al. 2018, 2022), POSTed to
-    ``https://psg.gsfc.nasa.gov/api.php``. PSG expands a pinned minimal config
-    into a full atmosphere (MERRA-2 for Earth on a fixed date, PSG's Venus
-    template), we override the viewing geometry to quadrature and the generator
-    block to ``rif`` units, and read the ``Total`` column, which PSG documents
-    as "I/F [apparent albedo]". PUMAS refuses 0.5-1.8 um in one shot on memory
-    grounds, so the band is requested in overlapping log-spaced chunks and
-    stitched.
+    ``https://psg.gsfc.nasa.gov/api.php``. Generation reads a *frozen*,
+    committed config under ``scripts/psg_config/`` -- never the service's live
+    defaults -- and the SHA-256 of that config goes into the CSV header.
+    ``--refresh-psg-config`` is the one path that rebuilds those files.
+
+    The frozen config puts the planet in ``<OBJECT>Exoplanet`` mode at 10 pc
+    with the sub-solar point 90 deg from the sub-observer point, which is what
+    makes PSG treat the disk as unresolved and run its illuminated-disk
+    sub-sampling at quadrature; the named solar-system atmospheres (MERRA-2 for
+    Earth, VIRA-45 with volcanic aerosol for Venus) are harvested from
+    ``<OBJECT>Planet`` mode and transplanted in, because exoplanet mode
+    otherwise falls back to an Earth template for every object.
+
+    Output is ``GENERATOR-RADUNITS=rif``, which PSG labels "I/F [apparent
+    albedo]", read from the column named after the object -- not ``Total``,
+    which also carries the star. PUMAS refuses 0.5-1.8 um in one shot on memory
+    grounds, so the band is requested in overlapping log-spaced chunks; the
+    overlaps are compared and the stitch is refused if they disagree.
 
 ``stellar``
     PHOENIX-ACES-AGSS-COND-2011 HiRes FITS (Husser et al. 2013) from
@@ -50,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import sys
 import tempfile
 import time
@@ -82,39 +94,78 @@ OUT_DIR = REPO_ROOT / "nullsim" / "data" / "spectra"
 REQUEST_MARGIN = 0.01
 
 # --------------------------------------------------------------------------
-# PSG (Earth / Venus geometric albedo)
+# PSG (Earth / Venus disk-integrated albedo at quadrature)
 # --------------------------------------------------------------------------
 
 PSG_URL = "https://psg.gsfc.nasa.gov/api.php"
 PSG_TIMEOUT_S = 1800
 
-# Fixed epoch: PSG pulls the Earth atmosphere from the NASA/MERRA-2 archive for
-# this date, so pinning it pins the atmospheric state.
+# The spectra are generated from a *frozen* config committed under
+# PSG_CONFIG_DIR, never from PSG's live defaults. `--refresh-psg-config` is the
+# only code path that consults the live service for anything but radiance, and
+# it rewrites those committed files; running it is a deliberate, reviewable act.
+PSG_CONFIG_DIR = Path(__file__).resolve().parent / "psg_config"
+
+# Fixed epoch, used only while refreshing: PSG pulls the Earth atmosphere from
+# the NASA/MERRA-2 archive for this date. After the refresh the profile is
+# literal text in the frozen config, so the date no longer affects anything.
 PSG_DATE = "2026/03/20 12:00"
 
-PSG_MINIMAL_CFG = {
-    "earth": (
+# Stage 1 of a refresh. PSG only looks up a named solar-system atmosphere in
+# `<OBJECT>Planet` mode, so the atmosphere and surface blocks are harvested here
+# and transplanted into the exoplanet frame below. Earth resolves to the
+# NASA/MERRA-2 profile, Venus to VIRA-45 with the volcanic (sulfuric acid)
+# aerosol.
+PSG_ATMOSPHERE_SOURCE = {
+    name: (
         "<OBJECT>Planet\n"
-        "<OBJECT-NAME>Earth\n"
+        f"<OBJECT-NAME>{name.capitalize()}\n"
         f"<OBJECT-DATE>{PSG_DATE}\n"
         "<GEOMETRY>Observatory\n"
-    ),
-    "venus": (
-        "<OBJECT>Planet\n"
-        "<OBJECT-NAME>Venus\n"
-        f"<OBJECT-DATE>{PSG_DATE}\n"
-        "<GEOMETRY>Observatory\n"
-    ),
+    )
+    for name in ("earth", "venus")
 }
 
-# Quadrature: cos(phase) = cos(i)cos(e) + sin(i)sin(e)cos(azimuth) vanishes for
-# i = 60 deg, e = 30 deg, azimuth = 180 deg, so the phase angle is exactly 90
-# deg. The pair also gives a sane disk-average airmass, sec(60) + sec(30).
-PSG_GEOMETRY_OVERRIDES = {
-    "GEOMETRY-SOLAR-ANGLE": "60.000",
-    "GEOMETRY-OBS-ANGLE": "30.000",
-    "GEOMETRY-AZIMUTH": "180.000",
+# Stage 2 of a refresh: the observing frame. `<OBJECT>Exoplanet` viewed from
+# 10 pc is what makes PSG treat the disk as unresolved and run its illuminated
+# -disk sub-sampling (Villanueva et al. 2018, sect. 2.3); in `Planet` mode the
+# geometry comes from the solar-system ephemeris and only two disk elements are
+# produced. Quadrature is set by placing the sub-solar point 90 deg from the
+# sub-observer point -- PSG then returns per-element incidence/emission angles
+# and illuminated-area weights that sum to one.
+PSG_DISK_ANGLES = 3
+
+PSG_FRAME = {
+    # key: (diameter [km], surface gravity [g], semi-major axis [AU])
+    "earth": (12742, 9.807, 1.0),
+    "venus": (12104, 8.87, 0.723),
 }
+
+
+def psg_frame_text(target: str) -> str:
+    diameter, gravity, star_distance_au = PSG_FRAME[target]
+    return (
+        "<OBJECT>Exoplanet\n"
+        f"<OBJECT-NAME>{target.capitalize()}\n"
+        f"<OBJECT-DATE>{PSG_DATE}\n"
+        f"<OBJECT-DIAMETER>{diameter}\n"
+        f"<OBJECT-GRAVITY>{gravity}\n"
+        "<OBJECT-GRAVITY-UNIT>g\n"
+        "<OBJECT-STAR-TYPE>G\n"
+        "<OBJECT-STAR-TEMPERATURE>5777\n"
+        "<OBJECT-STAR-RADIUS>1.0\n"
+        f"<OBJECT-STAR-DISTANCE>{star_distance_au}\n"
+        "<OBJECT-SOLAR-LONGITUDE>90.0\n"
+        "<OBJECT-SOLAR-LATITUDE>0.0\n"
+        "<OBJECT-OBS-LONGITUDE>0.0\n"
+        "<OBJECT-OBS-LATITUDE>0.0\n"
+        "<OBJECT-SEASON>90\n"
+        "<GEOMETRY>Observatory\n"
+        "<GEOMETRY-ALTITUDE-UNIT>pc\n"
+        "<GEOMETRY-OBS-ALTITUDE>10.0\n"
+        f"<GEOMETRY-DISK-ANGLES>{PSG_DISK_ANGLES}\n"
+    )
+
 
 PSG_GENERATOR_OVERRIDES = {
     "GENERATOR-RANGEUNIT": "um",
@@ -138,6 +189,11 @@ PSG_GENERATOR_OVERRIDES = {
 # far denser, only ~1.25x. Log-spaced chunks with a 1% overlap on each seam.
 PSG_N_CHUNKS = {"earth": 4, "venus": 7}
 PSG_CHUNK_OVERLAP = 0.01
+
+# Chunks are predicted twice in their overlap; if the two predictions disagree
+# by more than this (median relative) the stitch is refused rather than quietly
+# writing a seam artefact into the template.
+PSG_SEAM_TOLERANCE = 1e-3
 
 # --------------------------------------------------------------------------
 # PHOENIX (stellar photon-flux shape)
@@ -248,17 +304,8 @@ def _psg_post(payload: dict[str, str]) -> str:
     return text
 
 
-def _psg_expand_config(target: str) -> str:
-    """Ask PSG to fill in ephemeris, geometry, and atmosphere for the target."""
-    print(f"  PSG: expanding minimal config for {target}")
-    return _psg_post(
-        {
-            "type": "cfg",
-            "wephm": "y",
-            "watm": "y",
-            "file": PSG_MINIMAL_CFG[target],
-        }
-    )
+def psg_config_path(target: str) -> Path:
+    return PSG_CONFIG_DIR / f"{target}_quadrature.cfg"
 
 
 def _psg_apply_overrides(config: str, overrides: dict[str, str]) -> str:
@@ -271,23 +318,114 @@ def _psg_apply_overrides(config: str, overrides: dict[str, str]) -> str:
     return "\n".join(kept) + "\n"
 
 
-def _psg_parse_spectrum(text: str) -> tuple[np.ndarray, np.ndarray]:
-    """Pull the wavelength and ``Total`` columns out of a PSG rad file."""
+def refresh_psg_config(target: str) -> Path:
+    """Rebuild and freeze the fully expanded PSG config for ``target``.
+
+    The only code path that reads PSG's live defaults. Stage 1 harvests the
+    named atmosphere and surface blocks from ``<OBJECT>Planet`` mode; stage 2
+    transplants them into the exoplanet quadrature frame and lets PSG's geometry
+    module resolve the illuminated-disk sub-sampling. The result is written to
+    ``scripts/psg_config/`` and committed, so generation never depends on the
+    service's defaults again.
+    """
+    print(f"[{target}] refreshing frozen PSG config")
+    print("  stage 1: harvesting the named atmosphere from Planet mode")
+    planet_cfg = _psg_post(
+        {
+            "type": "cfg",
+            "wephm": "n",
+            "watm": "y",
+            "file": PSG_ATMOSPHERE_SOURCE[target],
+        }
+    )
+    blocks = [
+        line
+        for line in planet_cfg.splitlines()
+        if line.startswith(("<ATMOSPHERE-", "<SURFACE-"))
+    ]
+    if not blocks:
+        raise RuntimeError(f"PSG returned no atmosphere block for {target}")
+    description = next(
+        (b for b in blocks if b.startswith("<ATMOSPHERE-DESCRIPTION>")), "<unknown>"
+    )
+    print(f"    {description[:100]}")
+
+    print("  stage 2: expanding the exoplanet quadrature frame")
+    frame = psg_frame_text(target) + "\n".join(blocks) + "\n"
+    expanded = _psg_post(
+        {"type": "cfg", "wephm": "n", "watm": "n", "wgeo": "y", "file": frame}
+    )
+    fractions = _psg_disk_fractions(expanded)
+    total = float(np.sum(fractions))
+    print(
+        f"    {fractions.size} illuminated-disk elements, "
+        f"area weights sum to {total:.4f}"
+    )
+    if fractions.size < 2:
+        raise RuntimeError(
+            f"{target}: PSG returned {fractions.size} disk element(s); the "
+            "illuminated-disk integration did not engage"
+        )
+    if not 0.95 <= total <= 1.05:
+        raise RuntimeError(
+            f"{target}: disk area weights sum to {total:.4f}, expected ~1"
+        )
+
+    path = psg_config_path(target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(expanded)
+    print(f"  froze {path.relative_to(REPO_ROOT)}  sha256={_sha256(path)[:16]}...")
+    return path
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _psg_disk_fractions(config: str) -> np.ndarray:
+    for line in config.splitlines():
+        if line.startswith("<GEOMETRY-PLANET-FRACTION>"):
+            body = line.split(">", 1)[1]
+            return np.asarray([float(x) for x in body.split(",")], dtype=np.float64)
+    return np.zeros(0, dtype=np.float64)
+
+
+def _psg_parse_spectrum(text: str, target: str) -> tuple[np.ndarray, np.ndarray]:
+    """Pull the wavelength and *planet* columns out of a PSG rad file.
+
+    In exoplanet mode PSG emits ``Wave Total Noise Stellar <ObjectName>``. The
+    ``Total`` column is the star plus the planet, and since the star outshines
+    the planet by ~1e10 in the beam it is numerically meaningless here (it comes
+    back oscillating over +-1e4 in I/F units). The planet's own contribution is
+    the column named after the object, which is what an albedo means.
+    """
     columns: list[str] | None = None
     waves: list[float] = []
     values: list[float] = []
+    index: int | None = None
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("#"):
             body = stripped.lstrip("#").strip()
             if body.startswith("Wave"):
                 columns = body.split()
+                wanted = target.capitalize()
+                if wanted in columns:
+                    index = columns.index(wanted)
+                elif "Object" in columns:
+                    index = columns.index("Object")
+                else:
+                    raise RuntimeError(
+                        f"no planet column for {target!r} in PSG columns {columns}"
+                    )
             continue
         if not stripped:
             continue
+        if index is None:
+            raise RuntimeError("PSG returned data rows before a column header")
         fields = stripped.split()
         waves.append(float(fields[0]))
-        values.append(float(fields[columns.index("Total") if columns else 1]))
+        values.append(float(fields[index]))
     if not waves:
         raise RuntimeError("PSG returned no spectral rows")
     return np.asarray(waves, dtype=np.float64), np.asarray(values, dtype=np.float64)
@@ -300,33 +438,83 @@ def _psg_chunk_edges(n_chunks: int) -> np.ndarray:
 
 
 def generate_albedo(target: str, command: str) -> None:
-    print(f"[{target}] PSG apparent albedo at quadrature")
-    config = _psg_expand_config(target)
-    config = _psg_apply_overrides(config, PSG_GEOMETRY_OVERRIDES)
+    print(f"[{target}] PSG disk-integrated albedo at quadrature")
+    path = psg_config_path(target)
+    if not path.exists():
+        raise SystemExit(
+            f"missing frozen PSG config {path}. Run with --refresh-psg-config "
+            "to rebuild it from the service (this changes committed inputs)."
+        )
+    config = path.read_text()
+    config_hash = _sha256(path)
+    fractions = _psg_disk_fractions(config)
+    print(
+        f"  frozen config {path.name} sha256={config_hash[:16]}... "
+        f"{fractions.size} disk elements"
+    )
 
     n_chunks = PSG_N_CHUNKS[target]
     bounds = _psg_chunk_edges(n_chunks)
-    pieces: list[tuple[np.ndarray, np.ndarray]] = []
+    raw: list[tuple[np.ndarray, np.ndarray]] = []
     for i in range(n_chunks):
         lo, hi = bounds[i], bounds[i + 1]
         req_lo = lo * (1.0 - PSG_CHUNK_OVERLAP)
         req_hi = hi * (1.0 + PSG_CHUNK_OVERLAP)
-        print(f"  PSG: chunk {i + 1}/{n_chunks} {req_lo:.4f}-{req_hi:.4f} um")
+        print(
+            f"  PSG: chunk {i + 1}/{n_chunks} {req_lo:.4f}-{req_hi:.4f} um",
+            flush=True,
+        )
         overrides = dict(PSG_GENERATOR_OVERRIDES)
         overrides["GENERATOR-RANGE1"] = f"{req_lo:.6f}"
         overrides["GENERATOR-RANGE2"] = f"{req_hi:.6f}"
-        chunk_cfg = _psg_apply_overrides(config, overrides)
         text = _psg_post(
-            {"type": "rad", "wephm": "n", "wgeo": "n", "file": chunk_cfg}
+            {
+                "type": "rad",
+                "wephm": "n",
+                "wgeo": "n",
+                "file": _psg_apply_overrides(config, overrides),
+            }
         )
-        wave, value = _psg_parse_spectrum(text)
-        # Trim the overlap back to the nominal seam, keeping the first chunk's
-        # blue margin and the last chunk's red margin.
+        raw.append(_psg_parse_spectrum(text, target))
+
+    # Chunks overlap by PSG_CHUNK_OVERLAP on each side of every seam, so each
+    # seam has a region predicted twice. Disagreement there is the direct
+    # measure of whether stitching is safe; a silent seam artefact would inject
+    # a fake spectral feature straight into the CCF template.
+    seam_scores: list[float] = []
+    for i in range(n_chunks - 1):
+        left_w, left_v = raw[i]
+        right_w, right_v = raw[i + 1]
+        lo = max(left_w[0], right_w[0])
+        hi = min(left_w[-1], right_w[-1])
+        if hi <= lo:
+            raise RuntimeError(f"{target}: chunks {i} and {i + 1} do not overlap")
+        probe = left_w[(left_w >= lo) & (left_w <= hi)]
+        other = np.interp(probe, right_w, right_v)
+        mine = np.interp(probe, left_w, left_v)
+        scale = np.maximum(np.abs(mine), np.abs(other))
+        good = scale > 0.0
+        score = float(np.median(np.abs(mine - other)[good] / scale[good]))
+        seam_scores.append(score)
+        print(
+            f"    seam {i + 1} at {bounds[i + 1]:.4f} um: "
+            f"{probe.size} overlapping samples, median rel disagreement "
+            f"{score:.3e}"
+        )
+        if score > PSG_SEAM_TOLERANCE:
+            raise RuntimeError(
+                f"{target}: seam {i + 1} at {bounds[i + 1]:.4f} um disagrees by "
+                f"{score:.3e} > {PSG_SEAM_TOLERANCE:.0e}; refusing to stitch"
+            )
+    max_seam = max(seam_scores) if seam_scores else 0.0
+
+    pieces = []
+    for i, (wave, value) in enumerate(raw):
         keep = np.ones(wave.shape, dtype=bool)
         if i > 0:
-            keep &= wave >= lo
+            keep &= wave >= bounds[i]
         if i < n_chunks - 1:
-            keep &= wave < hi
+            keep &= wave < bounds[i + 1]
         pieces.append((wave[keep], value[keep]))
 
     wavelength = np.concatenate([p[0] for p in pieces])
@@ -340,6 +528,11 @@ def generate_albedo(target: str, command: str) -> None:
     resampled = resample_flux_conserving(wavelength, albedo, edges)
 
     n_clipped = int(np.count_nonzero((resampled < 0.0) | (resampled > 1.0)))
+    if n_clipped > 0.01 * resampled.size:
+        raise RuntimeError(
+            f"{target}: {n_clipped} of {resampled.size} samples fall outside "
+            "[0, 1]; that is too many to write off as band-edge noise"
+        )
     resampled = np.clip(resampled, 0.0, 1.0)
 
     provenance = base_provenance(
@@ -350,24 +543,35 @@ def generate_albedo(target: str, command: str) -> None:
     )
     provenance.update(
         {
-            "psg_object_date": PSG_DATE,
+            "psg_config": f"scripts/psg_config/{path.name}",
+            "psg_config_sha256": config_hash,
             "psg_geometry": (
-                "Observatory; incidence 60 deg, emission 30 deg, azimuth 180 "
-                "deg => phase angle 90 deg (quadrature), disk-representative"
+                "Exoplanet at 10 pc, sub-solar point 90 deg from the "
+                "sub-observer point => phase angle 90 deg (quadrature); PSG "
+                f"illuminated-disk sub-sampling with DISK-ANGLES="
+                f"{PSG_DISK_ANGLES} giving {fractions.size} elements, "
+                f"area weights summing to {float(np.sum(fractions)):.4f}"
             ),
             "psg_generator": (
                 "RADUNITS=rif (I/F apparent albedo), RESOLUTION=30000 RP, "
                 "RESOLUTIONKERNEL=Y, GAS-MODEL=Y, CONT-MODEL=Y, NOISE=NONE; "
-                f"requested in {n_chunks} overlapping log-spaced chunks "
-                "(PUMAS refuses the full band in one call) and stitched"
+                f"planet column '{target.capitalize()}' (not 'Total', which "
+                "includes the star); requested in "
+                f"{n_chunks} overlapping log-spaced chunks (PUMAS refuses the "
+                "full band in one call) and stitched"
+            ),
+            "psg_max_seam_disagreement": (
+                f"{max_seam:.3e} (median relative, tolerance "
+                f"{PSG_SEAM_TOLERANCE:.0e})"
             ),
             "reduction": (
                 f"PSG returns the R={R_OUT:.0f} kernel sampled at R=300000; "
                 "flux-conserving rebin onto the output grid"
             ),
             "note": (
-                "apparent albedo at quadrature phase, not the zero-phase "
-                f"geometric albedo; {n_clipped} samples clipped to [0, 1]"
+                "disk-integrated apparent albedo at quadrature phase, not the "
+                f"zero-phase geometric albedo; {n_clipped} samples clipped to "
+                "[0, 1]"
             ),
         }
     )
@@ -450,7 +654,28 @@ def generate_stellar(keys: list[str], cache_dir: Path, command: str) -> None:
             work_grid, work, R_OUT, r_in=PHOENIX_R_NATIVE
         )
         resampled = resample_flux_conserving(work_grid, degraded, edges)
-        resampled = np.maximum(resampled, 0.0)
+        # PHOENIX fluxes are physically non-negative; anything below zero here
+        # is our own numerics, and a *lot* of it would mean the reduction is
+        # wrong rather than merely noisy. Never floor silently.
+        negative = resampled < 0.0
+        n_negative = int(np.count_nonzero(negative))
+        worst = float(resampled.min()) if n_negative else 0.0
+        if n_negative:
+            median_positive = float(np.median(resampled[~negative]))
+            if (
+                n_negative > 0.001 * resampled.size
+                or abs(worst) > 1e-6 * median_positive
+            ):
+                raise RuntimeError(
+                    f"{stem}: {n_negative} of {resampled.size} resampled "
+                    f"samples are negative (min {worst:.3e} against a median "
+                    f"of {median_positive:.3e}); the reduction is suspect"
+                )
+            print(
+                f"  warning: floored {n_negative} negative sample(s), "
+                f"min {worst:.3e}"
+            )
+            resampled = np.maximum(resampled, 0.0)
 
         provenance = base_provenance(
             "stellar_flux",
@@ -476,6 +701,9 @@ def generate_stellar(keys: list[str], cache_dir: Path, command: str) -> None:
                     f"R={PHOENIX_R_NATIVE:.0f} -> R={R_OUT:.0f}, "
                     "flux-conserving rebin onto the output grid"
                 ),
+                "negative_samples_floored": (
+                    f"{n_negative} (most negative {worst:.3e})"
+                ),
             }
         )
         write_csv(
@@ -493,8 +721,12 @@ def generate_stellar(keys: list[str], cache_dir: Path, command: str) -> None:
 
 
 def generate_telluric(keys: list[str], cache_dir: Path, command: str) -> None:
+    from importlib.metadata import version
+
     from astropy.io import fits
     from skycalc_cli.skycalc import SkyModel
+
+    skycalc_version = version("skycalc_cli")
 
     grid, edges = output_grid()
     wmin_nm = LAMBDA_MIN_UM * (1.0 - REQUEST_MARGIN) * 1e3
@@ -534,10 +766,38 @@ def generate_telluric(keys: list[str], cache_dir: Path, command: str) -> None:
 
         with fits.open(raw) as hdul:
             table = hdul[1].data
-            wave_um = np.asarray(table["lam"], dtype=np.float64) * 1e-3
+            lam_unit = str(
+                next(c.unit for c in hdul[1].columns if c.name == "lam")
+            ).strip()
+            lam = np.asarray(table["lam"], dtype=np.float64)
             transmission = np.asarray(table["trans"], dtype=np.float64)
 
+        # skycalc_cli changed the output wavelength unit between v1.3 (um) and
+        # v1.4 (nm), so read it from the table rather than assuming, and then
+        # confirm the coverage actually matches what was requested.
+        scale = {"nm": 1e-3, "um": 1.0, "micron": 1.0}.get(lam_unit)
+        if scale is None:
+            raise RuntimeError(
+                f"SkyCalc returned an unrecognised 'lam' unit {lam_unit!r}"
+            )
+        wave_um = lam * scale
+        if not (
+            abs(wave_um[0] - wmin_nm * 1e-3) < 0.02
+            and abs(wave_um[-1] - wmax_nm * 1e-3) < 0.02
+        ):
+            raise RuntimeError(
+                f"SkyCalc coverage [{wave_um[0]:.4f}, {wave_um[-1]:.4f}] um "
+                f"does not match the requested "
+                f"[{wmin_nm * 1e-3:.4f}, {wmax_nm * 1e-3:.4f}] um "
+                f"(unit read as {lam_unit!r})"
+            )
+        print(
+            f"  SkyCalc returned {wave_um.size} samples, 'lam' unit "
+            f"{lam_unit!r}, coverage {wave_um[0]:.4f}-{wave_um[-1]:.4f} um"
+        )
+
         resampled = resample_flux_conserving(wave_um, transmission, edges)
+        n_clipped = int(np.count_nonzero((resampled < 0.0) | (resampled > 1.0)))
         resampled = np.clip(resampled, 0.0, 1.0)
 
         provenance = base_provenance(
@@ -553,16 +813,20 @@ def generate_telluric(keys: list[str], cache_dir: Path, command: str) -> None:
                     f"no {label} model, so the request uses its highest site "
                     f"option observatory={SKYCALC_OBSERVATORY}"
                 ),
-                "skycalc_request": (
-                    f"airmass={SKYCALC_AIRMASS}, pwv_mode=pwv, pwv={pwv} mm, "
-                    f"vacair=vac, wgrid_mode=fixed_spectral_resolution, "
-                    f"wres={SKYCALC_R_SAMPLE}, lsf_type=Gaussian, "
-                    f"lsf_gauss_fwhm={SKYCALC_LSF_FWHM_BINS} bins "
-                    f"(=> R={R_OUT:.0f}), column 'trans'"
+                "skycalc_client": f"skycalc_cli {skycalc_version}",
+                "skycalc_endpoint": model.url,
+                "skycalc_pwv_mm": f"{pwv}",
+                "skycalc_request": "; ".join(
+                    f"{k}={v}" for k, v in sorted(model.params.items())
+                ),
+                "skycalc_column": "trans (total atmospheric transmission)",
+                "skycalc_returned": (
+                    f"{wave_um.size} samples, 'lam' unit {lam_unit!r}, "
+                    f"coverage {wave_um[0]:.4f}-{wave_um[-1]:.4f} um"
                 ),
                 "reduction": (
-                    "flux-conserving rebin onto the output grid, clipped to "
-                    "[0, 1]"
+                    "flux-conserving rebin onto the output grid; "
+                    f"{n_clipped} samples clipped to [0, 1]"
                 ),
                 "note": (
                     "molecular absorption only; airglow, moon, zodiacal and "
@@ -592,6 +856,14 @@ def main(argv: list[str] | None = None) -> int:
         default=Path(tempfile.gettempdir()) / "nullsim_hdc_spectra",
         help="scratch directory for downloaded FITS (never inside the repo)",
     )
+    parser.add_argument(
+        "--refresh-psg-config",
+        action="store_true",
+        help=(
+            "rebuild the frozen PSG configs under scripts/psg_config/ from the "
+            "live service before generating; this changes committed inputs"
+        ),
+    )
     sub = parser.add_subparsers(dest="family", required=True)
     sub.add_parser("earth", help="Earth apparent albedo (PSG)")
     sub.add_parser("venus", help="Venus apparent albedo (PSG)")
@@ -606,14 +878,18 @@ def main(argv: list[str] | None = None) -> int:
     cache_dir: Path = args.cache_dir
 
     if args.family in ("earth", "venus"):
+        if args.refresh_psg_config:
+            refresh_psg_config(args.family)
         generate_albedo(args.family, command)
     elif args.family == "stellar":
         generate_stellar(args.only or sorted(STELLAR_MODELS), cache_dir, command)
     elif args.family == "telluric":
         generate_telluric(args.only or sorted(TELLURIC_SITES), cache_dir, command)
     else:
-        generate_albedo("earth", command)
-        generate_albedo("venus", command)
+        for target in ("earth", "venus"):
+            if args.refresh_psg_config:
+                refresh_psg_config(target)
+            generate_albedo(target, command)
         generate_stellar(sorted(STELLAR_MODELS), cache_dir, command)
         generate_telluric(sorted(TELLURIC_SITES), cache_dir, command)
     return 0

@@ -10,6 +10,7 @@
 # units: arbitrary photon-flux-density shape (F_lambda * lambda, h c dropped); the consuming stage renormalizes
 # wavelengths: vacuum, from WAVE_PHOENIX-ACES-AGSS-COND-2011
 # reduction: flux-conserving rebin onto a constant-R 300000 grid, Gaussian LSF degradation R=500000 -> R=30000, flux-conserving rebin onto the output grid
+# negative_samples_floored: 0 (most negative 0.000e+00)
 wavelength_um,value
 5.0000000000e-01,8.736748e+12
 5.0001666694e-01,7.469422e+12

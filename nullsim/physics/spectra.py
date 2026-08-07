@@ -113,10 +113,18 @@ _PACKAGED_SPECTRA: dict[str, str] = {
 def packaged_spectrum_path(name: str) -> Path:
     """Resolve a short template name to its packaged CSV under ``data/spectra``.
 
-    Names are case-insensitive: ``"earth"``/``"venus"`` are geometric albedos,
-    ``"G"``/``"K"``/``"M"`` are PHOENIX stellar photon-flux shapes, and
-    ``"maunakea"``/``"armazones"`` are telluric transmission snapshots. Raises
-    ``KeyError`` listing the valid names for anything else.
+    Names are case-insensitive:
+
+    - ``"earth"``, ``"venus"`` -- disk-integrated *apparent albedo* spectra at
+      quadrature phase (spectral shape; the absolute level is approximate and
+      is not the zero-phase geometric albedo).
+    - ``"G"``, ``"K"``, ``"M"`` -- PHOENIX stellar photon-flux shapes with
+      arbitrary normalization.
+    - ``"maunakea"``, ``"armazones"`` -- telluric transmission snapshots.
+
+    Every file carries a full provenance header; read it before using the
+    values for anything but their spectral shape. Raises ``KeyError`` listing
+    the valid names for anything else.
 
     The returned path is not checked for existence; `load_template_csv` reports
     a missing file.

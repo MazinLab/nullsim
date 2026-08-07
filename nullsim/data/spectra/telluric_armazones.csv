@@ -6,8 +6,13 @@
 # grid: constant-R log grid (constant_r_grid)
 # generator_command: python scripts/generate_hdc_spectra.py telluric
 # site: representative of Cerro Armazones (3046 m); SkyCalc has no Cerro Armazones model, so the request uses its highest site option observatory=3060m
-# skycalc_request: airmass=1.15, pwv_mode=pwv, pwv=5.0 mm, vacair=vac, wgrid_mode=fixed_spectral_resolution, wres=300000, lsf_type=Gaussian, lsf_gauss_fwhm=10.0 bins (=> R=30000), column 'trans'
-# reduction: flux-conserving rebin onto the output grid, clipped to [0, 1]
+# skycalc_client: skycalc_cli 1.4
+# skycalc_endpoint: https://etimecalret-002.eso.org/observing/etc/api/skycalc
+# skycalc_pwv_mm: 5.0
+# skycalc_request: airmass=1.15; ecl_lat=90.0; ecl_lon=135.0; incl_airglow=N; incl_loweratm=Y; incl_moon=N; incl_starlight=N; incl_therm=N; incl_upperatm=Y; incl_zodiacal=N; lsf_boxcar_fwhm=5.0; lsf_gauss_fwhm=10.0; lsf_type=Gaussian; moon_alt=45.0; moon_earth_dist=1.0; moon_sun_sep=90.0; moon_target_sep=45.0; msolflux=130.0; observatory=3060m; pwv=5.0; pwv_mode=pwv; season=0; temp_flag=1; therm_e1=0.0; therm_e2=0.0; therm_e3=0.0; therm_t1=0.0; therm_t2=0.0; therm_t3=0.0; time=0; vacair=vac; wdelta=0.1; wgrid_mode=fixed_spectral_resolution; wgrid_user=[500.0, 510.0, 520.0, 530.0, 540.0, 550.0]; wmax=1818.0; wmin=495.0; wres=300000
+# skycalc_column: trans (total atmospheric transmission)
+# skycalc_returned: 390281 samples, 'lam' unit 'nm', coverage 0.4950-1.8180 um
+# reduction: flux-conserving rebin onto the output grid; 0 samples clipped to [0, 1]
 # note: molecular absorption only; airglow, moon, zodiacal and starlight emission components excluded
 wavelength_um,value
 5.0000000000e-01,8.514303e-01
