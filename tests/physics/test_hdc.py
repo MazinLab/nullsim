@@ -223,6 +223,143 @@ def test_ccf_vs_rv_peaks_at_the_true_radial_velocity():
     assert shifts[int(np.argmax(values))] == pytest.approx(float(true_shift))
 
 
+def _unequal_comb(n, positions, strengths, shift):
+    lines = np.zeros(n)
+    lines[np.asarray(positions) + int(shift)] = strengths
+    return lines
+
+
+def test_ccf_vs_rv_normalization_beats_the_unnormalized_numerator():
+    # Unequal line strengths plus a telluric mask over the strongest data line.
+    # The raw numerator T^T V^-1 D peaks at shift -20, where the template's
+    # strong line lands on a weak data line; the normalized score peaks at the
+    # true shift because dividing by the template norm removes that advantage.
+    n = 140
+    positions = [40, 60, 80]
+    strengths = [1.0, 1.0, 10.0]
+    true_shift = 0
+    leak = np.full(n, 100.0)
+    data = _channels(_unequal_comb(n, positions, strengths, true_shift), leak)
+    telluric = np.ones(n)
+    telluric[80] = 0.0  # mask the strong line
+    shifts = np.arange(-20.0, 21.0, 5.0)
+
+    def trial(shift):
+        return _channels(_unequal_comb(n, positions, strengths, shift), leak)
+
+    kwargs = dict(
+        data_channels=data,
+        continuum_filter_width_channels=15,
+        telluric_transmission_per_channel=telluric,
+        telluric_mask_threshold=0.5,
+        integration_time_s=100.0,
+    )
+    normalized = ccf_vs_rv(trial, shifts, **kwargs)
+
+    # Reconstruct the unnormalized numerator the fix removed.
+    variance = data.planet_rate_hz + data.leak_rate_hz
+    observed = continuum_filter(data.planet_rate_hz + data.leak_rate_hz, 15)
+    keep = telluric >= 0.5
+    raw = np.array(
+        [
+            np.sum(
+                keep * continuum_filter(trial(s).planet_rate_hz, 15) / variance * observed
+            )
+            for s in shifts
+        ]
+    )
+    assert shifts[int(np.argmax(raw))] == pytest.approx(-20.0)  # the trap
+    assert shifts[int(np.argmax(normalized))] == pytest.approx(float(true_shift))
+
+
+def test_ccf_vs_rv_rejects_a_trial_template_on_a_different_grid():
+    n = 60
+    lines = np.zeros(n)
+    lines[10:60:10] = 1.0
+    leak = np.full(n, 50.0)
+    data = _channels(lines, leak)
+    shifted_edges = data.channel_edges_um * 1.01
+    off_grid = ChannelSpectra(
+        channel_centers_um=0.5 * (shifted_edges[:-1] + shifted_edges[1:]),
+        channel_edges_um=shifted_edges,
+        planet_rate_hz=lines,
+        leak_rate_hz=leak,
+        sky_rate_hz=np.zeros(n),
+        dark_rate_hz=np.zeros(n),
+    )
+    with pytest.raises(ValueError, match="different channel_edges_um"):
+        ccf_vs_rv(
+            lambda _rv: off_grid,
+            [0.0],
+            data_channels=data,
+            continuum_filter_width_channels=0,
+        )
+
+
+def test_ccf_vs_rv_rejects_non_finite_rv_and_integration_time():
+    n = 40
+    data = _channels(np.ones(n), np.full(n, 10.0))
+    with pytest.raises(ValueError, match="rv_grid_kms must be finite"):
+        ccf_vs_rv(
+            lambda _rv: data,
+            [0.0, np.nan],
+            data_channels=data,
+            continuum_filter_width_channels=0,
+        )
+    with pytest.raises(ValueError, match="integration_time_s"):
+        ccf_vs_rv(
+            lambda _rv: data,
+            [0.0],
+            data_channels=data,
+            continuum_filter_width_channels=0,
+            integration_time_s=-1.0,
+        )
+
+
+def test_self_subtraction_factor_is_a_bounded_snr_retention_ratio():
+    # Absorption-dominated template: the filtered template is negative in the
+    # lines, which a weighted flux ratio cannot describe.
+    n = 200
+    planet = np.full(n, 5.0)
+    planet[20:200:20] = 1.0  # absorption dips
+    ch = _channels(planet, np.full(n, 100.0))
+
+    def factor(width):
+        return matched_filter_ccf(
+            ch,
+            integration_time_s=100.0,
+            eps_systematic=0.0,
+            servo_bw_hz=100.0,
+            with_fringe_tracking=True,
+            continuum_filter_width_channels=width,
+            telluric_transmission_per_channel=None,
+            telluric_mask_threshold=0.0,
+        ).self_subtraction_factor
+
+    assert factor(0) == pytest.approx(1.0)
+    filtered = factor(15)
+    assert 0.0 < filtered < 1.0
+    # Narrower filters remove more of the template, never more than all of it.
+    assert 0.0 < factor(5) <= 1.0
+
+
+def test_matched_filter_rejects_non_finite_servo_bandwidth():
+    n = 20
+    ch = _channels(np.ones(n), np.full(n, 10.0))
+    for bad in (np.nan, np.inf, 0.0, -1.0):
+        with pytest.raises(ValueError, match="servo_bw_hz"):
+            matched_filter_ccf(
+                ch,
+                integration_time_s=100.0,
+                eps_systematic=1e-2,
+                servo_bw_hz=float(bad),
+                with_fringe_tracking=True,
+                continuum_filter_width_channels=0,
+                telluric_transmission_per_channel=None,
+                telluric_mask_threshold=0.0,
+            )
+
+
 def test_continuum_filter_removes_smooth_baseline_and_keeps_narrow_lines():
     n = 200
     baseline = 50.0 + 5.0 * np.linspace(0.0, 1.0, n)

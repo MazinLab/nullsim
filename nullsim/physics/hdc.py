@@ -39,8 +39,9 @@ telluric mask (1 where the atmospheric transmission clears a threshold) and let
 
 Two summary diagnostics come along for the ride:
 
-- ``self_subtraction_factor = sum_i w_i Ptilde_i / sum_i w_i P_i <= 1``: the
-  fraction of weighted planet signal that survives the continuum filter.
+- ``self_subtraction_factor = sqrt(sum_i Ptilde_i^2/v_i) / sqrt(sum_i P_i^2/v_i)``:
+  the fraction of the achievable photon-limited *SNR* (not flux) that survives
+  the continuum filter, over the unmasked channels.
 - ``n_effective_lines = (sum_i |w_i|)^2 / sum_i w_i^2``: the participation ratio
   of the weights, i.e. how many channels the statistic actually leans on.
 
@@ -146,7 +147,38 @@ class ChannelSpectra:
 
 @dataclass(frozen=True, eq=False)
 class CcfBudget:
-    """Matched-filter CCF signal, noise decomposition, and diagnostics."""
+    """Matched-filter CCF signal, noise decomposition, and diagnostics.
+
+    Attributes
+    ----------
+    ccf_snr:
+        ``S / sqrt(V_ph + V_sys)``.
+    ccf_snr_photon_limited:
+        ``S / sqrt(V_ph)``: the same detection with the null instability off.
+    signal_counts:
+        Matched-filter signal ``S = t sum_i w_i Ptilde_i`` (counts).
+    photon_var_counts, systematic_var_counts:
+        The two noise variances (counts^2).
+    systematic_ccf_leakage:
+        ``B_w = sum_i w_i Ltilde_i`` (Hz), the template projection of the
+        filtered stellar leak. This, not the raw band leak, sets the systematic
+        amplitude.
+    self_subtraction_factor:
+        **SNR-retention ratio, not a flux ratio**:
+        ``sqrt(sum_i Ptilde_i^2 / v_i) / sqrt(sum_i P_i^2 / v_i)`` over the
+        unmasked channels. Non-negative by construction, and exactly 1.0 when
+        continuum filtering is bypassed. It answers "what fraction of the
+        achievable photon-limited SNR survives the continuum filter", which is
+        the question a filter width is actually traded against. A weighted flux
+        ratio would not do: it is unbounded above and changes sign for
+        absorption-dominated templates, where the filtered template is negative.
+    n_effective_lines:
+        Participation ratio ``(sum_i |w_i|)^2 / sum_i w_i^2`` of the weights.
+    n_channels_used:
+        Channels with a non-zero weight budget (unmasked and ``v_i > 0``).
+    template_weights:
+        ``w_i``, zero where masked.
+    """
 
     ccf_snr: float
     ccf_snr_photon_limited: float
@@ -265,6 +297,47 @@ def _telluric_mask(
     return transmission >= float(telluric_mask_threshold)
 
 
+def _masked_ratio(
+    numerator: NDArray[np.float64],
+    denominator: NDArray[np.float64],
+    usable: NDArray[np.bool_],
+) -> NDArray[np.float64]:
+    """``numerator / denominator`` where ``usable``, zero elsewhere."""
+    out = np.zeros(numerator.shape, dtype=np.float64)
+    np.divide(numerator, denominator, out=out, where=usable)
+    return out
+
+
+_GRID_RTOL = 1e-9
+
+
+def _require_same_grid(
+    trial: ChannelSpectra, reference: ChannelSpectra, rv_kms: float
+) -> None:
+    """Raise unless ``trial`` sits on the same wavelength grid as ``reference``.
+
+    A trial template with the right length but a different grid would be
+    correlated against the data index by index, silently producing a wrong
+    answer instead of an error.
+    """
+    if trial.n_channels != reference.n_channels:
+        raise ValueError(
+            f"trial template at rv={rv_kms} has {trial.n_channels} channels, "
+            f"expected {reference.n_channels} to match data_channels"
+        )
+    for name in ("channel_edges_um", "channel_centers_um"):
+        trial_grid = getattr(trial, name)
+        reference_grid = getattr(reference, name)
+        if not np.allclose(trial_grid, reference_grid, rtol=_GRID_RTOL, atol=0.0):
+            worst = int(np.argmax(np.abs(trial_grid - reference_grid)))
+            raise ValueError(
+                f"trial template at rv={rv_kms} has a different {name} than "
+                f"data_channels: element {worst} is {trial_grid[worst]!r} vs "
+                f"{reference_grid[worst]!r}. The trial closure must rebuild the "
+                "template on the data's channel grid."
+            )
+
+
 def _weights(
     template_hz: NDArray[np.float64],
     variance_rate_hz: NDArray[np.float64],
@@ -272,9 +345,7 @@ def _weights(
 ) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
     """Matched-filter weights ``w = m * Ptilde / v``, zero on masked/empty channels."""
     usable = keep & (variance_rate_hz > 0.0)
-    weights = np.zeros_like(template_hz)
-    np.divide(template_hz, variance_rate_hz, out=weights, where=usable)
-    return weights, usable
+    return _masked_ratio(template_hz, variance_rate_hz, usable), usable
 
 
 def matched_filter_ccf(
@@ -308,8 +379,11 @@ def matched_filter_ccf(
         raise ValueError("integration_time_s must be finite and non-negative")
     if not math.isfinite(eps_systematic) or eps_systematic < 0.0:
         raise ValueError("eps_systematic must be finite and non-negative")
-    if with_fringe_tracking and servo_bw_hz <= 0.0:
-        raise ValueError("servo_bw_hz must be positive when fringe tracking is on")
+    if with_fringe_tracking and not (servo_bw_hz > 0.0 and math.isfinite(servo_bw_hz)):
+        raise ValueError(
+            "servo_bw_hz must be finite and positive when fringe tracking is on, "
+            f"got {servo_bw_hz}"
+        )
 
     n_ch = channels.n_channels
     keep = _telluric_mask(
@@ -354,10 +428,19 @@ def matched_filter_ccf(
         else 0.0
     )
 
-    unfiltered_signal = float(np.sum(weights * planet))
-    filtered_signal = float(np.sum(weights * planet_filtered))
+    # SNR-retention ratio, not a flux ratio: the photon-limited matched-filter
+    # SNR of the filtered template over that of the unfiltered one, on the same
+    # unmasked channels and the same noise budget.
+    snr_sq_filtered = float(
+        _masked_ratio(planet_filtered * planet_filtered, variance_rate, usable).sum()
+    )
+    snr_sq_unfiltered = float(
+        _masked_ratio(planet * planet, variance_rate, usable).sum()
+    )
     self_subtraction_factor = (
-        filtered_signal / unfiltered_signal if unfiltered_signal != 0.0 else 0.0
+        math.sqrt(snr_sq_filtered / snr_sq_unfiltered)
+        if snr_sq_unfiltered > 0.0
+        else 0.0
     )
 
     abs_sum = float(np.sum(np.abs(weights)))
@@ -416,21 +499,36 @@ def ccf_vs_rv(
 
     ``data_channels`` is the observation: planet at its true radial velocity plus
     leaked starlight, sky, and dark. ``channels_at_trial_rv_fn(rv)`` supplies the
-    template at each trial radial velocity through its ``planet_rate_hz`` field.
-    The returned statistic at trial velocity ``rv`` is the signal term of the
-    matched filter,
+    template at each trial radial velocity through its ``planet_rate_hz`` field;
+    it must return channels on the *same* wavelength grid as ``data_channels``.
+    The returned statistic at trial velocity ``rv`` is the template-normalized
+    matched-filter score
 
-    ``CCF(rv) = t * sum_i m_i * Ttilde_i(rv) / v_i * Dtilde_i``,
+    ``CCF(rv) = sqrt(t) * sum_i w_i(rv) Dtilde_i / sqrt(sum_i w_i(rv)^2 v_i)``,
+    ``w_i(rv) = m_i Ttilde_i(rv) / v_i``,
 
     with ``Dtilde`` the continuum-filtered observed dark-port rate
-    (planet + leak) and ``v_i`` the observed per-channel variance rate. It peaks
-    at the true radial velocity. Unrecognized keyword arguments are ignored so
-    that the same ``mf_kwargs`` mapping can be forwarded to both this function
-    and `matched_filter_ccf`.
+    (planet + leak) and ``v_i`` the observed per-channel variance rate.
+
+    The normalization is not cosmetic. The raw numerator ``T^T V^-1 D`` grows
+    with the template norm, so a trial velocity that happens to park a strong
+    template line on a weak data line can outscore the true velocity whenever the
+    template's own strong lines have been removed by the telluric mask or pushed
+    past a band edge. Dividing by ``sqrt(T^T V^-1 T)`` makes the statistic a
+    Cauchy-Schwarz cosine in the ``V^-1`` metric, which is maximized only when
+    the template matches the data, so the peak sits at the true radial velocity.
+
+    Unrecognized keyword arguments are ignored so that the same ``mf_kwargs``
+    mapping can be forwarded to both this function and `matched_filter_ccf`.
     """
     rv_array = np.atleast_1d(np.asarray(rv_grid_kms, dtype=np.float64))
     if rv_array.ndim != 1:
         raise ValueError(f"rv_grid_kms must be 1-D, got shape {rv_array.shape}")
+    if not np.all(np.isfinite(rv_array)):
+        raise ValueError("rv_grid_kms must be finite")
+    integration_time_s = float(integration_time_s)
+    if not math.isfinite(integration_time_s) or integration_time_s < 0.0:
+        raise ValueError("integration_time_s must be finite and non-negative")
 
     n_ch = data_channels.n_channels
     keep = _telluric_mask(
@@ -439,18 +537,19 @@ def ccf_vs_rv(
     variance_rate = data_channels.total_rate_hz()
     observed = data_channels.planet_rate_hz + data_channels.leak_rate_hz
     observed_filtered = _filtered(observed, continuum_filter_width_channels)
+    sqrt_time = math.sqrt(integration_time_s)
 
     values = np.empty(rv_array.size, dtype=np.float64)
     for index, rv in enumerate(rv_array):
         trial = channels_at_trial_rv_fn(float(rv))
-        if trial.n_channels != n_ch:
-            raise ValueError(
-                f"trial template at rv={rv} has {trial.n_channels} channels, "
-                f"expected {n_ch} to match data_channels"
-            )
-        template = _filtered(
-            trial.planet_rate_hz, continuum_filter_width_channels
-        )
+        _require_same_grid(trial, data_channels, rv)
+        template = _filtered(trial.planet_rate_hz, continuum_filter_width_channels)
         weights, _ = _weights(template, variance_rate, keep)
-        values[index] = np.sum(weights * observed_filtered) * float(integration_time_s)
+        template_norm = math.sqrt(float(np.sum(weights * weights * variance_rate)))
+        if template_norm <= 0.0:
+            values[index] = 0.0
+            continue
+        values[index] = (
+            sqrt_time * float(np.sum(weights * observed_filtered)) / template_norm
+        )
     return values

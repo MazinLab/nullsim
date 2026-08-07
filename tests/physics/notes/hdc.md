@@ -126,15 +126,31 @@ already folded into the rates.
 
 The continuum filter removes some of the planet signal along with the continuum:
 broad planet features are indistinguishable from a stellar continuum. The
-retained fraction, weighted the same way the statistic is,
+quantity reported is an **SNR-retention ratio, not a flux ratio** -- the
+photon-limited matched-filter SNR of the filtered template divided by that of the
+unfiltered one, on the same unmasked channels and the same noise budget:
 
 ```text
-self_subtraction_factor = sum_i w_i Ptilde_i / sum_i w_i P_i   (<= 1),
+self_subtraction_factor = sqrt(sum_i Ptilde_i^2 / v_i) / sqrt(sum_i P_i^2 / v_i).
 ```
 
-is 1 exactly when filtering is disabled (`width <= 0`), which the flat-template
-test checks, and falls toward 0 as the filter width shrinks toward the line
-width.
+The obvious alternative, the weighted flux ratio
+`sum_i w_i Ptilde_i / sum_i w_i P_i`, does not work. It is not a fraction of
+anything: for `P = [1, 1, 2, 1, 2]` with a width-3 median filter and a flat leak
+it evaluates to 2.03, and for an absorption-dominated template it changes sign,
+because `Ptilde` is negative in the lines while `P` is positive. Its denominator
+can also pass through zero. The SNR ratio is non-negative by construction, is
+exactly 1.0 when filtering is bypassed (`width <= 0`, so `Ptilde = P`), and
+answers the question a filter width is actually traded against.
+
+Note that the matched filter itself is untroubled by absorption: the signal
+`S = t sum_i Ptilde_i^2 / v_i` is positive whether the lines are in emission or
+absorption, since a negative template correlates with a negative data excess.
+Only the *summary diagnostic* needed the quadratic form.
+
+The pinned test uses a continuum with absorption dips, asserts the factor is
+exactly 1.0 at `width = 0`, and requires it to lie in `(0, 1)` for a width-15
+filter and in `(0, 1]` for a width-5 one.
 
 The effective line count is the participation ratio of the weights,
 
@@ -150,19 +166,38 @@ argument.
 ## Radial-Velocity Scan
 
 `ccf_vs_rv` correlates a fixed observed spectrum (planet at its true radial
-velocity plus leak, sky, dark) against templates rebuilt at trial velocities:
+velocity plus leak, sky, dark) against templates rebuilt at trial velocities.
+The statistic is the *template-normalized* matched-filter score
 
 ```text
-CCF(rv) = t * sum_i m_i * Ttilde_i(rv) / v_i * Dtilde_i,
+CCF(rv) = sqrt(t) * (sum_i w_i(rv) Dtilde_i) / sqrt(sum_i w_i(rv)^2 v_i),
+w_i(rv) = m_i Ttilde_i(rv) / v_i,
 ```
 
 with `v_i` and `Dtilde` taken from the observation and held fixed across the
-scan. It is the signal term of the matched filter with the template shifted, so
-it peaks where the template lines land on the data lines. The pinned test uses
-integer channel shifts of a line comb on a smooth leak and requires the argmax
-at the true shift. Note that the fixed data spectrum is a required input: a scan
-that shifts the template and recomputes the weights and the "data" together
-would be an autocorrelation and would be flat in `rv`.
+scan.
+
+The normalization is load-bearing. The bare numerator is `T^T V^-1 D`, which
+scales with the template norm, so its value can be raised simply by giving the
+template more power inside the mask. Concretely: put planet lines of strength
+`[1, 1, 10]` at channels `[40, 60, 80]`, mask channel 80, and scan integer
+shifts. At the true shift the strong line is masked away and the numerator is
+`2/V`; at a shift of `-20` the template's strength-10 line lands on a
+strength-1 data line and the numerator is `11/V`. The bare numerator picks the
+wrong velocity. Dividing by `sqrt(T^T V^-1 T)` turns the statistic into a
+Cauchy-Schwarz cosine in the `V^-1` metric, bounded by `sqrt(D^T V^-1 D)` and
+attained only when `T ∝ D`, so the true velocity wins: the same example gives
+`0.141` at the true shift against `0.108` and `0.0099` at the competitors. Both
+halves of this are pinned -- the test asserts that the unnormalized numerator
+peaks at `-20` and that the shipped statistic peaks at 0.
+
+Two further requirements are enforced rather than assumed. The fixed data
+spectrum is a required input: a scan that shifts the template and rebuilds the
+weights and the "data" together would be an autocorrelation and would be flat in
+`rv`. And the trial closure must return channels on the data's wavelength grid;
+`_require_same_grid` compares edges and centers to `rtol = 1e-9` and raises,
+because a same-length grid at different wavelengths would otherwise be
+correlated index by index and quietly return a wrong answer.
 
 ## Citations
 
