@@ -135,22 +135,55 @@ self_subtraction_factor = sqrt(sum_i Ptilde_i^2 / v_i) / sqrt(sum_i P_i^2 / v_i)
 ```
 
 The obvious alternative, the weighted flux ratio
-`sum_i w_i Ptilde_i / sum_i w_i P_i`, does not work. It is not a fraction of
-anything: for `P = [1, 1, 2, 1, 2]` with a width-3 median filter and a flat leak
-it evaluates to 2.03, and for an absorption-dominated template it changes sign,
-because `Ptilde` is negative in the lines while `P` is positive. Its denominator
-can also pass through zero. The SNR ratio is non-negative by construction, is
-exactly 1.0 when filtering is bypassed (`width <= 0`, so `Ptilde = P`), and
-answers the question a filter width is actually traded against.
+`sum_i w_i Ptilde_i / sum_i w_i P_i`, does not work. For an
+absorption-dominated template it changes sign, because `Ptilde` is negative in
+the lines while `P` is positive, and its denominator can pass through zero. The
+SNR ratio is non-negative by construction and answers the question a filter
+width is actually traded against.
 
 Note that the matched filter itself is untroubled by absorption: the signal
 `S = t sum_i Ptilde_i^2 / v_i` is positive whether the lines are in emission or
 absorption, since a negative template correlates with a negative data excess.
 Only the *summary diagnostic* needed the quadratic form.
 
-The pinned test uses a continuum with absorption dips, asserts the factor is
-exactly 1.0 at `width = 0`, and requires it to lie in `(0, 1)` for a width-15
-filter and in `(0, 1]` for a width-5 one.
+### It is not bounded by 1, and should not be
+
+The name invites the reading "fraction retained", but there is no hard `(0, 1]`
+bound and none should be imposed. Take `P = [5, 0.1, 5, 0.1, 5, 0.1, 5]` on a
+flat leak of 100 with a width-3 median filter. The running median of an
+alternating sequence returns the *opposite* level at every interior sample, so
+
+```text
+Ptilde = [0, -4.9, +4.9, -4.9, +4.9, -4.9, 0],
+```
+
+and the factor comes out at 1.11147. That is the correct answer. The unfiltered
+template is a bright, nearly flat spectrum whose matched-filter SNR is limited
+by how little it varies; the filter converts narrow absorption dips riding that
+bright continuum into large signed excursions about zero, and a template with
+large signed excursions carries more matched-filter SNR than the near-flat one
+it came from. Deep absorption on a bright continuum is exactly the regime where
+high dispersion helps most, so a diagnostic that reported "1.0, nothing gained"
+there would be hiding the effect the technique exists to exploit.
+
+The honest statement is therefore: non-negative, typically at or below 1 for
+emission-line-like templates, and above 1 when absorption structure dominates
+over a bright continuum. Anything that clamps it is throwing away information.
+
+### Conventions at the edges
+
+- `width <= 0` (filtering bypassed) returns exactly 1.0 *unconditionally*.
+  `Ptilde` is `P` by construction, so nothing was lost, and this is stated
+  directly rather than computed -- otherwise an all-zero template would take
+  the `0/0` path and report 0.0, which would be wrong.
+- Filtering active with an all-zero template (`sum_i P_i^2/v_i = 0`) returns
+  0.0 by convention. There is no signal whose retention could be measured, and
+  0.0 is the value that will not be mistaken for a healthy detection.
+
+Four cases are pinned: the reviewer's alternating counterexample at its exact
+value 1.11147, sparse absorption dips on a continuum (where the factor is a
+small fraction, ~0.18), the bypass path with an all-zero template, and the
+active-filter zero-denominator path.
 
 The effective line count is the participation ratio of the weights,
 

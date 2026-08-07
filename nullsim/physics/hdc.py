@@ -41,7 +41,10 @@ Two summary diagnostics come along for the ride:
 
 - ``self_subtraction_factor = sqrt(sum_i Ptilde_i^2/v_i) / sqrt(sum_i P_i^2/v_i)``:
   the fraction of the achievable photon-limited *SNR* (not flux) that survives
-  the continuum filter, over the unmasked channels.
+  the continuum filter, over the unmasked channels. Non-negative, 1.0 when
+  filtering is bypassed, and usually at or below 1 -- but it exceeds 1 when
+  absorption structure on a bright continuum turns into large signed
+  excursions under the running median, which is real and must not be clamped.
 - ``n_effective_lines = (sum_i |w_i|)^2 / sum_i w_i^2``: the participation ratio
   of the weights, i.e. how many channels the statistic actually leans on.
 
@@ -166,12 +169,24 @@ class CcfBudget:
     self_subtraction_factor:
         **SNR-retention ratio, not a flux ratio**:
         ``sqrt(sum_i Ptilde_i^2 / v_i) / sqrt(sum_i P_i^2 / v_i)`` over the
-        unmasked channels. Non-negative by construction, and exactly 1.0 when
-        continuum filtering is bypassed. It answers "what fraction of the
-        achievable photon-limited SNR survives the continuum filter", which is
-        the question a filter width is actually traded against. A weighted flux
-        ratio would not do: it is unbounded above and changes sign for
-        absorption-dominated templates, where the filtered template is negative.
+        unmasked channels. It answers "what fraction of the achievable
+        photon-limited SNR survives the continuum filter", which is the question
+        a filter width is actually traded against.
+
+        Non-negative by construction. Exactly 1.0 when continuum filtering is
+        bypassed (``width <= 0``), unconditionally. 0.0 by convention when
+        filtering is active and the template carries no signal at all.
+
+        Typically at or below 1 for emission-line-like templates, but it **can
+        exceed 1** and that is correct, not a bug: a running median converts
+        narrow absorption dips riding a bright continuum into large signed
+        excursions about zero, and those excursions can carry more
+        matched-filter SNR than the near-flat unfiltered spectrum they came
+        from. Do not clamp it.
+
+        A weighted flux ratio would not do in its place: it changes sign for
+        absorption-dominated templates, where the filtered template is negative,
+        and its denominator can pass through zero.
     n_effective_lines:
         Participation ratio ``(sum_i |w_i|)^2 / sum_i w_i^2`` of the weights.
     n_channels_used:
@@ -430,18 +445,28 @@ def matched_filter_ccf(
 
     # SNR-retention ratio, not a flux ratio: the photon-limited matched-filter
     # SNR of the filtered template over that of the unfiltered one, on the same
-    # unmasked channels and the same noise budget.
-    snr_sq_filtered = float(
-        _masked_ratio(planet_filtered * planet_filtered, variance_rate, usable).sum()
-    )
-    snr_sq_unfiltered = float(
-        _masked_ratio(planet * planet, variance_rate, usable).sum()
-    )
-    self_subtraction_factor = (
-        math.sqrt(snr_sq_filtered / snr_sq_unfiltered)
-        if snr_sq_unfiltered > 0.0
-        else 0.0
-    )
+    # unmasked channels and the same noise budget. See the CcfBudget docstring
+    # for why this can legitimately exceed 1.
+    if int(continuum_filter_width_channels) <= 0:
+        # Filtering bypassed: Ptilde is P by construction, so nothing was lost.
+        # Stated unconditionally so an all-zero template gives 1.0 rather than
+        # falling into 0/0.
+        self_subtraction_factor = 1.0
+    else:
+        snr_sq_filtered = float(
+            _masked_ratio(
+                planet_filtered * planet_filtered, variance_rate, usable
+            ).sum()
+        )
+        snr_sq_unfiltered = float(
+            _masked_ratio(planet * planet, variance_rate, usable).sum()
+        )
+        # No template signal at all to retain: report 0.0 by convention.
+        self_subtraction_factor = (
+            math.sqrt(snr_sq_filtered / snr_sq_unfiltered)
+            if snr_sq_unfiltered > 0.0
+            else 0.0
+        )
 
     abs_sum = float(np.sum(np.abs(weights)))
     sq_sum = float(np.sum(weights * weights))

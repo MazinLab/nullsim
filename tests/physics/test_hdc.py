@@ -316,31 +316,55 @@ def test_ccf_vs_rv_rejects_non_finite_rv_and_integration_time():
         )
 
 
-def test_self_subtraction_factor_is_a_bounded_snr_retention_ratio():
+def _factor(planet, leak, width):
+    return matched_filter_ccf(
+        _channels(planet, leak),
+        integration_time_s=100.0,
+        eps_systematic=0.0,
+        servo_bw_hz=100.0,
+        with_fringe_tracking=True,
+        continuum_filter_width_channels=width,
+        telluric_transmission_per_channel=None,
+        telluric_mask_threshold=0.0,
+    ).self_subtraction_factor
+
+
+def test_self_subtraction_factor_for_sparse_absorption_dips():
     # Absorption-dominated template: the filtered template is negative in the
-    # lines, which a weighted flux ratio cannot describe.
+    # lines, which a weighted flux ratio cannot describe. Sparse dips on a
+    # bright continuum retain only a small fraction of the broadband SNR.
     n = 200
     planet = np.full(n, 5.0)
-    planet[20:200:20] = 1.0  # absorption dips
-    ch = _channels(planet, np.full(n, 100.0))
+    planet[20:200:20] = 1.0
+    leak = np.full(n, 100.0)
 
-    def factor(width):
-        return matched_filter_ccf(
-            ch,
-            integration_time_s=100.0,
-            eps_systematic=0.0,
-            servo_bw_hz=100.0,
-            with_fringe_tracking=True,
-            continuum_filter_width_channels=width,
-            telluric_transmission_per_channel=None,
-            telluric_mask_threshold=0.0,
-        ).self_subtraction_factor
+    assert _factor(planet, leak, 0) == pytest.approx(1.0)
+    assert 0.0 < _factor(planet, leak, 15) < 1.0
+    assert 0.0 < _factor(planet, leak, 5) < 1.0
 
-    assert factor(0) == pytest.approx(1.0)
-    filtered = factor(15)
-    assert 0.0 < filtered < 1.0
-    # Narrower filters remove more of the template, never more than all of it.
-    assert 0.0 < factor(5) <= 1.0
+
+def test_self_subtraction_factor_exceeds_one_for_alternating_absorption():
+    # NOT a bug and NOT to be clamped. A width-3 running median on an
+    # alternating sequence returns the opposite level at every interior
+    # sample, so the filter turns a bright, nearly flat spectrum into large
+    # signed excursions about zero:
+    #     Ptilde = [0, -4.9, +4.9, -4.9, +4.9, -4.9, 0].
+    # A template with large signed excursions carries more matched-filter SNR
+    # than the near-flat one it came from, so the retention ratio is > 1.
+    planet = np.array([5.0, 0.1, 5.0, 0.1, 5.0, 0.1, 5.0])
+    leak = np.full(planet.size, 100.0)
+    assert _factor(planet, leak, 3) == pytest.approx(1.11147, rel=1e-3)
+
+
+def test_self_subtraction_factor_edge_conventions():
+    n = 40
+    zero_planet = np.zeros(n)
+    leak = np.full(n, 100.0)
+    # Bypassed filtering is exactly 1.0 unconditionally: Ptilde is P, so
+    # nothing was lost, even with no signal to lose (must not hit 0/0 -> 0).
+    assert _factor(zero_planet, leak, 0) == 1.0
+    # Active filtering with no template signal at all: 0.0 by convention.
+    assert _factor(zero_planet, leak, 15) == 0.0
 
 
 def test_matched_filter_rejects_non_finite_servo_bandwidth():
