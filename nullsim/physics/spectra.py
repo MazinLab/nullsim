@@ -99,6 +99,39 @@ class TemplateSpectrum:
         object.__setattr__(self, "values", values)
 
 
+_PACKAGED_SPECTRA: dict[str, str] = {
+    "earth": "earth_albedo.csv",
+    "venus": "venus_albedo.csv",
+    "g": "stellar_g2v.csv",
+    "k": "stellar_k2v.csv",
+    "m": "stellar_m2v.csv",
+    "maunakea": "telluric_maunakea.csv",
+    "armazones": "telluric_armazones.csv",
+}
+
+
+def packaged_spectrum_path(name: str) -> Path:
+    """Resolve a short template name to its packaged CSV under ``data/spectra``.
+
+    Names are case-insensitive: ``"earth"``/``"venus"`` are geometric albedos,
+    ``"G"``/``"K"``/``"M"`` are PHOENIX stellar photon-flux shapes, and
+    ``"maunakea"``/``"armazones"`` are telluric transmission snapshots. Raises
+    ``KeyError`` listing the valid names for anything else.
+
+    The returned path is not checked for existence; `load_template_csv` reports
+    a missing file.
+    """
+    key = str(name).strip().lower()
+    try:
+        filename = _PACKAGED_SPECTRA[key]
+    except KeyError:
+        raise KeyError(
+            f"unknown packaged spectrum {name!r}; valid names are "
+            f"{sorted(_PACKAGED_SPECTRA)}"
+        ) from None
+    return Path(__file__).resolve().parent.parent / "data" / "spectra" / filename
+
+
 def load_template_csv(path: Path, kind: str | None = None) -> TemplateSpectrum:
     """Load a two-column ``wavelength_um,value`` CSV into a `TemplateSpectrum`.
 
