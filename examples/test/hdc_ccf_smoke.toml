@@ -1,0 +1,242 @@
+# Minimal end-to-end exercise of the high dispersion coronagraphy (HDC)
+# cross-correlation path: `characterization.hdc_ccf` behind an AWG-dispersed
+# `characterization.spectro` port.
+#
+# Derived from `mkid_native_spectro.toml` -- same four-mode array, same short
+# optimizer settings -- with three changes that matter for HDC:
+#
+#   * An M2V host. Reflected-light Earth analogues around Sun-like stars are
+#     out of reach for a ground nuller; M dwarfs put the habitable zone at a
+#     contrast and separation the instrument can plausibly reach, so the
+#     packaged stellar template resolved from `scene.star.spectral_type` is
+#     the M-dwarf one.
+#   * A nonzero planet radial velocity, which is what separates the planet's
+#     line forest from the leaked stellar continuum in the rest frame of the
+#     cross-correlation.
+#   * An AWG spectrograph at R = 5000 rather than the MKID's native R ~ 24.
+#     HDC is a resolving-power game; the MKID branch fits only a handful of
+#     resolution elements across J, which is not a regime where the matched
+#     filter has anything to work with.
+#
+# The injected contrast is deliberately far brighter than a real Earth
+# analogue (which sits near 1e-9 in reflected light) so that a CI-scale run
+# produces a visible cross-correlation peak. This config is a plumbing test,
+# not a sensitivity prediction.
+
+[run]
+name = "hdc_ccf_smoke"
+description = "Four-mode HDC cross-correlation smoke test around an M2V host."
+seed = 1
+
+[grid]
+wavelength_center_um = 1.25
+wavelength_bandwidth_um = 0.15
+n_wavelength_bins = 5
+
+[scene.star]
+jmag = 5.0
+spectral_type = "M2V"
+angular_diameter_mas = 0.8
+distance_pc = 5.0
+
+[scene.planet]
+contrast = 1.0e-4
+separation_mas = 30.0
+position_angle_deg = 0.0
+radial_velocity_kms = 30.0
+
+[scene.exozodi]
+level_zodi = 1.0
+
+[observation]
+hour_angle_h = 0.0
+integration_time_s = 3600.0
+
+[[pipeline.stages]]
+id = "scene"
+type = "scene.point_source"
+altitude_deg = 80.0
+azimuth_deg = 180.0
+
+[[pipeline.stages]]
+id = "array"
+type = "telescope.fixed_aperture"
+diameter_m = 10.0
+n_apertures = 4
+array_layout = "y_array"
+spacing_m = 40.0
+mirror_transmission = 0.80
+
+[[pipeline.stages]]
+id = "pupil_modes"
+type = "telescope.pupil_modes"
+n_modes = 4
+layout = "packed_circular"
+span_fraction = 1.0
+preserve_collecting_area = true
+
+[[pipeline.stages]]
+id = "atmosphere"
+type = "atmosphere.kolmogorov"
+r0_500nm_m = 0.15
+L0_m = 25.0
+wind_speed_m_s = 10.0
+atmospheric_transmission = 0.93
+
+[[pipeline.stages]]
+id = "ao"
+type = "ao.pyramid_wfs"
+n_actuators = 3025
+loop_frequency_hz = 2000.0
+pupil_template = "full_pupil"
+n_subap_across = 50
+derive_r_mag_from_scene_jmag = true
+excess_noise_sq = 1.0
+readout_noise_e_rms = 0.0
+central_obstruction = 0.24
+tau0_500nm_s = 2.83e-3
+theta0_500nm_arcsec = 1.19
+v_wind_m_s = 10.0
+
+[[pipeline.stages]]
+id = "injection_seed"
+type = "injection.ideal"
+n_modes = 4
+apply_strehl_coupling = false
+
+[[pipeline.stages]]
+id = "injection"
+type = "injection.single_mode_fiber"
+central_obscuration_ratio = 0.24
+
+[[pipeline.stages]]
+id = "smf28"
+type = "transport.smf28"
+length_m = 10.0
+phi_rms_rad = 0.01
+
+[[pipeline.stages]]
+id = "delay_lines"
+type = "delay_lines.geometric"
+max_delay_m = 90.0
+
+[[pipeline.stages]]
+id = "chip_opt"
+type = "chip_optimization.scipy"
+n_modes = 4
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+wl_design_um = 1.25
+target_null_depth = 1.0e-5
+max_iter = 30
+seed = 0
+
+[[pipeline.stages]]
+id = "chip"
+type = "chip.kernel_mzi_mesh"
+n_modes = 4
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+wl_design_um = 1.25
+optimization_source = "auto"
+
+[[pipeline.stages]]
+id = "detector"
+type = "detector.mkid"
+qe = 0.7
+mkid_max_count_rate_hz = 5.0e4
+n_pixels_bright = 5000
+n_pixels_dark = 500
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+n_modes = 4
+integration_time_s = 3600.0
+band = "J"
+
+[[pipeline.stages]]
+id = "fringe_tracking"
+type = "fringe_tracking.closed_loop"
+servo_bw_hz = 2000.0
+fringe_visibility = 0.9
+n_spectral_channels = 10
+n_spectral_eff = 2.5
+predictive_lag_reduction = 0.05
+wind_speed_m_s = 10.0
+
+[[pipeline.stages]]
+id = "calibration"
+type = "calibration.floor_lookup"
+default_floor_log10 = -6.0
+band = "J"
+
+[[pipeline.stages]]
+id = "sensitivity"
+type = "sensitivity.detection_curve"
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+separations_mas = [10.0, 30.0, 100.0]
+n_pa_samples = 12
+include_angular_coupling = true
+n_azimuths = 1
+n_realizations_per_azimuth = 0
+n_mc_realizations = 0
+mc_seed = 0
+
+[[pipeline.stages]]
+id = "characterization"
+type = "characterization.spectro"
+n_modes = 4
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+wl_design_um = 1.25
+null_floor = 1.0e-8
+n_restarts = 2
+max_iter = 800
+seed = 2
+broadband_n_wavelengths = 1
+band = "J"
+spectrograph = "awg"
+awg_resolving_power = 5000.0
+awg_throughput = 0.7
+awg_free_spectral_range_fraction = 1.0
+awg_order = 1
+awg_pixels_per_resolution_element = 2
+n_spectro_pixels = 1
+snr_min_per_bin = 3.0
+resolving_power_cap = 10000.0
+
+[[pipeline.stages]]
+id = "hdc"
+type = "characterization.hdc_ccf"
+planet_template = "earth"
+telluric_template = "maunakea"
+integration_time_s = 3600.0
+target_snr = 5.0
+# Shrunk from the stage defaults to keep the smoke run short: the diagnostic
+# scans rebuild the channel grid at every point.
+snr_vs_r_points = 6
+rv_scan_points = 21
+rv_scan_halfwidth_kms = 100.0
+
+[[pipeline.stages]]
+id = "performance"
+type = "performance.standard"
+target_snr = 5.0
+
+[output]
+dir = "results/{run.name}/{timestamp}"
+plots = ["hdc_ccf"]
+tables = ["performance_summary", "characterization_summary"]
+
+[output.formats]
+tables = ["json"]
+
+[cache]
+enabled = true
+dir = ".nullsim_cache"
+version = 1

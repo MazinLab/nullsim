@@ -93,3 +93,5 @@ examples/test/*
 # and tests/examples/test_kilo_keck_config.py.
 !examples/test/kilo_keck_6.toml
 !examples/test/kilo_keck_6_joint_crlb.toml
+# Loaded by tests/examples/test_hdc_ccf_smoke.py.
+!examples/test/hdc_ccf_smoke.toml
