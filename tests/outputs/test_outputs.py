@@ -416,8 +416,32 @@ def test_characterization_summaries_mask_infeasible_snr_and_rates(
     assert math.isnan(characterization["planet_signal_rate_hz"])
 
 
+# One distinct sentinel per published hdc_* column, so a test that asserts all
+# five is asserting five independent values rather than five views of one.
+_HDC_SENTINELS: dict[str, tuple[str, float]] = {
+    "hdc_ccf_snr": ("ccf_snr", 12.5),
+    "hdc_ccf_snr_photon_limited": ("ccf_snr_photon_limited", 18.0),
+    "hdc_n_effective_lines": ("n_effective_lines", 340.0),
+    "hdc_resolving_power": ("resolving_power_used", 25000.0),
+    "hdc_systematic_rejection": ("ccf_systematic_rejection", 3.0e-3),
+}
+
+
+def _hdc_sentinel_payload(
+    upstream: str = "characterization.spectro",
+) -> dict[str, object]:
+    """A fully populated hdc_ccf payload: every published column has a value."""
+    payload: dict[str, object] = {
+        key: value for key, value in _HDC_SENTINELS.values()
+    }
+    payload["upstream_spectro_component"] = upstream
+    return payload
+
+
 def _characterization_record(
-    tmp_path: Path, extra_components: dict[str, dict[str, object]] | None = None
+    tmp_path: Path,
+    extra_components: dict[str, dict[str, object]] | None = None,
+    optimization_success: bool = True,
 ) -> RunRecord:
     """A record carrying a characterization.spectro row plus optional extras."""
     record = _record(tmp_path)
@@ -427,7 +451,7 @@ def _characterization_record(
         {
             "snr": 5.0,
             "max_spectral_resolution": 100.0,
-            "optimization_success": True,
+            "optimization_success": optimization_success,
         },
     )
     for name, payload in (extra_components or {}).items():
@@ -449,17 +473,7 @@ def _characterization_record(
 def test_characterization_summary_publishes_hdc_ccf_columns(tmp_path: Path) -> None:
     """HDC CCF scalars must surface as hdc_* columns on the spectro row."""
     record = _characterization_record(
-        tmp_path,
-        {
-            "characterization.hdc_ccf": {
-                "ccf_snr": 12.5,
-                "ccf_snr_photon_limited": 18.0,
-                "n_effective_lines": 340.0,
-                "resolving_power_used": 25000.0,
-                "ccf_systematic_rejection": 3.0e-3,
-                "upstream_spectro_component": "characterization.spectro",
-            }
-        },
+        tmp_path, {"characterization.hdc_ccf": _hdc_sentinel_payload()}
     )
     collection = RunCollection(
         config=_resolved_stub(), records=(record,), output_dir=tmp_path
@@ -468,11 +482,8 @@ def test_characterization_summary_publishes_hdc_ccf_columns(tmp_path: Path) -> N
     path = characterization_summary(collection, tmp_path, ("json",))[0]
     row = json.loads(path.read_text(encoding="utf-8"))[0]
 
-    assert row["hdc_ccf_snr"] == pytest.approx(12.5)
-    assert row["hdc_ccf_snr_photon_limited"] == pytest.approx(18.0)
-    assert row["hdc_n_effective_lines"] == pytest.approx(340.0)
-    assert row["hdc_resolving_power"] == pytest.approx(25000.0)
-    assert row["hdc_systematic_rejection"] == pytest.approx(3.0e-3)
+    for column, (_key, expected) in _HDC_SENTINELS.items():
+        assert row[column] == pytest.approx(expected), column
 
 
 def test_characterization_summary_hdc_columns_nan_without_component(
@@ -488,13 +499,7 @@ def test_characterization_summary_hdc_columns_nan_without_component(
     path = characterization_summary(collection, tmp_path, ("json",))[0]
     row = json.loads(path.read_text(encoding="utf-8"))[0]
 
-    for column in (
-        "hdc_ccf_snr",
-        "hdc_ccf_snr_photon_limited",
-        "hdc_n_effective_lines",
-        "hdc_resolving_power",
-        "hdc_systematic_rejection",
-    ):
+    for column in _HDC_SENTINELS:
         assert math.isnan(row[column]), column
 
 
@@ -506,42 +511,29 @@ def test_characterization_summary_hdc_columns_mask_on_spectro_nonconvergence(
     A failed retune makes a finite CCF number describe a candidate solution the
     pipeline never accepted, so the hdc_* columns follow the same masking as
     ``snr`` and the per-port rates on that row.
+
+    Both branches run off the same fully populated payload, so the NaNs are
+    attributable to the convergence gate alone: every one of the five columns
+    demonstrably carries a value when the spectro row converges.
     """
-    record = _record(tmp_path)
-    state = record.result.state
-    results = state.results.add_component(
-        "characterization.spectro",
-        {"snr": 5.0, "optimization_success": False},
-    ).add_component(
-        "characterization.hdc_ccf",
-        {
-            "ccf_snr": 7.5,
-            "resolving_power_used": 25000.0,
-            "upstream_spectro_component": "characterization.spectro",
-        },
-    )
-    patched = RunRecord(
-        config=record.config,
-        result=RunResult(
-            state=replace(state, results=results),
-            diagnostics=record.result.diagnostics,
-            timings=record.result.timings,
-            cache_hit_count=record.result.cache_hit_count,
-            config_hash=record.result.config_hash,
-        ),
-        run_dir=record.run_dir,
-        coord_tuple=record.coord_tuple,
-    )
-    collection = RunCollection(
-        config=_resolved_stub(), records=(patched,), output_dir=tmp_path
-    )
+    rows: dict[bool, dict[str, object]] = {}
+    for converged in (True, False):
+        record = _characterization_record(
+            tmp_path,
+            {"characterization.hdc_ccf": _hdc_sentinel_payload()},
+            optimization_success=converged,
+        )
+        collection = RunCollection(
+            config=_resolved_stub(), records=(record,), output_dir=tmp_path
+        )
+        path = characterization_summary(collection, tmp_path, ("json",))[0]
+        rows[converged] = json.loads(path.read_text(encoding="utf-8"))[0]
 
-    path = characterization_summary(collection, tmp_path, ("json",))[0]
-    row = json.loads(path.read_text(encoding="utf-8"))[0]
-
-    assert row["converged"] is False
-    assert math.isnan(row["hdc_ccf_snr"])
-    assert math.isnan(row["hdc_resolving_power"])
+    assert rows[True]["converged"] is True
+    assert rows[False]["converged"] is False
+    for column, (_key, expected) in _HDC_SENTINELS.items():
+        assert rows[True][column] == pytest.approx(expected), column
+        assert math.isnan(rows[False][column]), column
 
 
 def test_characterization_summary_hdc_columns_join_on_upstream_component(
