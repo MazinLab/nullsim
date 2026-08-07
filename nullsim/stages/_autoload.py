@@ -45,6 +45,7 @@ _STAGE_MODULES = (
     "nullsim.stages.performance.pdi",
     "nullsim.stages.characterization.spectro",
     "nullsim.stages.characterization.detection_curve",
+    "nullsim.stages.characterization.hdc_ccf",
 )
 
 # Optional-extra stages: importing succeeds even without the extra (lazy
