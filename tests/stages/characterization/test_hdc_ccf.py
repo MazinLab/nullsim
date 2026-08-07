@@ -452,6 +452,162 @@ def test_hdc_ccf_headline_snr_is_independent_of_the_diagnostic_scans(
         assert left[key] == right[key]
 
 
+def _mkid_payload(*, n_spectro_pixels: int, per_pixel_dark_hz: float) -> dict:
+    payload = _spectro_payload()
+    for key in (
+        "awg_total_planet_rate_hz",
+        "awg_total_leakage_rate_hz",
+        "awg_total_sky_rate_hz",
+        "awg",
+        "awg_resolving_power",
+        "awg_n_bins",
+    ):
+        payload.pop(key)
+    payload["spectrograph"] = "mkid"
+    payload["mkid_resolving_power"] = 3000.0
+    payload["mkid_pixels_per_resolution_element"] = 1
+    payload["mkid_n_spectro_pixels"] = n_spectro_pixels
+    # Mirrors per_bin_snr: dark_rate_hz_per_pixel * n_spectro_pixels per bin.
+    payload["mkid_dark_rate_hz_per_bin_total"] = per_pixel_dark_hz * n_spectro_pixels
+    # D scales with n_spectro_ports (== 1 on the MKID branch), NOT with pixels.
+    payload["D"] = per_pixel_dark_hz * _INTEGRATION_TIME_S
+    return payload
+
+
+def test_hdc_ccf_mkid_dark_scales_with_spectro_pixels(tmp_path: Path) -> None:
+    """MKID dark follows n_spectro_pixels, which the band-total D does not."""
+
+    per_channel = []
+    for n_pixels in (1, 4):
+        state = SimulationState.empty({"wavelength_grid_um": (1.25,)})
+        state = replace(
+            state,
+            scene=Scene(
+                star_jmag=4.0,
+                star_spectral_type="M2V",
+                planet_contrast=_PLANET_CONTRAST,
+                planet_radial_velocity_kms=_PLANET_RV_KMS,
+            ),
+            results=SimulationState.empty({}).results.add_component(
+                "characterization.spectro",
+                _mkid_payload(n_spectro_pixels=n_pixels, per_pixel_dark_hz=0.5),
+            ),
+        )
+        result = _stage(
+            _context(tmp_path), snr_vs_r_points=0, rv_scan_points=0
+        ).apply(state)
+        payload = result.results.components["characterization.hdc_ccf"]
+        per_channel.append(float(payload["dark_rate_hz_per_channel"]))
+        assert "mkid_dark_rate_hz_per_bin_total" in str(
+            payload["detection_budget_source"]
+        )
+
+    assert per_channel == [0.5, 2.0]
+
+
+@pytest.mark.parametrize("resolving_power", [100.0, 300.0, 1000.0, 3000.0])
+def test_hdc_ccf_sky_loses_the_same_uncovered_band_share(
+    tmp_path: Path, resolving_power: float
+) -> None:
+    """Sky must forfeit the dropped channel's share like planet and leak do.
+
+    Sky is carried as a rate density and channelized through the identical
+    path, so it tracks the leak -- the other smooth continuum -- essentially
+    exactly. Before the fix it was allocated by an area rule renormalized into
+    the retained span and kept 100% while everything else lost its share.
+    """
+
+    result = _stage(
+        _context(tmp_path),
+        resolving_power=resolving_power,
+        snr_vs_r_points=0,
+        rv_scan_points=0,
+    ).apply(_state())
+    payload = result.results.components["characterization.hdc_ccf"]
+
+    assert float(payload["channel_band_coverage_fraction"]) < 1.0
+
+    def retained(channel_key: str, total_key: str) -> float:
+        return float(
+            np.sum(np.asarray(payload[channel_key], dtype=np.float64))
+        ) / float(payload[total_key])
+
+    leak_fraction = retained(
+        "ccf_leak_rate_hz_per_channel", "detected_leak_rate_hz"
+    )
+    sky_fraction = retained("ccf_sky_rate_hz_per_channel", "sky_rate_hz_total")
+
+    assert sky_fraction < 1.0
+    assert sky_fraction == pytest.approx(leak_fraction, rel=2.0e-3)
+
+    if resolving_power >= 3000.0:
+        # At a sane kernel width every component agrees. At very coarse R the
+        # planet's structured spectrum interacts differently with the LSF's
+        # edge clamp than a smooth continuum does, which is an artifact of the
+        # convolution's edge mode, not of the sky allocation.
+        planet_fraction = retained(
+            "ccf_planet_rate_hz_per_channel", "detected_planet_rate_hz"
+        )
+        assert sky_fraction == pytest.approx(planet_fraction, rel=1.0e-3)
+
+
+def test_hdc_ccf_narrow_band_scan_records_nan_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """A fixed 100..30000 scan axis must not fail a viable narrow-band run."""
+
+    wl_um = np.linspace(1.150, 1.155, _N_WAVELENGTHS)
+    narrow = _spectro_payload()
+    narrow["wavelengths_m"] = tuple(float(w) * 1.0e-6 for w in wl_um)
+    state = SimulationState.empty({"wavelength_grid_um": tuple(float(w) for w in wl_um)})
+    state = replace(
+        state,
+        scene=Scene(
+            star_jmag=4.0,
+            star_spectral_type="M2V",
+            planet_contrast=_PLANET_CONTRAST,
+            planet_radial_velocity_kms=_PLANET_RV_KMS,
+        ),
+        results=state.results.add_component("characterization.spectro", narrow),
+    )
+
+    result = _stage(_context(tmp_path), snr_vs_r_points=12).apply(state)
+    payload = result.results.components["characterization.hdc_ccf"]
+
+    snr = np.asarray(payload["snr_vs_resolving_power"], dtype=np.float64)
+    r_axis = np.asarray(payload["snr_vs_resolving_power_r"], dtype=np.float64)
+    # The band spans ln(1.155/1.150) = 4.3e-3, so R below ~230 fits no channel.
+    infeasible = r_axis < 200.0
+    assert np.any(infeasible) and np.all(np.isnan(snr[infeasible]))
+    assert np.all(np.isfinite(snr[r_axis > 1000.0]))
+    # The headline at R=3000 is unaffected.
+    assert float(payload["ccf_snr"]) > 0.0
+
+
+def test_hdc_ccf_narrow_band_headline_still_raises_below_one_channel(
+    tmp_path: Path,
+) -> None:
+    """The headline path keeps its hard error; only the scan degrades."""
+
+    wl_um = np.linspace(1.150, 1.155, _N_WAVELENGTHS)
+    narrow = _spectro_payload()
+    narrow["wavelengths_m"] = tuple(float(w) * 1.0e-6 for w in wl_um)
+    state = SimulationState.empty({"wavelength_grid_um": tuple(float(w) for w in wl_um)})
+    state = replace(
+        state,
+        scene=Scene(
+            star_jmag=4.0,
+            star_spectral_type="M2V",
+            planet_contrast=_PLANET_CONTRAST,
+            planet_radial_velocity_kms=_PLANET_RV_KMS,
+        ),
+        results=state.results.add_component("characterization.spectro", narrow),
+    )
+    stage = _stage(_context(tmp_path), resolving_power=100.0, snr_vs_r_points=0)
+    with pytest.raises(ValueError, match="narrower than one resolution element"):
+        stage.apply(state)
+
+
 def test_hdc_ccf_reads_with_fringe_tracking_from_the_payload(
     tmp_path: Path,
 ) -> None:

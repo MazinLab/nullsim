@@ -947,6 +947,15 @@ def _mkid_spectrograph_payload(
         "mkid_resolving_power_ref": mkid_r_ref,
         "mkid_lambda_ref_um": mkid_lambda_ref_um,
         "mkid_pixels_per_resolution_element": 1,
+        # Per-bin detector dark exactly as per_bin_snr charges it above
+        # (dark_rate_hz_per_pixel * n_spectro_pixels). Published so downstream
+        # consumers (characterization.hdc_ccf) do not have to reconstruct it
+        # from the band-total D, which scales with n_spectro_ports rather than
+        # n_spectro_pixels and undercounts whenever n_spectro_pixels > 1.
+        "mkid_n_spectro_pixels": int(params.n_spectro_pixels),
+        "mkid_dark_rate_hz_per_bin_total": float(
+            params.n_dark_count_hz * int(params.n_spectro_pixels)
+        ),
         "mkid_snr_per_bin": float(mkid_snr_per_bin),
         "mkid_min_snr_per_bin": float(mkid_snr_per_bin),
     }

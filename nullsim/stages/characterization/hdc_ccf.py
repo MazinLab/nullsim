@@ -45,7 +45,11 @@ Model choices worth knowing before reading the payload:
   into its detected stellar rate); what that single scalar cannot carry is
   line structure, and that is exactly what the template adds. The absolute
   transmission is kept separately, convolved through the instrument
-  line-spread function, for the channel mask.
+  line-spread function, for the channel mask. This assumes the upstream
+  throughput really does carry the broadband loss, which the stage cannot
+  check: the atmosphere stage no-ops when ``atmospheric_transmission`` is
+  None, and a config that never set it gets telluric line structure on an
+  unattenuated continuum.
 - The radial-velocity scan therefore correlates trial templates against the
   *leak-subtracted* dark-port residual, with the leak's shot noise retained in
   the per-channel variance. Without that subtraction the statistic would peak
@@ -293,6 +297,9 @@ class HdcCcfStage(BaseStage):
             "ccf_leak_rate_hz_per_channel": channels.leak_rate_hz.astype(
                 np.float64, copy=True
             ),
+            "ccf_sky_rate_hz_per_channel": channels.sky_rate_hz.astype(
+                np.float64, copy=True
+            ),
             "template_weights_per_channel": budget.template_weights.astype(
                 np.float64, copy=True
             ),
@@ -346,9 +353,8 @@ class HdcCcfStage(BaseStage):
             "snr_vs_resolving_power_model": (
                 "matched-filter CCF SNR rebuilt at each resolving power: new "
                 "constant-R channel grid, re-convolved and re-channelized "
-                "planet/leak densities, sky reallocated across the new channel "
-                "widths, dark held fixed per channel so its band total grows "
-                "with the channel count. Capped at the resolving power the "
+                "planet/leak/sky densities, dark held fixed per channel so its "
+                "band total grows with the channel count. Capped at the resolving power the "
                 "templates and the analysis grid jointly carry."
             ),
             "snr_vs_rv_model": (
@@ -449,8 +455,12 @@ _CCF_MODEL = (
     "unit-band-mean SHAPE, not an absolute transmission, because the upstream "
     "rates already carry a band-averaged atmospheric transmission from "
     "atmosphere.kolmogorov; the template supplies only the line structure that "
-    "the single upstream scalar cannot. The absolute (unnormalized) "
-    "transmission is what the telluric channel mask thresholds on. "
+    "the single upstream scalar cannot. That is an ASSUMPTION about the "
+    "upstream pipeline which this stage cannot verify: atmosphere.kolmogorov "
+    "no-ops when atmospheric_transmission is None, so a config that never set "
+    "it gets telluric line structure riding on an unattenuated continuum. "
+    "The absolute (unnormalized) transmission is what the telluric channel "
+    "mask thresholds on. "
     "ccf_systematic_rejection = systematic_ccf_leakage / detected leak rate is "
     "the template-projected fraction of the dark-port leak: the "
     "null-instability amplitude eps_systematic multiplies that projection "
@@ -822,6 +832,7 @@ class _ChannelBuilder:
         "densities",
         "content_resolving_power",
         "budget",
+        "sky_density",
     )
 
     def __init__(
@@ -838,6 +849,32 @@ class _ChannelBuilder:
         self.densities = densities
         self.content_resolving_power = content_resolving_power
         self.budget = budget
+        # Sky is carried as a rate DENSITY and channelized like the planet and
+        # the leak, rather than allocated by an area rule. A flat surface
+        # brightness windowed to the detector band is what it physically is,
+        # and running it through the same line-spread function and the same
+        # binning is the only way it forfeits exactly the same uncovered-band
+        # share the other components do. An allocation rule cannot match that:
+        # at coarse R the LSF pulls flux from just outside the retained span
+        # back into it, so the retained fraction is not the geometric
+        # bandwidth ratio.
+        band_width_um = band.lambda_max_um - band.lambda_min_um
+        self.sky_density = np.where(
+            grid_um <= band.lambda_max_um,
+            budget.sky_rate_hz / band_width_um,
+            0.0,
+        )
+
+    def n_complete_channels(self, resolving_power: float) -> int:
+        """How many whole resolution elements fit inside the detector band."""
+
+        span = math.log(self.band.lambda_max_um / self.band.lambda_min_um)
+        return int(math.floor(span * float(resolving_power) + 1.0e-9))
+
+    def supports(self, resolving_power: float) -> bool:
+        """Whether a channel grid can be built at this resolving power."""
+
+        return self.n_complete_channels(resolving_power) >= 1
 
     def edges(self, resolving_power: float) -> NDArray[np.float64]:
         """Channel edges that stay inside the detector band.
@@ -848,6 +885,10 @@ class _ChannelBuilder:
         over the uncovered part while its sky and dark allocations stayed
         whole -- so the partial channel is dropped rather than clipped. What
         that costs is reported as ``channel_band_coverage_fraction``.
+
+        Raises when not even one whole channel fits. Callers on the headline
+        path want that hard error; the diagnostic R scan checks `supports`
+        first and records NaN instead.
         """
 
         edges = build_channel_edges(
@@ -861,7 +902,8 @@ class _ChannelBuilder:
                 "characterization.hdc_ccf: the detector band "
                 f"[{self.band.lambda_min_um:.4g}, {self.band.lambda_max_um:.4g}] "
                 f"um is narrower than one resolution element at R="
-                f"{resolving_power:.4g}; there is no usable channel to build."
+                f"{resolving_power:.4g}; there is no usable channel to build. "
+                "Widen the band or raise the resolving power."
             )
         return edges
 
@@ -929,12 +971,7 @@ class _ChannelBuilder:
         leak = self._channelize(
             self.densities.leak_density, edges, resolving_power
         )
-        # Sky is a spectrally flat surface brightness, so its per-channel share
-        # follows the channel widths; on a log channel grid those are not equal.
-        # Only the whole channels inside the band are illuminated, so the
-        # allocation is over the tiled span, not the nominal band.
-        widths = np.diff(edges)
-        sky = self.budget.sky_rate_hz * widths / float(np.sum(widths))
+        sky = self._channelize(self.sky_density, edges, resolving_power)
         return ChannelSpectra(
             channel_centers_um=_channel_centers(edges),
             channel_edges_um=edges,
@@ -988,6 +1025,12 @@ def _snr_vs_r(
     ``snr_vs_resolving_power`` forwards a single fixed ``mf_kwargs`` mapping,
     but the telluric mask is per channel and therefore R dependent, so the
     scan is driven one point at a time with the mask rebuilt for that grid.
+
+    The scan axis is a fixed 100..30000 sweep, so on a narrow band its low end
+    can ask for a resolving power at which not one whole channel fits. Those
+    points record NaN: a diagnostic sweep running off the bottom of the band
+    is not a reason to fail a run whose headline resolving power is fine. The
+    headline path keeps its hard error.
     """
 
     if r_values.size == 0:
@@ -996,8 +1039,10 @@ def _snr_vs_r(
     def build(resolving_power: float) -> ChannelSpectra:
         return channel_builder.channels(resolving_power, planet_rv_kms)
 
-    values = np.empty(r_values.size, dtype=np.float64)
+    values = np.full(r_values.size, np.nan, dtype=np.float64)
     for index, resolving_power in enumerate(r_values):
+        if not channel_builder.supports(float(resolving_power)):
+            continue
         kwargs = dict(mf_kwargs)
         kwargs["telluric_transmission_per_channel"] = (
             channel_builder.telluric_per_channel(float(resolving_power))
@@ -1215,24 +1260,44 @@ class _DetectionBudget:
         # spectro_throughput=1.0 to per_bin_snr: native dispersion adds no
         # spectrograph throughput term, so the optical rates entering the
         # detector are the published band totals.
+        #
+        # Dark must come from the per-pixel metadata, not from the band-total
+        # D. per_bin_snr charges ``dark_rate_hz_per_pixel * n_spectro_pixels``
+        # per bin, while D scales with n_spectro_ports; the two agree only at
+        # the default of one spectro pixel, and D undercounts the dark budget
+        # whenever n_spectro_pixels > 1.
+        dark_per_bin = spectro.get("mkid_dark_rate_hz_per_bin_total")
+        if dark_per_bin is not None:
+            dark_rate_hz_per_channel = max(float(dark_per_bin), 0.0)
+            dark_source = (
+                "dark = mkid_dark_rate_hz_per_bin_total "
+                "(dark_rate_hz_per_pixel x n_spectro_pixels), charged per "
+                "channel the way per_bin_snr charges it per bin at one bin "
+                "per resolution element"
+            )
+        else:
+            # Older payloads predate the per-bin key. D over the integration
+            # time is dark_rate_hz_per_pixel for the single spectro port that
+            # spectro's validator enforces on the MKID branch, which is the
+            # per-bin rate only when n_spectro_pixels == 1.
+            dark_rate_hz_per_channel = (
+                max(float(spectro.get("D", 0.0) or 0.0), 0.0) / integration_time_s
+            )
+            dark_source = (
+                "dark from the band-total D over the integration time "
+                "(payload predates mkid_dark_rate_hz_per_bin_total); this "
+                "undercounts the per-bin dark when n_spectro_pixels > 1"
+            )
         return cls(
             planet_rate_hz=max(float(spectro["planet_signal_rate_hz"]), 0.0),
             leak_rate_hz=max(float(spectro["leakage_rate_hz"]), 0.0),
             sky_rate_hz=max(float(spectro.get("Sky", 0.0) or 0.0), 0.0)
             / integration_time_s,
-            # per_bin_snr charges dark_rate_hz_per_pixel * n_spectro_pixels per
-            # bin, and the MKID branch runs one bin per resolution element with
-            # exactly one spectro port (enforced by spectro's validator), so the
-            # published D over the integration time is the per channel rate at
-            # the default of one pixel per port.
-            dark_rate_hz_per_channel=max(float(spectro.get("D", 0.0) or 0.0), 0.0)
-            / integration_time_s,
+            dark_rate_hz_per_channel=dark_rate_hz_per_channel,
             source=(
                 "MKID native dispersion: characterization.spectro applies no "
                 "spectrograph throughput, so planet_signal_rate_hz and "
-                "leakage_rate_hz are the detected band totals; dark is the "
-                "published D over the integration time, charged per channel "
-                "the way per_bin_snr charges it per bin."
+                f"leakage_rate_hz are the detected band totals; {dark_source}."
             ),
         )
 
