@@ -520,17 +520,17 @@ _CCF_MODEL = (
     "it gets telluric line structure riding on an unattenuated continuum. "
     "The absolute (unnormalized) transmission is what the telluric channel "
     "mask thresholds on. "
-    "ccf_systematic_rejection = |sum_i w_i Ltilde_i| / sum_i w_i L_i is the "
-    "fraction of the template-projected leak that SURVIVES continuum "
-    "filtering: filtered over unfiltered leak projection under the same "
-    "matched-filter weights, so the arbitrary weight normalization cancels and "
-    "the ratio is non-negative and normally in [0, 1]. Small means the leak's "
-    "spectral structure is nearly orthogonal to the planet template, which is "
-    "where the HDC systematic gain comes from -- the null-instability "
-    "amplitude eps_systematic multiplies that surviving projection rather than "
-    "the whole band leak. Do not read it as a ratio to the raw dark-port leak "
-    "rate: that earlier definition scaled with the weight normalization and "
-    "could go negative."
+    "ccf_systematic_rejection = |sum_i w_i Ltilde_i| / sum_i |w_i| L_i is the "
+    "fraction of the leak that SURVIVES continuum filtering into the "
+    "statistic: filtered leak projection over the total unfiltered leak the "
+    "same matched-filter weights touch, so the arbitrary weight normalization "
+    "cancels and the ratio is non-negative and in practice well below 1. Small "
+    "means the leak's spectral structure is nearly orthogonal to the planet "
+    "template, which is where the HDC systematic gain comes from -- the "
+    "null-instability amplitude eps_systematic multiplies that surviving "
+    "projection rather than the whole band leak. Do not read it as a ratio to "
+    "the raw dark-port leak rate: that earlier definition scaled with the "
+    "weight normalization and could go negative."
 )
 
 
@@ -1847,24 +1847,34 @@ def _template_sha256(path: Path) -> str | None:
 
 
 def _ccf_systematic_rejection(budget: Any, channels: ChannelSpectra) -> float:
-    """Fraction of the template-projected leak that survives continuum filtering.
+    """Fraction of the leak the matched filter still sees after filtering.
 
-    ``|sum_i w_i Ltilde_i| / sum_i w_i L_i``: the same weights appear in both
-    sums, so the arbitrary scale of the matched-filter template cancels and the
-    result is a genuine dimensionless rejection factor. The numerator is taken
-    in absolute value because the filtered leak projection is signed -- an
-    absorption-dominated residual flips it -- while what the systematic term
-    cares about is its magnitude.
+    ``|sum_i w_i Ltilde_i| / sum_i |w_i| L_i``: filtered leak projection over
+    the total unfiltered leak the same weights touch. The weights appear
+    linearly in both sums, so the arbitrary scale of the matched-filter
+    template cancels; the result is non-negative and in practice well below 1.
+    Small means the leak's spectral structure is nearly orthogonal to the
+    planet template, which is where the HDC systematic gain lives.
 
-    The earlier definition divided by the raw band leak rate instead, which
-    scaled with the weight normalization and could be negative.
+    Two rejected alternatives, both for concrete reasons:
+
+    * ``systematic_ccf_leakage / leak_rate_hz`` (the original) is not scale
+      invariant -- it scales with the weight normalization -- and is signed.
+    * ``sum_i w_i L_i`` as the denominator, keeping the signed weights, looks
+      like the natural "unfiltered projection" but degenerates: continuum
+      filtering leaves the template with a near-zero mean, so its projection
+      onto a smooth positive leak is a small residual of either sign. In the
+      reference fixture it is -7.4e-3 against a +1.1e-3 numerator, i.e.
+      negative, and a ratio built on it is meaningless. Taking ``|w_i|``
+      keeps the same weights while making the denominator a genuine
+      non-degenerate scale.
     """
 
-    unfiltered = float(np.sum(budget.template_weights * channels.leak_rate_hz))
+    weights = np.asarray(budget.template_weights, dtype=np.float64)
+    unfiltered = float(np.sum(np.abs(weights) * channels.leak_rate_hz))
     if unfiltered <= 0.0:
         return 0.0
     return abs(float(budget.systematic_ccf_leakage)) / unfiltered
-
 
 def _telluric_masked_fraction(
     telluric_per_channel: NDArray[np.float64] | None, threshold: float

@@ -661,7 +661,8 @@ def test_hdc_ccf_systematic_rejection_is_scale_invariant(tmp_path: Path) -> None
             "ccf_systematic_rejection"
         ]
     )
-    assert left >= 0.0 and right >= 0.0
+    # Non-zero: a degenerate denominator would silently collapse this to 0.
+    assert left > 0.0 and right > 0.0
     assert right == pytest.approx(left, rel=0.05)
 
 def test_hdc_ccf_partial_fsr_restricts_the_channel_span(tmp_path: Path) -> None:
