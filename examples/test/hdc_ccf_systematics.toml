@@ -1,9 +1,10 @@
 # Systematics-dominated companion to `hdc_ccf_smoke.toml`: the case where
 # cross-correlation actually buys something. The smoke config is photon
-# limited, so the matched filter has no systematic to reject and loses to the
-# broadband band SNR. Here the leaked starlight carries a quasi-static
-# instability, which caps the broadband number and leaves the CCF nearly
-# untouched.
+# limited, and there the matched filter LOSES to the broadband band SNR
+# (ccf_snr 70.49 against band 387.41) -- correctly, because it throws away
+# most of the planet's photons to isolate the lines. Here the leaked
+# starlight carries a quasi-static instability. It costs the band a factor
+# 125 and the CCF a factor 2.1, and that asymmetry is the whole point.
 #
 # The only changes from the smoke config are two knobs, set identically on
 # `characterization.spectro` and `performance.standard`:
@@ -14,11 +15,21 @@
 # `with_fringe_tracking = false` is not a claim that the fringe tracker is
 # switched off -- `fringe_tracking.closed_loop` still runs. It selects the
 # quasi-static branch of the null-instability variance,
-# (eps * leak_counts)^2 rather than eps^2 * leak_rate^2 * t / (2 f_servo):
-# a speckle that stays put over the exposure instead of averaging down as
-# sqrt(t). That is the systematic HDC exists to remove, and the sqrt(t)
-# branch cannot produce it at any physical eps -- with f_servo = 2 kHz the
-# CCF systematic term only overtakes CCF photon noise for eps > 2.
+# (eps * leak_counts)^2 rather than eps^2 * leak_rate^2 * t / (2 f_servo).
+# That branch asserts the 1e-3 fluctuation is perfectly coherent across the
+# whole 3600 s exposure: no averaging at all, correlation time >= t. Nothing
+# upstream in the pipeline derives that correlation time -- it is hand set
+# here, and it is the assumption the entire demonstration rests on. A
+# quasi-static speckle is the systematic HDC exists to remove, so it is the
+# right branch for this example, but the number is asserted, not computed.
+#
+# At THIS config's operating point the averaging branch cannot substitute:
+# with f_servo = 2 kHz, CCF systematic variance only overtakes CCF photon
+# noise for eps > 2.0 (dominance needs eps^2 / f_servo > 2.04e-3). That is a
+# statement about 2 kHz, not about the branch -- at a 30 Hz speckle
+# decorrelation bandwidth the same inequality needs only eps > 0.25, which is
+# large but not absurd. A config wanting the averaging branch would have to
+# argue for both numbers.
 #
 # Achieved at 3600 s (run 20260807-164521, ~2 s wall clock):
 #
@@ -29,10 +40,15 @@
 #   ccf_systematic_var / ccf_photon_var = 1.757e4 / 4969 = 3.54
 #   ccf_systematic_rejection = 0.026
 #
-# The rejection factor is the whole story: the continuum filter keeps 2.6% of
-# the leaked-starlight amplitude the broadband band SNR has to swallow whole,
-# so the same eps costs the band a factor ~125 in SNR and the CCF a factor
-# ~2.1. Panel (c) of the `hdc_ccf` plot shows the realized curve far below the
+# Read that rejection factor as an illustrative best case, not a bound. It is
+# |sum w L~| / (sum |w| L) for ONE coherent scalar eps multiplying ONE smooth
+# leak spectrum: the continuum filter keeps 2.6% of what the band SNR
+# swallows whole. There is no chromatic-speckle covariance model behind it. A
+# perturbation with structure at the line scale would project onto the
+# template differently -- possibly much more strongly, possibly less -- and
+# this config says nothing about that case.
+#
+# Panel (c) of the `hdc_ccf` plot shows the realized curve far below the
 # photon limit at R = 100 and converging toward it by R = 3e4, as narrower
 # channels resolve the planet's lines away from the smooth leak.
 #

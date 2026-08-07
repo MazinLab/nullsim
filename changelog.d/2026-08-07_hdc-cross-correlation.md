@@ -53,6 +53,9 @@ Framing and the sqrt(N_lines) scaling follow Wang, Mawet, Ruane, Hu & Benneke
   end in a few seconds.
 - **New example config `examples/test/hdc_ccf_systematics.toml`**: the same
   instrument with a quasi-static 1e-3 null instability on the leaked
-  starlight. The broadband band SNR falls to 3.1 while the cross-correlation
-  holds 33.1, which is the regime HDC is for; the smoke config is photon
-  limited and ties.
+  starlight, hand set via `residual_speckle_stability_factor` with
+  `with_fringe_tracking = false`. The broadband band SNR falls from 387.4 to
+  3.1 while the cross-correlation only falls from 70.5 to 33.1, which is the
+  regime HDC is for. In the photon-limited smoke config HDC loses to
+  broadband, 70.5 against 387.4 — correctly so, since the matched filter
+  discards the continuum photons that the band SNR counts.
