@@ -79,7 +79,6 @@ from nullsim.physics.hdc import (
     ccf_vs_rv,
     channelize,
     matched_filter_ccf,
-    snr_vs_resolving_power,
 )
 from nullsim.physics.spectra import (
     TemplateSpectrum,
@@ -247,7 +246,7 @@ class HdcCcfStage(BaseStage):
         }
         budget = matched_filter_ccf(channels, **mf_kwargs)
 
-        snr_vs_r = _snr_vs_r(
+        snr_vs_r, snr_vs_r_photon_limited = _snr_vs_r(
             r_scan,
             channel_builder=channel_builder,
             planet_rv_kms=planet_rv_kms,
@@ -300,10 +299,20 @@ class HdcCcfStage(BaseStage):
             "ccf_sky_rate_hz_per_channel": channels.sky_rate_hz.astype(
                 np.float64, copy=True
             ),
+            # v_i = P_i + L_i + S_sky,i + D_i, the Poisson variance rate the
+            # matched filter divides by. Published because the weights alone do
+            # not determine a channel's SNR contribution: that is
+            # w_i^2 v_i = Ptilde_i^2 / v_i, which needs v_i.
+            "ccf_variance_rate_hz_per_channel": channels.total_rate_hz().astype(
+                np.float64, copy=True
+            ),
             "template_weights_per_channel": budget.template_weights.astype(
                 np.float64, copy=True
             ),
             "snr_vs_resolving_power": snr_vs_r.astype(np.float64, copy=True),
+            "snr_vs_resolving_power_photon_limited": (
+                snr_vs_r_photon_limited.astype(np.float64, copy=True)
+            ),
             "snr_vs_resolving_power_r": r_scan.astype(np.float64, copy=True),
             "snr_vs_rv": snr_vs_rv.astype(np.float64, copy=True),
             "snr_vs_rv_kms": rv_grid_kms.astype(np.float64, copy=True),
@@ -355,7 +364,12 @@ class HdcCcfStage(BaseStage):
                 "constant-R channel grid, re-convolved and re-channelized "
                 "planet/leak/sky densities, dark held fixed per channel so its "
                 "band total grows with the channel count. Capped at the resolving power the "
-                "templates and the analysis grid jointly carry."
+                "templates and the analysis grid jointly carry. "
+                "snr_vs_resolving_power_photon_limited is the same scan with "
+                "the null-instability variance off, taken from the same budget "
+                "at each point: the photon limit is R dependent and must not be "
+                "read off the operating-point scalar. Infeasible R values (not "
+                "one whole channel fits the band) record NaN in both arrays."
             ),
             "snr_vs_rv_model": (
                 "Unbounded matched-filter score in sigma-like units, NOT a "
@@ -1019,12 +1033,21 @@ def _snr_vs_r(
     channel_builder: _ChannelBuilder,
     planet_rv_kms: float,
     mf_kwargs: dict[str, Any],
-) -> NDArray[np.float64]:
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """CCF SNR across the resolving-power scan, remasking tellurics at each R.
 
+    Returns ``(ccf_snr, ccf_snr_photon_limited)`` on the same axis. The photon
+    limit is R dependent for the same reason the realized SNR is -- both are
+    rebuilt on a new channel grid at every point -- so it has to be scanned,
+    not carried across the axis as the scalar at the operating point.
+
     ``snr_vs_resolving_power`` forwards a single fixed ``mf_kwargs`` mapping,
-    but the telluric mask is per channel and therefore R dependent, so the
-    scan is driven one point at a time with the mask rebuilt for that grid.
+    but the telluric mask is per channel and therefore R dependent, so the scan
+    is driven one point at a time with the mask rebuilt for that grid. Calling
+    ``matched_filter_ccf`` directly rather than through that wrapper is what
+    lets both SNRs come from one budget instead of two identical solves;
+    ``snr_vs_resolving_power(build, (r,), **kwargs)[0]`` is exactly
+    ``matched_filter_ccf(build(r), **kwargs).ccf_snr``.
 
     The scan axis is a fixed 100..30000 sweep, so on a narrow band its low end
     can ask for a resolving power at which not one whole channel fits. Those
@@ -1034,12 +1057,11 @@ def _snr_vs_r(
     """
 
     if r_values.size == 0:
-        return np.empty(0, dtype=np.float64)
-
-    def build(resolving_power: float) -> ChannelSpectra:
-        return channel_builder.channels(resolving_power, planet_rv_kms)
+        empty = np.empty(0, dtype=np.float64)
+        return empty, empty.copy()
 
     values = np.full(r_values.size, np.nan, dtype=np.float64)
+    photon_limited = np.full(r_values.size, np.nan, dtype=np.float64)
     for index, resolving_power in enumerate(r_values):
         if not channel_builder.supports(float(resolving_power)):
             continue
@@ -1047,10 +1069,13 @@ def _snr_vs_r(
         kwargs["telluric_transmission_per_channel"] = (
             channel_builder.telluric_per_channel(float(resolving_power))
         )
-        values[index] = snr_vs_resolving_power(
-            build, (float(resolving_power),), **kwargs
-        )[0]
-    return values
+        budget = matched_filter_ccf(
+            channel_builder.channels(float(resolving_power), planet_rv_kms),
+            **kwargs,
+        )
+        values[index] = budget.ccf_snr
+        photon_limited[index] = budget.ccf_snr_photon_limited
+    return values, photon_limited
 
 
 def _ccf_vs_rv(

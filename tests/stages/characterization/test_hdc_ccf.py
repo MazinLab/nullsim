@@ -178,9 +178,11 @@ def test_hdc_ccf_publishes_expected_payload_keys(payload: dict[str, object]) -> 
         "ccf_channel_centers_um",
         "ccf_planet_rate_hz_per_channel",
         "ccf_leak_rate_hz_per_channel",
+        "ccf_variance_rate_hz_per_channel",
         "template_weights_per_channel",
         # Scans.
         "snr_vs_resolving_power",
+        "snr_vs_resolving_power_photon_limited",
         "snr_vs_resolving_power_r",
         "snr_vs_rv",
         "snr_vs_rv_kms",
@@ -253,6 +255,57 @@ def test_hdc_ccf_snr_vs_r_axis_is_ascending_and_finite(
     assert r_axis.size == snr.size == 6
     assert np.all(np.diff(r_axis) > 0.0)
     assert np.all(np.isfinite(snr))
+
+
+def test_hdc_ccf_variance_rate_is_the_matched_filter_denominator(
+    payload: dict[str, object],
+) -> None:
+    """v_i = P_i + L_i + S_sky,i + D_i is what the weights divide by, and it is
+    what a consumer needs to turn w_i into a per-channel SNR contribution."""
+
+    variance = np.asarray(
+        payload["ccf_variance_rate_hz_per_channel"], dtype=np.float64
+    )
+    planet = np.asarray(payload["ccf_planet_rate_hz_per_channel"], dtype=np.float64)
+    leak = np.asarray(payload["ccf_leak_rate_hz_per_channel"], dtype=np.float64)
+    sky = np.asarray(payload["ccf_sky_rate_hz_per_channel"], dtype=np.float64)
+    dark = float(payload["dark_rate_hz_per_channel"])
+
+    assert variance.size == int(payload["n_channels"])
+    assert variance == pytest.approx(planet + leak + sky + dark)
+    assert np.all(variance > 0.0)
+
+
+def test_hdc_ccf_photon_limited_scan_bounds_the_realized_scan(
+    payload: dict[str, object],
+) -> None:
+    """The photon limit is R dependent, so it is scanned alongside the realized
+    SNR: same axis, same NaN pattern, and pointwise no smaller."""
+
+    snr = np.asarray(payload["snr_vs_resolving_power"], dtype=np.float64)
+    photon = np.asarray(
+        payload["snr_vs_resolving_power_photon_limited"], dtype=np.float64
+    )
+
+    assert photon.size == snr.size
+    assert np.array_equal(np.isnan(photon), np.isnan(snr))
+    finite = np.isfinite(snr)
+    assert np.all(photon[finite] >= snr[finite] - 1.0e-12)
+
+
+def test_hdc_ccf_photon_limited_scan_is_r_dependent(
+    payload: dict[str, object],
+) -> None:
+    """The whole point of scanning the photon limit: it varies with resolving
+    power, so it cannot be drawn as the operating-point scalar held flat."""
+
+    photon = np.asarray(
+        payload["snr_vs_resolving_power_photon_limited"], dtype=np.float64
+    )
+    finite = photon[np.isfinite(photon)]
+
+    assert finite.size > 1
+    assert float(np.ptp(finite)) > 0.01 * float(np.max(finite))
 
 
 def test_hdc_ccf_telluric_template_masks_channels(tmp_path: Path) -> None:

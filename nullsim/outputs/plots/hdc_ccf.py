@@ -194,20 +194,21 @@ def _plot_template_weights(ax: plt.Axes, payload: dict[str, Any]) -> None:
     ax.set_ylabel("Matched-filter weight (per channel)")
     ax.grid(True, axis="y", alpha=0.22)
 
-    # Per-channel SNR contribution: the matched filter's SNR adds in
-    # quadrature across channels, so channel i contributes a fraction
-    # w_i^2 / sum_j w_j^2 of the total SNR^2.
-    finite = np.isfinite(weights)
-    total = float(np.sum(weights[finite] ** 2))
-    if total > 0.0:
-        share = np.full(weights.size, np.nan, dtype=np.float64)
-        share[finite] = weights[finite] ** 2 / total
+    # Per-channel photon-limited SNR^2 contribution. With w_i = m_i Ptilde_i /
+    # v_i, photon-limited SNR^2 = t sum_i w_i^2 v_i, so channel i contributes
+    # w_i^2 v_i = Ptilde_i^2 / v_i -- NOT w_i^2, which mis-ranks channels
+    # whenever the variance rates differ across the band.
+    variance = _variance_rate_per_channel(payload, weights.size)
+    share = _snr_squared_share(weights, variance)
+    if share is not None:
         ax2 = ax.twinx()
         ax2.plot(x, share, "o-", color="#9467bd", linewidth=1.1, markersize=3.2)
         ax2.set_ylim(bottom=0.0)
-        ax2.set_ylabel("Share of total SNR$^2$")
+        ax2.set_ylabel(r"Share of photon-limited SNR$^2$ ($w_i^2 v_i$)")
         ax2.tick_params(axis="y", labelcolor="#9467bd")
-    ax.set_title("Template weights and SNR contribution")
+        ax.set_title("Template weights and photon-limited SNR contribution")
+        return
+    ax.set_title("Template weights")
 
 
 def _plot_snr_vs_r(ax: plt.Axes, payload: dict[str, Any]) -> None:
@@ -232,29 +233,46 @@ def _plot_snr_vs_r(ax: plt.Axes, payload: dict[str, Any]) -> None:
         markersize=4,
         label="CCF SNR",
     )
-    photon = _finite_scalar(payload.get("ccf_snr_photon_limited"))
-    if photon is not None:
-        ax.axhline(
-            photon,
-            color="#ff7f0e",
-            linestyle="--",
-            linewidth=1.1,
-            label=f"photon limit {photon:.3g}",
-        )
     realized = _finite_scalar(payload.get("ccf_snr"))
+    photon = _finite_scalar(payload.get("ccf_snr_photon_limited"))
     r_used = _finite_scalar(payload.get("resolving_power_used"))
-    if realized is not None:
-        ax.axhline(
-            realized,
-            color="#2ca02c",
-            linestyle=":",
-            linewidth=1.1,
-            label=f"realized {realized:.3g}",
+
+    # The photon limit is R dependent (new channel grid at every scan point),
+    # so it is drawn as the scanned curve. Never as a horizontal line: that
+    # would assert an R independence the model does not have.
+    photon_scan = _array(payload.get("snr_vs_resolving_power_photon_limited"))
+    if photon_scan.shape == r_values.shape and np.any(np.isfinite(photon_scan)):
+        ax.semilogx(
+            r_values,
+            np.where(np.isfinite(photon_scan), photon_scan, np.nan),
+            "s--",
+            color="#ff7f0e",
+            linewidth=1.2,
+            markersize=3.4,
+            label="photon-limited CCF SNR",
         )
+    elif photon is not None and r_used is not None and r_used > 0.0:
+        # Older payload without the scan: mark the operating point only.
+        ax.plot(
+            [r_used],
+            [photon],
+            "s",
+            color="#ff7f0e",
+            markersize=7,
+            label=f"photon limit at R used ({photon:.3g})",
+        )
+
     if r_used is not None and r_used > 0.0:
         ax.axvline(r_used, color="0.45", linestyle=":", linewidth=1.0)
         if realized is not None:
-            ax.plot([r_used], [realized], "*", color="#2ca02c", markersize=11)
+            ax.plot(
+                [r_used],
+                [realized],
+                "*",
+                color="#2ca02c",
+                markersize=11,
+                label=f"operating point ({realized:.3g})",
+            )
 
     ax.set_xlabel("Resolving power R")
     ax.set_ylabel("CCF SNR")
@@ -311,6 +329,55 @@ def _plot_snr_vs_rv(ax: plt.Axes, payload: dict[str, Any]) -> None:
     ax.grid(True, alpha=0.22)
     if ax.get_legend_handles_labels()[0]:
         ax.legend(loc="best", fontsize=8.5)
+
+
+def _variance_rate_per_channel(
+    payload: dict[str, Any],
+    n_channels: int,
+) -> np.ndarray | None:
+    """Per-channel Poisson variance rate ``v_i`` (Hz), or ``None``.
+
+    Prefers the published array. Older payloads predate it, so fall back to the
+    stage's own definition ``v = P + L + S_sky + D`` rebuilt from the published
+    components; the stage charges a single fixed dark rate to every channel, so
+    the scalar ``dark_rate_hz_per_channel`` reconstructs D exactly.
+    """
+
+    variance = _array(payload.get("ccf_variance_rate_hz_per_channel"))
+    if variance.size == n_channels:
+        return variance
+    parts = [
+        _array(payload.get(key))
+        for key in (
+            "ccf_planet_rate_hz_per_channel",
+            "ccf_leak_rate_hz_per_channel",
+            "ccf_sky_rate_hz_per_channel",
+        )
+    ]
+    if any(part.size != n_channels for part in parts):
+        return None
+    dark = _finite_scalar(payload.get("dark_rate_hz_per_channel"))
+    if dark is None:
+        return None
+    return parts[0] + parts[1] + parts[2] + dark
+
+
+def _snr_squared_share(
+    weights: np.ndarray,
+    variance: np.ndarray | None,
+) -> np.ndarray | None:
+    """Fraction of the photon-limited SNR^2 each channel carries."""
+
+    if variance is None or variance.shape != weights.shape:
+        return None
+    contribution = weights * weights * variance
+    finite = np.isfinite(contribution) & (variance > 0.0)
+    total = float(np.sum(contribution[finite]))
+    if not np.isfinite(total) or total <= 0.0:
+        return None
+    share = np.full(weights.size, np.nan, dtype=np.float64)
+    share[finite] = contribution[finite] / total
+    return share
 
 
 def _array(values: Any) -> np.ndarray:
