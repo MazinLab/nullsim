@@ -44,6 +44,7 @@ _STAGE_CONFIG_BINDINGS: dict[str, dict[str, str]] = {
         "star_spectral_type": "scene.star.spectral_type",
         "planet_contrast": "scene.planet.contrast",
         "planet_separation_mas": "scene.planet.separation_mas",
+        "planet_radial_velocity_kms": "scene.planet.radial_velocity_kms",
         "position_angle_deg": "scene.planet.position_angle_deg",
         "exozodi_level_zodi": "scene.exozodi.level_zodi",
     },

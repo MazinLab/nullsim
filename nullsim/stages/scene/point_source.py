@@ -44,6 +44,10 @@ class PointSource(BaseStage):
         star_spectral_type: str | None = None
         planet_contrast: float = Field(default=1.0e-6, ge=0.0)
         planet_separation_mas: float = Field(default=100.0, ge=0.0)
+        # Star-planet radial velocity in km/s, positive = receding. Sets the
+        # Doppler offset of the planet template used by cross-correlation
+        # (high dispersion coronagraphy) characterization stages.
+        planet_radial_velocity_kms: float = 30.0
         position_angle_deg: float = 0.0
         exozodi_level_zodi: float = Field(default=0.0, ge=0.0)
         altitude_deg: float | None = None
@@ -58,6 +62,7 @@ class PointSource(BaseStage):
             star_spectral_type=params.star_spectral_type,
             planet_contrast=params.planet_contrast,
             planet_separation_mas=params.planet_separation_mas,
+            planet_radial_velocity_kms=params.planet_radial_velocity_kms,
             planet_position_angle_deg=params.position_angle_deg,
             exozodi_level_zodi=params.exozodi_level_zodi,
             altitude_deg=params.altitude_deg,
@@ -71,6 +76,7 @@ class PointSource(BaseStage):
                 "star_spectral_type": params.star_spectral_type,
                 "planet_contrast": params.planet_contrast,
                 "planet_separation_mas": params.planet_separation_mas,
+                "planet_radial_velocity_kms": params.planet_radial_velocity_kms,
                 "position_angle_deg": params.position_angle_deg,
                 "exozodi_level_zodi": params.exozodi_level_zodi,
                 "altitude_deg": params.altitude_deg,

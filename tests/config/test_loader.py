@@ -352,6 +352,47 @@ azimuth_deg = 0.0
     )
 
 
+def test_load_config_materializes_planet_radial_velocity(tmp_path: Path) -> None:
+    config_text = """
+[run]
+name = "rv_materialize"
+
+[grid]
+wavelength_center_um = 1.65
+wavelength_bandwidth_um = 0.4
+n_wavelength_bins = 1
+
+[scene.star]
+jmag = 9.0
+angular_diameter_mas = 1.0
+distance_pc = 10.0
+
+[scene.planet]
+contrast = 1.0e-6
+separation_mas = 10.0
+position_angle_deg = 0.0
+radial_velocity_kms = -17.5
+
+[observation]
+integration_time_s = 3600.0
+
+[[pipeline.stages]]
+id = "scene"
+type = "scene.point_source"
+"""
+    cfg_path = tmp_path / "rv.toml"
+    cfg_path.write_text(config_text)
+
+    resolved = load_config(cfg_path)
+    scene_stage = next(
+        s for s in resolved.pipeline.stages if s.type == "scene.point_source"
+    )
+
+    assert scene_stage.model_dump().get(
+        "planet_radial_velocity_kms"
+    ) == pytest.approx(-17.5)
+
+
 def test_load_config_materializes_site_telescope_defaults_into_stage_specs(
     tmp_path: Path,
 ) -> None:

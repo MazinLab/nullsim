@@ -21,7 +21,7 @@ from nullsim.pipeline import (
 )
 
 EXPECTED_EMPTY_STATE_DIGEST_HEX = (
-    "9b75952bfa44e1aeccd8d68d1f5d72f190dda1e5c4dbef75f87eac5781d472f9"
+    "72ae107906862a7ec4bb109cd38e77dd275ef9919825fe523c6d6e1df081ce93"
 )
 
 

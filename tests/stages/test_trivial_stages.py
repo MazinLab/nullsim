@@ -150,6 +150,29 @@ def test_point_source_contract(tmp_path: Path) -> None:
     assert state.scene.components["point_source"]["star_jmag"] == 5.0
 
 
+def test_point_source_carries_planet_radial_velocity_into_scene(
+    tmp_path: Path,
+) -> None:
+    initial_state = SimulationState.empty(GRID)
+    stage = _stage(
+        "scene.point_source",
+        tmp_path,
+        planet_radial_velocity_kms=42.0,
+    )
+    state = stage.apply(initial_state)
+
+    assert state.scene.planet_radial_velocity_kms == pytest.approx(42.0)
+    assert state.scene.components["point_source"][
+        "planet_radial_velocity_kms"
+    ] == pytest.approx(42.0)
+
+
+def test_point_source_default_radial_velocity_is_30_kms(tmp_path: Path) -> None:
+    state = _stage("scene.point_source", tmp_path).apply(SimulationState.empty(GRID))
+
+    assert state.scene.planet_radial_velocity_kms == pytest.approx(30.0)
+
+
 def test_fixed_aperture_contract(tmp_path: Path) -> None:
     before = _scene_state(tmp_path)
     stage = _stage("telescope.fixed_aperture", tmp_path, diameter_m=2.0)

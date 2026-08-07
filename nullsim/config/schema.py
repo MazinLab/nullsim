@@ -65,6 +65,9 @@ class PlanetConfig(StrictConfigModel):
     contrast: float = Field(ge=0.0)
     separation_mas: float = Field(ge=0.0)
     position_angle_deg: float
+    # Star-planet radial velocity in km/s, positive = receding. Unset leaves
+    # the scene.point_source Params default in place.
+    radial_velocity_kms: float | None = None
 
 
 class ExozodiConfig(StrictConfigModel):

@@ -242,6 +242,7 @@ class Scene(SubBudget):
     star_spectral_type: str | None = None
     planet_contrast: float | None = None
     planet_separation_mas: float | None = None
+    planet_radial_velocity_kms: float | None = None
     planet_position_angle_deg: float | None = None
     exozodi_level_zodi: float | None = None
     altitude_deg: float | None = None
