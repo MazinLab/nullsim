@@ -15,6 +15,7 @@ Two labelling contracts inherited from the physics reviews:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,15 @@ from nullsim.outputs.styles import _ensure_headless_backend  # noqa: F401  # sid
 from matplotlib import pyplot as plt
 
 from nullsim.outputs import RunCollection, RunRecord
+
+# Same convergence contract the characterization_summary table applies to its
+# HDC columns. Imported rather than restated so the two cannot drift: a CCF
+# figure and a CCF table row must never disagree about whether the upstream
+# retune was accepted.
+from nullsim.outputs.tables import _characterization_payload_converged
 from nullsim.pipeline import register_plot
+
+_LOGGER = logging.getLogger(__name__)
 
 _COMPONENT_PREFIXES = ("characterization.hdc_ccf", "hdc_ccf")
 _IDENTIFYING_KEYS = frozenset(
@@ -46,10 +55,22 @@ def hdc_ccf(
     payload = None
     matched_record = None
     for record in collection.records:
-        payload = _find_payload(record)
-        if payload is not None:
-            matched_record = record
-            break
+        candidate = _find_payload(record)
+        if candidate is None:
+            continue
+        if not _upstream_converged(record, candidate):
+            _LOGGER.warning(
+                "hdc_ccf: skipping the figure for upstream spectro component "
+                "%r because its characterization optimization did not "
+                "converge; the CCF metrics describe a retune the pipeline "
+                "never accepted (the characterization_summary table masks the "
+                "matching columns for the same reason).",
+                candidate.get("upstream_spectro_component"),
+            )
+            continue
+        payload = candidate
+        matched_record = record
+        break
     if payload is None:
         return ()
 
@@ -112,6 +133,23 @@ def _find_payload(record: RunRecord) -> dict[str, Any] | None:
         if _IDENTIFYING_KEYS.issubset(value):
             return value
     return None
+
+
+def _upstream_converged(record: RunRecord, payload: dict[str, Any]) -> bool:
+    """Whether the spectro retune behind this CCF payload was accepted.
+
+    Payloads that do not name their upstream component, or name one that is not
+    on the state, cannot be checked -- those render, because suppressing a
+    figure we cannot prove is invalid would silently drop legitimate output.
+    """
+
+    upstream = payload.get("upstream_spectro_component")
+    if not isinstance(upstream, str):
+        return True
+    spectro = record.result.state.results.components.get(upstream)
+    if not isinstance(spectro, dict):
+        return True
+    return _characterization_payload_converged(spectro)
 
 
 def _plot_channel_spectra(ax: plt.Axes, payload: dict[str, Any]) -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -287,3 +289,78 @@ def test_plot_hdc_ccf_tolerates_nan_and_empty_scans() -> None:
 
     assert len(fig.axes) >= 4
     plt.close(fig)
+
+
+def _spectro_component(*, converged: bool) -> dict:
+    """Minimal spectro payload the shared convergence predicate can judge."""
+
+    return {
+        "optimization_success": converged,
+        "enforce_null_constraint": True,
+        "optimization_constraint_margin": 1.0e-6 if converged else -1.0,
+        "null_floor": 3.0e-5,
+    }
+
+
+def test_hdc_ccf_plot_skips_when_upstream_spectro_did_not_converge(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Same contract the characterization_summary table applies to its columns."""
+
+    payload = _payload()
+    payload["upstream_spectro_component"] = "characterization.spectro"
+    record = _record(
+        {
+            "characterization.spectro": _spectro_component(converged=False),
+            "characterization.hdc_ccf": payload,
+        },
+        tmp_path,
+    )
+    collection = RunCollection(
+        config=SimpleNamespace(), records=(record,), output_dir=tmp_path
+    )
+
+    with caplog.at_level(logging.WARNING):
+        written = hdc_ccf(collection, tmp_path, ("png",))
+
+    assert written == ()
+    assert not (tmp_path / "plots" / "hdc_ccf.png").exists()
+    assert "did not" in caplog.text and "converge" in caplog.text
+
+
+def test_hdc_ccf_plot_renders_when_upstream_spectro_converged(
+    tmp_path: Path,
+) -> None:
+    payload = _payload()
+    payload["upstream_spectro_component"] = "characterization.spectro"
+    record = _record(
+        {
+            "characterization.spectro": _spectro_component(converged=True),
+            "characterization.hdc_ccf": payload,
+        },
+        tmp_path,
+    )
+    collection = RunCollection(
+        config=SimpleNamespace(), records=(record,), output_dir=tmp_path
+    )
+
+    written = hdc_ccf(collection, tmp_path, ("png",))
+
+    assert (tmp_path / "plots" / "hdc_ccf.png") in written
+
+
+def test_hdc_ccf_plot_renders_when_upstream_cannot_be_identified(
+    tmp_path: Path,
+) -> None:
+    """No upstream key, or a name not on the state: render rather than hide."""
+
+    payload = _payload()
+    payload["upstream_spectro_component"] = "characterization.spectro.absent"
+    record = _record({"characterization.hdc_ccf": payload}, tmp_path)
+    collection = RunCollection(
+        config=SimpleNamespace(), records=(record,), output_dir=tmp_path
+    )
+
+    assert (tmp_path / "plots" / "hdc_ccf.png") in hdc_ccf(
+        collection, tmp_path, ("png",)
+    )
