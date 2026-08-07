@@ -40,7 +40,13 @@ def _context(tmp_path: Path) -> RunContext:
     )
 
 
-def _spectro_payload() -> dict[str, object]:
+def _spectro_payload(
+    *,
+    awg_throughput: float = 1.0,
+    free_spectral_range_fraction: float = 1.0,
+    dark_rate_hz_per_bin: float = 0.0,
+    with_fringe_tracking: bool | None = True,
+) -> dict[str, object]:
     """A synthetic ``characterization.spectro`` payload on a flat 8-bin band."""
 
     wl_um = np.linspace(_WL_MIN_UM, _WL_MAX_UM, _N_WAVELENGTHS)
@@ -58,7 +64,11 @@ def _spectro_payload() -> dict[str, object]:
         * _INTEGRATION_TIME_S
         / (2.0 * _SERVO_BW_HZ)
     )
-    return {
+    # Mirror awg_spectrum: the AWG throughput and the free-spectral-range
+    # fraction multiply every optical rate before binning, and dark is charged
+    # per bin with two bins per resolution element.
+    detected = awg_throughput * free_spectral_range_fraction
+    payload: dict[str, object] = {
         "wavelengths_m": tuple(float(w) * 1.0e-6 for w in wl_um),
         "detected_stellar_rate_by_wavelength_hz": stellar,
         "detected_stellar_rate_hz": stellar_total,
@@ -80,10 +90,25 @@ def _spectro_payload() -> dict[str, object]:
         "spectrograph": "awg",
         "awg_resolving_power": 3000.0,
         "awg_n_bins": 200,
+        "awg_total_planet_rate_hz": planet_rate_hz * detected,
+        "awg_total_leakage_rate_hz": leak_rate_hz * detected,
+        "awg_total_sky_rate_hz": (10.0 / _INTEGRATION_TIME_S) * detected,
+        "awg": {
+            "n_bins": 200,
+            "pixels_per_resolution_element": 2,
+            "dark_rate_hz_per_bin_total": dark_rate_hz_per_bin,
+            "throughput": awg_throughput,
+            "free_spectral_range_fraction": free_spectral_range_fraction,
+        },
     }
+    if with_fringe_tracking is not None:
+        payload["with_fringe_tracking"] = with_fringe_tracking
+    return payload
 
 
-def _state(*, with_spectro: bool = True) -> SimulationState:
+def _state(
+    *, with_spectro: bool = True, **payload_overrides: object
+) -> SimulationState:
     wavelengths_um = tuple(
         float(w) for w in np.linspace(_WL_MIN_UM, _WL_MAX_UM, _N_WAVELENGTHS)
     )
@@ -102,7 +127,8 @@ def _state(*, with_spectro: bool = True) -> SimulationState:
     if not with_spectro:
         return state
     results = state.results.add_component(
-        "characterization.spectro", _spectro_payload()
+        "characterization.spectro",
+        _spectro_payload(**payload_overrides),  # type: ignore[arg-type]
     )
     return replace(state, results=results)
 
@@ -135,27 +161,66 @@ def test_hdc_ccf_registers_stage_contract(tmp_path: Path) -> None:
 
 def test_hdc_ccf_publishes_expected_payload_keys(payload: dict[str, object]) -> None:
     expected = {
+        # Headline CCF budget.
         "ccf_snr",
         "ccf_snr_photon_limited",
+        "ccf_signal_counts",
+        "ccf_photon_var_counts",
+        "ccf_systematic_var_counts",
         "systematic_ccf_leakage",
         "ccf_systematic_rejection",
+        "self_subtraction_factor",
         "n_effective_lines",
         "n_channels_used",
+        "n_channels",
         "telluric_masked_fraction",
+        # Per-channel arrays.
+        "ccf_channel_centers_um",
+        "ccf_planet_rate_hz_per_channel",
+        "ccf_leak_rate_hz_per_channel",
+        "template_weights_per_channel",
+        # Scans.
         "snr_vs_resolving_power",
         "snr_vs_resolving_power_r",
         "snr_vs_rv",
         "snr_vs_rv_kms",
+        # Time and configuration.
         "integration_time_for_target_snr_s",
+        "integration_time_s",
+        "target_snr",
         "resolving_power_used",
-        "planet_template_provenance",
-        "star_template_provenance",
+        "resolving_power_source",
+        "analysis_grid_resolving_power",
+        "content_resolving_power",
+        "grid_oversampling",
+        "continuum_filter_width_res_elements",
+        "telluric_mask_threshold",
+        "planet_radial_velocity_kms",
+        # Detection budget and audit.
+        "detected_planet_rate_hz",
+        "detected_leak_rate_hz",
+        "sky_rate_hz_total",
+        "dark_rate_hz_per_channel",
+        "detection_budget_source",
+        "channel_band_coverage_fraction",
         "leak_normalization",
         "planet_normalization",
-        "self_subtraction_factor",
+        "eps_systematic_used",
+        "servo_bw_hz_used",
+        "with_fringe_tracking",
+        "systematic_branch_source",
+        "upstream_spectro_component",
+        # Provenance.
+        "planet_template_provenance",
+        "star_template_provenance",
+        "telluric_template_provenance",
         "ccf_model",
+        "snr_vs_resolving_power_model",
+        "snr_vs_rv_model",
+        "source_model",
     }
-    assert expected <= set(payload)
+    missing = expected - set(payload)
+    assert not missing, f"missing payload keys: {sorted(missing)}"
 
 
 def test_hdc_ccf_snr_is_finite_positive_and_photon_limit_bounds_it(
@@ -247,3 +312,173 @@ def test_hdc_ccf_rejects_unknown_template_name(tmp_path: Path) -> None:
     stage = _stage(_context(tmp_path), planet_template="jupiter")
     with pytest.raises((KeyError, ValueError, FileNotFoundError)):
         stage.apply(_state())
+
+
+def test_hdc_ccf_external_dependencies_fall_back_when_file_unreadable(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "not_there" / "planet.csv"
+    stage = _stage(_context(tmp_path), planet_template=str(missing))
+    dependencies = stage.external_dependencies()
+
+    planet = next(
+        dep
+        for dep in dependencies
+        if dep.source == "characterization.hdc_ccf.planet_template"
+    )
+    assert planet.content_hash is None
+    assert Path(planet.path) == missing
+    # Every readable template still gets its hash.
+    star_candidates = [
+        dep for dep in dependencies if "star_template_candidate" in dep.source
+    ]
+    assert len(star_candidates) == 3
+    assert all(dep.content_hash is not None for dep in star_candidates)
+
+
+def test_hdc_ccf_normalizes_to_awg_detected_rates(tmp_path: Path) -> None:
+    """AWG throughput and FSR losses must reach the CCF budget."""
+
+    full = _stage(_context(tmp_path), snr_vs_r_points=0, rv_scan_points=0).apply(
+        _state()
+    )
+    lossy = _stage(_context(tmp_path), snr_vs_r_points=0, rv_scan_points=0).apply(
+        _state(awg_throughput=0.5, free_spectral_range_fraction=0.5)
+    )
+    full_payload = full.results.components["characterization.hdc_ccf"]
+    lossy_payload = lossy.results.components["characterization.hdc_ccf"]
+
+    # 0.5 throughput x 0.5 FSR = a quarter of the photons on the detector.
+    assert float(lossy_payload["detected_planet_rate_hz"]) == pytest.approx(
+        0.25 * float(full_payload["detected_planet_rate_hz"])
+    )
+    assert float(lossy_payload["detected_leak_rate_hz"]) == pytest.approx(
+        0.25 * float(full_payload["detected_leak_rate_hz"])
+    )
+    assert float(lossy_payload["ccf_snr"]) < float(full_payload["ccf_snr"])
+
+
+def test_hdc_ccf_zero_awg_throughput_gives_no_signal(tmp_path: Path) -> None:
+    result = _stage(
+        _context(tmp_path), snr_vs_r_points=0, rv_scan_points=0
+    ).apply(_state(awg_throughput=0.0))
+    payload = result.results.components["characterization.hdc_ccf"]
+
+    assert float(payload["detected_planet_rate_hz"]) == 0.0
+    assert float(payload["ccf_snr"]) == 0.0
+    assert float(payload["ccf_snr_photon_limited"]) == 0.0
+
+
+def test_hdc_ccf_dark_is_fixed_per_channel_not_diluted(tmp_path: Path) -> None:
+    """AWG dark is per detector bin: two bins per resolution element."""
+
+    result = _stage(_context(tmp_path), snr_vs_r_points=0, rv_scan_points=0).apply(
+        _state(dark_rate_hz_per_bin=0.25)
+    )
+    payload = result.results.components["characterization.hdc_ccf"]
+    assert float(payload["dark_rate_hz_per_channel"]) == pytest.approx(0.5)
+
+
+def test_hdc_ccf_channels_stay_inside_the_detector_band(
+    payload: dict[str, object],
+) -> None:
+    """No partial channel hanging off the red end of the band."""
+
+    coverage = float(payload["channel_band_coverage_fraction"])
+    assert 0.99 < coverage <= 1.0
+    centers = np.asarray(payload["ccf_channel_centers_um"], dtype=np.float64)
+    assert centers[0] >= _WL_MIN_UM - 0.02
+    assert centers[-1] <= _WL_MAX_UM + 0.02
+
+
+def test_hdc_ccf_band_totals_survive_the_telluric_shape(tmp_path: Path) -> None:
+    """Telluric is a shape: the published detected totals must be preserved.
+
+    The upstream rates already carry a band-averaged atmospheric transmission
+    from ``atmosphere.kolmogorov``, so the template may only add line
+    structure, not a second broadband loss.
+    """
+
+    result = _stage(
+        _context(tmp_path),
+        telluric_template="maunakea",
+        snr_vs_r_points=0,
+        rv_scan_points=0,
+    ).apply(_state())
+    payload = result.results.components["characterization.hdc_ccf"]
+
+    planet_total = float(
+        np.sum(np.asarray(payload["ccf_planet_rate_hz_per_channel"]))
+    )
+    leak_total = float(np.sum(np.asarray(payload["ccf_leak_rate_hz_per_channel"])))
+    assert planet_total == pytest.approx(
+        float(payload["detected_planet_rate_hz"]), rel=0.02
+    )
+    assert leak_total == pytest.approx(
+        float(payload["detected_leak_rate_hz"]), rel=0.02
+    )
+    assert float(payload["leak_normalization"]) == pytest.approx(1.0, rel=0.05)
+    assert float(payload["planet_normalization"]) == pytest.approx(1.0, rel=0.05)
+
+
+def test_hdc_ccf_r_scan_reaches_the_template_resolution(tmp_path: Path) -> None:
+    result = _stage(
+        _context(tmp_path), snr_vs_r_points=8, rv_scan_points=0
+    ).apply(_state())
+    payload = result.results.components["characterization.hdc_ccf"]
+
+    r_axis = np.asarray(payload["snr_vs_resolving_power_r"], dtype=np.float64)
+    assert r_axis[0] == pytest.approx(100.0)
+    assert r_axis[-1] == pytest.approx(30_000.0)
+    assert np.all(np.isfinite(payload["snr_vs_resolving_power"]))
+
+
+def test_hdc_ccf_headline_snr_is_independent_of_the_diagnostic_scans(
+    tmp_path: Path,
+) -> None:
+    """Turning the R or RV scans on must not move the headline number."""
+
+    state = _state()
+    without = _stage(
+        _context(tmp_path), snr_vs_r_points=0, rv_scan_points=0
+    ).apply(state)
+    with_scans = _stage(
+        _context(tmp_path), snr_vs_r_points=8, rv_scan_points=21
+    ).apply(state)
+
+    left = without.results.components["characterization.hdc_ccf"]
+    right = with_scans.results.components["characterization.hdc_ccf"]
+    for key in ("ccf_snr", "systematic_ccf_leakage", "planet_normalization"):
+        assert left[key] == right[key]
+
+
+def test_hdc_ccf_reads_with_fringe_tracking_from_the_payload(
+    tmp_path: Path,
+) -> None:
+    declared = _stage(_context(tmp_path), snr_vs_r_points=0, rv_scan_points=0).apply(
+        _state(with_fringe_tracking=False)
+    )
+    payload = declared.results.components["characterization.hdc_ccf"]
+    assert payload["with_fringe_tracking"] is False
+    assert "payload key" in str(payload["systematic_branch_source"])
+
+    inferred = _stage(_context(tmp_path), snr_vs_r_points=0, rv_scan_points=0).apply(
+        _state(with_fringe_tracking=None)
+    )
+    inferred_payload = inferred.results.components["characterization.hdc_ccf"]
+    assert inferred_payload["with_fringe_tracking"] is True
+    assert "fallback inference" in str(inferred_payload["systematic_branch_source"])
+
+
+def test_hdc_ccf_rv_statistic_matches_photon_limited_snr_at_true_rv(
+    payload: dict[str, object],
+) -> None:
+    """The RV statistic is a matched-filter score, not a bounded cosine."""
+
+    rv_kms = np.asarray(payload["snr_vs_rv_kms"], dtype=np.float64)
+    ccf = np.asarray(payload["snr_vs_rv"], dtype=np.float64)
+    at_true_rv = float(ccf[int(np.argmin(np.abs(rv_kms - _PLANET_RV_KMS)))])
+    assert at_true_rv == pytest.approx(
+        float(payload["ccf_snr_photon_limited"]), rel=1e-6
+    )
+    assert "matched-filter score" in str(payload["snr_vs_rv_model"])

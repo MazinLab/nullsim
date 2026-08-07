@@ -22,16 +22,30 @@ sqrt(N_lines) scaling follow Wang, Mawet, Ruane, Hu & Benneke 2017, AJ 153,
 Model choices worth knowing before reading the payload:
 
 - The planet spectrum is reflected starlight: ``contrast x stellar_flux x
-  albedo x throughput x telluric``, Doppler shifted as a whole by
-  ``scene.planet_radial_velocity_kms``. It therefore carries the stellar line
-  forest as well as the planet's own albedo features.
-- The leaked stellar spectrum is ``leak_fraction x stellar_flux x telluric``
-  at zero radial velocity. Its *mean* never contributes signal (the bright
-  port measures it); what it contributes is shot noise and, through the
+  chip throughput x planet-to-star coupling ratio x albedo x telluric shape``,
+  Doppler shifted as a whole by ``scene.planet_radial_velocity_kms``. It
+  therefore carries the stellar line forest as well as the planet's own albedo
+  features.
+- The leaked stellar spectrum is ``leak_fraction x stellar_flux x telluric
+  shape`` at zero radial velocity. Its *mean* never contributes signal (the
+  bright port measures it); what it contributes is shot noise and, through the
   null-instability amplitude ``eps_systematic``, the systematic term. The
   template projection of the filtered leak (``systematic_ccf_leakage``) is the
   CCF-space replacement for the broadband leakage rate, and its ratio to the
   raw leak (``ccf_systematic_rejection``) is the HDC systematic gain.
+- Both are renormalized to the band totals actually *detected* behind the
+  spectrograph. For an AWG that means the ``awg_total_*`` rates, which already
+  carry the AWG throughput and free-spectral-range losses -- normalizing to
+  the pre-AWG optical rates would credit the CCF with photons the instrument
+  never delivered.
+- Telluric absorption enters as a unit-band-mean *shape*, not an absolute
+  transmission. The broadband atmospheric loss is already in the upstream
+  rates (``atmosphere.kolmogorov`` folds a band-averaged transmission into
+  ``throughput.transmission_fraction``, which the spectro stage multiplies
+  into its detected stellar rate); what that single scalar cannot carry is
+  line structure, and that is exactly what the template adds. The absolute
+  transmission is kept separately, convolved through the instrument
+  line-spread function, for the channel mask.
 - The radial-velocity scan therefore correlates trial templates against the
   *leak-subtracted* dark-port residual, with the leak's shot noise retained in
   the per-channel variance. Without that subtraction the statistic would peak
@@ -101,12 +115,6 @@ _REQUIRED_SPECTRO_KEYS = frozenset(
 _DEFAULT_PLANET_RV_KMS = 30.0
 _R_SCAN_MIN = 100.0
 _R_SCAN_MAX = 30_000.0
-# Templates are only ever point-sampled onto the analysis grid after being
-# smoothed to at most this fraction of the analysis grid's resolving power,
-# and the R scan never asks for more than this fraction of the surviving
-# content resolution -- a matched filter cannot be evaluated at a resolving
-# power the analysis grid does not resolve.
-_R_SCAN_CONTENT_FRACTION = 0.5
 _STELLAR_TEMPLATE_BY_TYPE = {"G": "G", "K": "K", "M": "M"}
 _RESOLVING_POWER_RE = re.compile(r"resolving_power\s*:\s*([0-9.eE+]+)")
 
@@ -154,33 +162,31 @@ class HdcCcfStage(BaseStage):
             spectro, params.resolving_power
         )
         spectro_integration_time_s = _spectro_integration_time_s(spectro)
-        sky_rate_hz, dark_rate_hz = _background_rates_hz(
+        detection_budget = _DetectionBudget.from_spectro(
             spectro, spectro_integration_time_s
         )
         eps_systematic = float(spectro["eps_systematic"])
         servo_bw_hz = float(spectro["servo_bw_hz"])
-        leakage_rate_hz = float(spectro["leakage_rate_hz"])
-        planet_signal_rate_hz = float(spectro["planet_signal_rate_hz"])
-        with_fringe_tracking, systematic_branch_source = _infer_fringe_tracking(
+        with_fringe_tracking, systematic_branch_source = _resolve_fringe_tracking(
             spectro,
             eps_systematic=eps_systematic,
-            leakage_rate_hz=leakage_rate_hz,
+            leakage_rate_hz=float(spectro["leakage_rate_hz"]),
             integration_time_s=spectro_integration_time_s,
         )
 
         planet_rv_kms = _planet_radial_velocity_kms(state)
-        r_grid = float(params.grid_oversampling) * resolving_power
-
-        # The coarsest channel grid the run will build sets how far past the
-        # band the analysis grid has to reach, because a constant-R channel
-        # grid overshoots the band edge by up to one resolution element.
-        r_min_used = (
-            min(resolving_power, _R_SCAN_MIN)
-            if params.snr_vs_r_points > 1
-            else resolving_power
+        # One analysis grid for the whole run, sized for the finest resolving
+        # power any part of it could ask for. Sizing it off the baseline R
+        # alone would cap the R scan at a fraction of its requested range; and
+        # the ceiling is deliberately the fixed _R_SCAN_MAX rather than
+        # "_R_SCAN_MAX only when the scan is on", so that turning a diagnostic
+        # scan on or off cannot move the headline ccf_snr.
+        r_grid = float(params.grid_oversampling) * max(
+            resolving_power, _R_SCAN_MAX
         )
-        lambda_max_grid_um = band.lambda_max_um * math.exp(1.5 / r_min_used)
-        grid_um = constant_r_grid(band.lambda_min_um, lambda_max_grid_um, r_grid)
+        grid_um = constant_r_grid(
+            band.lambda_min_um, band.lambda_max_um, r_grid
+        )
 
         max_shift_kms = abs(planet_rv_kms) + float(params.rv_scan_halfwidth_kms)
         templates = _Templates.load(
@@ -188,19 +194,19 @@ class HdcCcfStage(BaseStage):
             state=state,
             config_dir=_config_dir_from_context(self.context),
             lambda_min_um=band.lambda_min_um,
-            lambda_max_um=lambda_max_grid_um,
+            lambda_max_um=float(grid_um[-1]),
             max_shift_kms=max_shift_kms,
         )
         content_resolving_power = templates.content_resolving_power(r_grid)
-        if content_resolving_power <= resolving_power:
+        if content_resolving_power < resolving_power:
             raise ValueError(
                 "characterization.hdc_ccf: the spectral templates only resolve "
-                f"R={content_resolving_power:.4g}, which does not exceed the "
-                f"instrument R={resolving_power:.4g}. Raise grid_oversampling "
-                "or use finer template snapshots."
+                f"R={content_resolving_power:.4g}, below the instrument "
+                f"R={resolving_power:.4g}. Raise grid_oversampling or use finer "
+                "template snapshots."
             )
         # Only now is the cap known: the scan cannot ask for a resolving power
-        # the templates and the analysis grid do not jointly resolve.
+        # the templates and the analysis grid do not jointly carry.
         r_scan = _r_scan_values(params.snr_vs_r_points, content_resolving_power)
 
         densities = _RateDensities.build(
@@ -209,8 +215,8 @@ class HdcCcfStage(BaseStage):
             templates=templates,
             r_grid=r_grid,
             planet_contrast=_planet_contrast(state),
-            planet_signal_rate_hz=planet_signal_rate_hz,
-            leakage_rate_hz=leakage_rate_hz,
+            planet_signal_rate_hz=detection_budget.planet_rate_hz,
+            leakage_rate_hz=detection_budget.leak_rate_hz,
             planet_rv_kms=planet_rv_kms,
         )
 
@@ -219,11 +225,7 @@ class HdcCcfStage(BaseStage):
             grid_um=grid_um,
             densities=densities,
             content_resolving_power=content_resolving_power,
-            sky_rate_hz=sky_rate_hz,
-            dark_rate_hz=dark_rate_hz,
-            dark_reference_n_bins=_dark_reference_n_bins(
-                spectro, band, resolving_power
-            ),
+            budget=detection_budget,
         )
         channels = channel_builder.channels(resolving_power, planet_rv_kms)
         telluric_per_channel = channel_builder.telluric_per_channel(resolving_power)
@@ -269,8 +271,10 @@ class HdcCcfStage(BaseStage):
             "ccf_systematic_var_counts": float(budget.systematic_var_counts),
             "systematic_ccf_leakage": float(budget.systematic_ccf_leakage),
             "ccf_systematic_rejection": (
-                float(budget.systematic_ccf_leakage / leakage_rate_hz)
-                if leakage_rate_hz > 0.0
+                float(
+                    budget.systematic_ccf_leakage / detection_budget.leak_rate_hz
+                )
+                if detection_budget.leak_rate_hz > 0.0
                 else 0.0
             ),
             "self_subtraction_factor": float(budget.self_subtraction_factor),
@@ -320,8 +324,16 @@ class HdcCcfStage(BaseStage):
             "servo_bw_hz_used": servo_bw_hz,
             "with_fringe_tracking": bool(with_fringe_tracking),
             "systematic_branch_source": systematic_branch_source,
-            "sky_rate_hz_total": float(sky_rate_hz),
-            "dark_rate_hz_total": float(dark_rate_hz),
+            "detected_planet_rate_hz": float(detection_budget.planet_rate_hz),
+            "detected_leak_rate_hz": float(detection_budget.leak_rate_hz),
+            "sky_rate_hz_total": float(detection_budget.sky_rate_hz),
+            "dark_rate_hz_per_channel": float(
+                detection_budget.dark_rate_hz_per_channel
+            ),
+            "detection_budget_source": detection_budget.source,
+            "channel_band_coverage_fraction": (
+                channel_builder.band_coverage_fraction(resolving_power)
+            ),
             "upstream_spectro_component": spectro_name,
             "planet_template_provenance": templates.planet.provenance,
             "star_template_provenance": templates.star.provenance,
@@ -334,24 +346,30 @@ class HdcCcfStage(BaseStage):
             "snr_vs_resolving_power_model": (
                 "matched-filter CCF SNR rebuilt at each resolving power: new "
                 "constant-R channel grid, re-convolved and re-channelized "
-                "planet/leak densities, sky split over the new channel count, "
-                "dark held fixed per channel. Capped at "
-                f"{_R_SCAN_CONTENT_FRACTION:g} x the template content "
-                "resolving power, above which the analysis grid no longer "
-                "resolves the instrument line-spread function."
+                "planet/leak densities, sky reallocated across the new channel "
+                "widths, dark held fixed per channel so its band total grows "
+                "with the channel count. Capped at the resolving power the "
+                "templates and the analysis grid jointly carry."
             ),
             "snr_vs_rv_model": (
-                "dimensionless normalized detection statistic (a Cauchy-Schwarz "
-                "cosine in the inverse-variance metric, not an SNR): trial "
-                "templates at each radial velocity correlated against the "
-                "leak-subtracted dark-port residual, with the leak's shot "
-                "noise retained in the per-channel variance."
+                "Unbounded matched-filter score in sigma-like units, NOT a "
+                "bounded correlation coefficient: "
+                "sqrt(t) * sum_i w_i(rv) Dtilde_i / sqrt(sum_i w_i(rv)^2 v_i) "
+                "with w_i(rv) = m_i Ttilde_i(rv) / v_i. At the true radial "
+                "velocity, with the leak-subtracted data used here, it equals "
+                "the photon-limited matched-filter SNR "
+                "(ccf_snr_photon_limited). Trial templates at each radial "
+                "velocity are correlated against the leak-subtracted dark-port "
+                "residual, with the leak's shot noise retained in the "
+                "per-channel variance."
             ),
             "source_model": (
                 "nullsim characterization.hdc_ccf: nullsim.physics.hdc "
-                "matched-filter CCF over packaged nullsim.physics.spectra "
-                "template snapshots, driven by the upstream "
-                "characterization.spectro per-wavelength budgets."
+                "matched-filter CCF over nullsim.physics.spectra templates "
+                "(packaged snapshots by name, or user CSVs by path -- see the "
+                "per-template provenance strings for what was actually used), "
+                "driven by the upstream characterization.spectro "
+                "per-wavelength budgets and its spectrograph detection budget."
             ),
         }
         results = state.results.add_component(component_name, payload)
@@ -420,12 +438,21 @@ _CCF_MODEL = (
     "planets out of the noise at fixed nuller performance, changing no null "
     "depth, throughput, or photon rate published upstream by "
     "characterization.spectro. Planet spectrum = contrast x stellar flux x "
-    "albedo x chip throughput x telluric, Doppler shifted by "
-    "scene.planet_radial_velocity_kms; leaked starlight = leak fraction x "
-    "stellar flux x telluric at zero radial velocity. Both are continuum "
-    "filtered by a running median before the template-weighted sum. "
-    "ccf_systematic_rejection = systematic_ccf_leakage / leakage_rate_hz is "
-    "the template-projected fraction of the raw dark-port leak: the "
+    "chip planet throughput x planet-to-star coupling ratio "
+    "(spectro_planet_to_star_ratio_per_wavelength) x albedo x telluric shape, "
+    "Doppler shifted as a whole by scene.planet_radial_velocity_kms; leaked "
+    "starlight = leak fraction (static leak + realized floor) x stellar flux "
+    "x telluric shape at zero radial velocity. Both are renormalized so their "
+    "band integrals equal the DETECTED band totals behind the spectrograph "
+    "(see detection_budget_source), then continuum filtered by a running "
+    "median before the template-weighted sum. Telluric absorption enters as a "
+    "unit-band-mean SHAPE, not an absolute transmission, because the upstream "
+    "rates already carry a band-averaged atmospheric transmission from "
+    "atmosphere.kolmogorov; the template supplies only the line structure that "
+    "the single upstream scalar cannot. The absolute (unnormalized) "
+    "transmission is what the telluric channel mask thresholds on. "
+    "ccf_systematic_rejection = systematic_ccf_leakage / detected leak rate is "
+    "the template-projected fraction of the dark-port leak: the "
     "null-instability amplitude eps_systematic multiplies that projection "
     "rather than the whole band leak, which is where the HDC systematic gain "
     "comes from."
@@ -618,7 +645,8 @@ class _RateDensities:
 
     __slots__ = (
         "grid_um",
-        "telluric",
+        "telluric_transmission",
+        "telluric_shape",
         "has_telluric",
         "leak_density",
         "leak_normalization",
@@ -630,7 +658,8 @@ class _RateDensities:
         self,
         *,
         grid_um: NDArray[np.float64],
-        telluric: NDArray[np.float64],
+        telluric_transmission: NDArray[np.float64],
+        telluric_shape: NDArray[np.float64],
         has_telluric: bool,
         leak_density: NDArray[np.float64],
         leak_normalization: float,
@@ -638,7 +667,12 @@ class _RateDensities:
         planet_density_at_rv: Any,
     ) -> None:
         self.grid_um = grid_um
-        self.telluric = telluric
+        # Absolute transmission in [0, 1]: what the telluric mask thresholds on.
+        self.telluric_transmission = telluric_transmission
+        # The same curve divided by its band mean: what multiplies the rate
+        # densities, so it adds line structure without re-applying the
+        # broadband loss the upstream throughput already carries.
+        self.telluric_shape = telluric_shape
         self.has_telluric = has_telluric
         self.leak_density = leak_density
         self.leak_normalization = leak_normalization
@@ -679,27 +713,6 @@ class _RateDensities:
         throughput = np.interp(grid_um, band.wavelength_um, band.planet_throughput)
         leak_fraction = np.interp(grid_um, band.wavelength_um, band.leak_fraction)
 
-        star_shape = _shape_on_grid(templates.star, grid_um, r_grid, 0.0)
-        star_norm = _weighted_mean(star_shape, stellar_density)
-        star_shape = star_shape / star_norm
-        stellar_density = stellar_density * star_shape
-
-        telluric = (
-            _shape_on_grid(templates.telluric, grid_um, r_grid, 0.0)
-            if templates.telluric is not None
-            else np.ones_like(grid_um)
-        )
-        telluric = np.clip(telluric, 0.0, 1.0)
-
-        leak_density_raw = stellar_density * leak_fraction
-        leak_normalization = _normalization(
-            leakage_rate_hz, leak_density_raw, grid_um
-        )
-        leak_density = leak_density_raw * leak_normalization * telluric
-
-        albedo_rest = _shape_on_grid(templates.planet, grid_um, r_grid, 0.0)
-        albedo_norm = _weighted_mean(albedo_rest, stellar_density * throughput)
-
         coarse_density = np.where(
             in_band,
             np.interp(
@@ -708,6 +721,59 @@ class _RateDensities:
                 band.stellar_rate_hz / band.bin_width_um,
             ),
             0.0,
+        )
+
+        star_shape = _shape_on_grid(templates.star, grid_um, r_grid, 0.0)
+        star_norm = _weighted_mean(star_shape, coarse_density, grid_um)
+        star_shape = star_shape / star_norm
+        stellar_density = coarse_density * star_shape
+
+        # Atmospheric transmission enters this stage twice over, and the two
+        # roles need different normalizations.
+        #
+        # The broadband loss is ALREADY in the upstream rates:
+        # ``atmosphere.kolmogorov`` folds a band-averaged transmission into
+        # ``throughput.transmission_fraction``, which
+        # ``spectro._detected_stellar_rate_by_wavelength_hz`` multiplies into
+        # ``detected_stellar_rate_by_wavelength_hz`` -- and therefore into the
+        # published ``planet_signal_rate_hz`` and ``leakage_rate_hz``. What the
+        # upstream factor does NOT carry is line structure: it is one scalar
+        # broadcast to every wavelength bin. So the template contributes only
+        # the structure, as a shape normalized to unit band mean, multiplied in
+        # BEFORE renormalization. The band totals stay equal to the published
+        # detected rates, the normalization factors stay a truthful audit of
+        # the interpolation, and the broadband transmission is not counted
+        # twice.
+        #
+        # The mask, by contrast, thresholds on ABSOLUTE transmission, so it
+        # keeps the raw curve.
+        telluric_transmission = (
+            np.clip(_shape_on_grid(templates.telluric, grid_um, r_grid, 0.0), 0.0, 1.0)
+            if templates.telluric is not None
+            else np.ones_like(grid_um)
+        )
+        if templates.telluric is not None:
+            telluric_shape = telluric_transmission / _weighted_mean(
+                telluric_transmission, stellar_density, grid_um
+            )
+        else:
+            telluric_shape = np.ones_like(grid_um)
+
+        leak_density_raw = stellar_density * leak_fraction * telluric_shape
+        leak_normalization = _normalization(
+            leakage_rate_hz, leak_density_raw, grid_um
+        )
+        leak_density = leak_density_raw * leak_normalization
+
+        albedo_rest = _shape_on_grid(templates.planet, grid_um, r_grid, 0.0)
+        # Weight the albedo by everything it actually multiplies, telluric shape
+        # included. For an Earth analogue seen through Earth's atmosphere the
+        # albedo dips and the telluric dips are the same molecules, so leaving
+        # the telluric out of these weights would leave a real ~10% correlation
+        # for the renormalization to absorb -- and the published normalization
+        # factor is supposed to audit interpolation error, not shape overlap.
+        albedo_norm = _weighted_mean(
+            albedo_rest, stellar_density * throughput * telluric_shape, grid_um
         )
 
         def planet_density_raw(rv_kms: float) -> NDArray[np.float64]:
@@ -725,6 +791,7 @@ class _RateDensities:
                 * throughput
                 * albedo
                 / albedo_norm
+                * telluric_shape
             )
 
         planet_normalization = _normalization(
@@ -732,11 +799,12 @@ class _RateDensities:
         )
 
         def planet_density(rv_kms: float) -> NDArray[np.float64]:
-            return planet_density_raw(rv_kms) * planet_normalization * telluric
+            return planet_density_raw(rv_kms) * planet_normalization
 
         return cls(
             grid_um=grid_um,
-            telluric=telluric,
+            telluric_transmission=telluric_transmission,
+            telluric_shape=telluric_shape,
             has_telluric=templates.telluric is not None,
             leak_density=leak_density,
             leak_normalization=leak_normalization,
@@ -753,9 +821,7 @@ class _ChannelBuilder:
         "grid_um",
         "densities",
         "content_resolving_power",
-        "sky_rate_hz",
-        "dark_rate_hz",
-        "dark_reference_n_bins",
+        "budget",
     )
 
     def __init__(
@@ -765,37 +831,77 @@ class _ChannelBuilder:
         grid_um: NDArray[np.float64],
         densities: _RateDensities,
         content_resolving_power: float,
-        sky_rate_hz: float,
-        dark_rate_hz: float,
-        dark_reference_n_bins: int,
+        budget: _DetectionBudget,
     ) -> None:
         self.band = band
         self.grid_um = grid_um
         self.densities = densities
         self.content_resolving_power = content_resolving_power
-        self.sky_rate_hz = sky_rate_hz
-        self.dark_rate_hz = dark_rate_hz
-        self.dark_reference_n_bins = dark_reference_n_bins
+        self.budget = budget
 
     def edges(self, resolving_power: float) -> NDArray[np.float64]:
-        return build_channel_edges(
+        """Channel edges that stay inside the detector band.
+
+        ``constant_r_grid`` overshoots the top of the band by up to one
+        resolution element. A channel that only partly overlaps the band is
+        not a usable resolution element -- its sources would be zero-windowed
+        over the uncovered part while its sky and dark allocations stayed
+        whole -- so the partial channel is dropped rather than clipped. What
+        that costs is reported as ``channel_band_coverage_fraction``.
+        """
+
+        edges = build_channel_edges(
             self.band.lambda_min_um, self.band.lambda_max_um, resolving_power
+        )
+        limit = self.band.lambda_max_um * (1.0 + 1.0e-12)
+        while edges.size > 2 and edges[-1] > limit:
+            edges = edges[:-1]
+        if edges.size < 2 or edges[-1] > limit:
+            raise ValueError(
+                "characterization.hdc_ccf: the detector band "
+                f"[{self.band.lambda_min_um:.4g}, {self.band.lambda_max_um:.4g}] "
+                f"um is narrower than one resolution element at R="
+                f"{resolving_power:.4g}; there is no usable channel to build."
+            )
+        return edges
+
+    def band_coverage_fraction(self, resolving_power: float) -> float:
+        """Fraction of the detector band the whole channels actually tile."""
+
+        edges = self.edges(resolving_power)
+        return float(
+            (edges[-1] - edges[0])
+            / (self.band.lambda_max_um - self.band.lambda_min_um)
         )
 
     def telluric_per_channel(
         self, resolving_power: float
     ) -> NDArray[np.float64] | None:
+        """Per-channel telluric transmission, seen through the instrument LSF.
+
+        The mask has to describe the transmission the *instrument* sees, so
+        the raw curve goes through the same line-spread function as the rates
+        before it is bin-averaged. Masking on the unconvolved curve would
+        threshold structure the spectrograph cannot resolve.
+        """
+
         # ``None`` means "no telluric mask at all", which is what
         # matched_filter_ccf wants for a space config or a unit-transmission
         # atmosphere; anything else would mask on an all-ones array.
         if not self.densities.has_telluric:
             return None
+        edges = self.edges(resolving_power)
+        transmission = self.densities.telluric_transmission
+        if resolving_power < self.content_resolving_power:
+            transmission = convolve_to_resolving_power(
+                self.grid_um,
+                transmission,
+                resolving_power,
+                r_in=self.content_resolving_power,
+            )
+        # Bin MEANS, not integrals: this is a transmission, not a rate.
         return np.clip(
-            resample_flux_conserving(
-                self.grid_um, self.densities.telluric, self.edges(resolving_power)
-            ),
-            0.0,
-            1.0,
+            resample_flux_conserving(self.grid_um, transmission, edges), 0.0, 1.0
         )
 
     def channels(
@@ -823,17 +929,21 @@ class _ChannelBuilder:
         leak = self._channelize(
             self.densities.leak_density, edges, resolving_power
         )
+        # Sky is a spectrally flat surface brightness, so its per-channel share
+        # follows the channel widths; on a log channel grid those are not equal.
+        # Only the whole channels inside the band are illuminated, so the
+        # allocation is over the tiled span, not the nominal band.
+        widths = np.diff(edges)
+        sky = self.budget.sky_rate_hz * widths / float(np.sum(widths))
         return ChannelSpectra(
             channel_centers_um=_channel_centers(edges),
             channel_edges_um=edges,
             planet_rate_hz=planet,
             leak_rate_hz=leak,
-            sky_rate_hz=np.full(
-                n_channels, self.sky_rate_hz / n_channels, dtype=np.float64
-            ),
+            sky_rate_hz=sky,
             dark_rate_hz=np.full(
                 n_channels,
-                self.dark_rate_hz / self.dark_reference_n_bins,
+                self.budget.dark_rate_hz_per_channel,
                 dtype=np.float64,
             ),
         )
@@ -844,14 +954,25 @@ class _ChannelBuilder:
         edges: NDArray[np.float64],
         resolving_power: float,
     ) -> NDArray[np.float64]:
-        return _clip_tiny_negatives(
-            channelize(
-                self.grid_um,
-                density,
-                edges,
-                resolving_power,
-                r_in=self.content_resolving_power,
+        if resolving_power < self.content_resolving_power:
+            return _clip_tiny_negatives(
+                channelize(
+                    self.grid_um,
+                    density,
+                    edges,
+                    resolving_power,
+                    r_in=self.content_resolving_power,
+                )
             )
+        # At (or beyond) the resolution the templates carry there is no further
+        # broadening to apply -- the template's own line-spread function is
+        # already the instrument's -- so bin-average directly. This is exactly
+        # ``channelize`` minus a convolution by a zero-width kernel, and it lets
+        # the R scan reach the template resolution instead of stopping short of
+        # it on ``convolve_to_resolving_power``'s strict r_in > r_out guard.
+        return _clip_tiny_negatives(
+            resample_flux_conserving(self.grid_um, density, edges)
+            * np.diff(edges)
         )
 
 
@@ -987,56 +1108,157 @@ def _spectro_integration_time_s(spectro: dict[str, Any]) -> float:
     )
 
 
-def _background_rates_hz(
-    spectro: dict[str, Any], integration_time_s: float
-) -> tuple[float, float]:
-    """Band-total sky and dark rates in Hz from the published count budgets."""
+class _DetectionBudget:
+    """Band totals as actually *detected* behind the spectrograph.
 
-    sky_counts = float(spectro.get("Sky", 0.0) or 0.0)
-    dark_counts = float(spectro.get("D", 0.0) or 0.0)
-    return (
-        max(sky_counts, 0.0) / integration_time_s,
-        max(dark_counts, 0.0) / integration_time_s,
-    )
+    ``characterization.spectro`` publishes ``planet_signal_rate_hz`` and
+    ``leakage_rate_hz`` as the optical rates *entering* the spectrograph. For
+    an AWG those are not what lands on the detector: ``awg_spectrum`` applies
+    the AWG throughput and the free-spectral-range fraction to every optical
+    rate before binning (``physics/spectroscopy.py``). Normalizing the HDC
+    densities to the pre-AWG rates would hand the cross-correlation photons
+    the instrument never delivered -- an ``awg_throughput`` of zero would still
+    produce a positive CCF SNR. So the AWG branch normalizes to the published
+    ``awg_total_*`` detected rates instead.
 
-
-def _dark_reference_n_bins(
-    spectro: dict[str, Any], band: _CoarseBand, resolving_power: float
-) -> int:
-    """Channel count the published dark budget was spread over.
-
-    Dark counts are per detector pixel, so the *per channel* dark rate is what
-    is physically fixed: the band total grows with the channel count. The AWG
-    payload states its bin count directly; otherwise fall back to the channel
-    count at the working resolving power.
+    Dark current does not disperse: it is fixed per detector *bin*, so the per
+    channel dark rate is the invariant and the band total grows with the
+    channel count. One channel here is one resolution element, which is
+    ``pixels_per_resolution_element`` AWG bins wide.
     """
 
-    n_bins = spectro.get("awg_n_bins")
-    if n_bins is not None and int(n_bins) > 0:
-        return int(n_bins)
-    return max(
-        build_channel_edges(
-            band.lambda_min_um, band.lambda_max_um, resolving_power
-        ).size
-        - 1,
-        1,
+    __slots__ = (
+        "planet_rate_hz",
+        "leak_rate_hz",
+        "sky_rate_hz",
+        "dark_rate_hz_per_channel",
+        "source",
     )
 
+    def __init__(
+        self,
+        *,
+        planet_rate_hz: float,
+        leak_rate_hz: float,
+        sky_rate_hz: float,
+        dark_rate_hz_per_channel: float,
+        source: str,
+    ) -> None:
+        self.planet_rate_hz = planet_rate_hz
+        self.leak_rate_hz = leak_rate_hz
+        self.sky_rate_hz = sky_rate_hz
+        self.dark_rate_hz_per_channel = dark_rate_hz_per_channel
+        self.source = source
 
-def _infer_fringe_tracking(
+    @classmethod
+    def from_spectro(
+        cls, spectro: dict[str, Any], integration_time_s: float
+    ) -> _DetectionBudget:
+        spectrograph = str(spectro.get("spectrograph", "awg")).lower()
+        if spectrograph == "mkid":
+            return cls._from_mkid(spectro, integration_time_s)
+        return cls._from_awg(spectro, integration_time_s)
+
+    @classmethod
+    def _from_awg(
+        cls, spectro: dict[str, Any], integration_time_s: float
+    ) -> _DetectionBudget:
+        awg = spectro.get("awg")
+        awg = awg if isinstance(awg, dict) else {}
+        missing = [
+            key
+            for key in (
+                "awg_total_planet_rate_hz",
+                "awg_total_leakage_rate_hz",
+                "awg_total_sky_rate_hz",
+            )
+            if spectro.get(key) is None
+        ]
+        if missing or "dark_rate_hz_per_bin_total" not in awg:
+            raise ValueError(
+                "characterization.hdc_ccf needs the AWG detection budget from "
+                "the upstream characterization.spectro payload "
+                "(awg_total_planet_rate_hz, awg_total_leakage_rate_hz, "
+                "awg_total_sky_rate_hz, awg['dark_rate_hz_per_bin_total']); "
+                f"missing {missing or ['awg.dark_rate_hz_per_bin_total']}. "
+                "Without them the cross-correlation would silently ignore the "
+                "AWG throughput and free-spectral-range losses."
+            )
+        pixels_per_resolution_element = max(
+            int(awg.get("pixels_per_resolution_element", 1) or 1), 1
+        )
+        dark_per_bin_hz = max(float(awg["dark_rate_hz_per_bin_total"]), 0.0)
+        return cls(
+            planet_rate_hz=max(float(spectro["awg_total_planet_rate_hz"]), 0.0),
+            leak_rate_hz=max(float(spectro["awg_total_leakage_rate_hz"]), 0.0),
+            sky_rate_hz=max(float(spectro["awg_total_sky_rate_hz"]), 0.0),
+            dark_rate_hz_per_channel=(
+                dark_per_bin_hz * pixels_per_resolution_element
+            ),
+            source=(
+                "AWG-detected band totals from characterization.spectro "
+                "(awg_total_* keys already carry the AWG throughput and "
+                "free-spectral-range fraction); dark = "
+                f"{pixels_per_resolution_element} AWG bins per resolution "
+                "element x awg['dark_rate_hz_per_bin_total'], fixed per "
+                "channel. A free-spectral-range fraction below 1 enters as a "
+                "band-integrated factor, exactly as characterization.spectro "
+                "models it, not as a wavelength window."
+            ),
+        )
+
+    @classmethod
+    def _from_mkid(
+        cls, spectro: dict[str, Any], integration_time_s: float
+    ) -> _DetectionBudget:
+        # The MKID branch of characterization.spectro passes
+        # spectro_throughput=1.0 to per_bin_snr: native dispersion adds no
+        # spectrograph throughput term, so the optical rates entering the
+        # detector are the published band totals.
+        return cls(
+            planet_rate_hz=max(float(spectro["planet_signal_rate_hz"]), 0.0),
+            leak_rate_hz=max(float(spectro["leakage_rate_hz"]), 0.0),
+            sky_rate_hz=max(float(spectro.get("Sky", 0.0) or 0.0), 0.0)
+            / integration_time_s,
+            # per_bin_snr charges dark_rate_hz_per_pixel * n_spectro_pixels per
+            # bin, and the MKID branch runs one bin per resolution element with
+            # exactly one spectro port (enforced by spectro's validator), so the
+            # published D over the integration time is the per channel rate at
+            # the default of one pixel per port.
+            dark_rate_hz_per_channel=max(float(spectro.get("D", 0.0) or 0.0), 0.0)
+            / integration_time_s,
+            source=(
+                "MKID native dispersion: characterization.spectro applies no "
+                "spectrograph throughput, so planet_signal_rate_hz and "
+                "leakage_rate_hz are the detected band totals; dark is the "
+                "published D over the integration time, charged per channel "
+                "the way per_bin_snr charges it per bin."
+            ),
+        )
+
+
+def _resolve_fringe_tracking(
     spectro: dict[str, Any],
     *,
     eps_systematic: float,
     leakage_rate_hz: float,
     integration_time_s: float,
 ) -> tuple[bool, str]:
-    """Recover which systematic branch ``characterization.spectro`` used.
+    """Which systematic branch ``characterization.spectro`` used.
 
-    The spectro stage does not publish ``with_fringe_tracking``, but it does
-    publish ``systematic_var``, and the two branches of
-    ``performance.standard._systematic_variance`` differ by a factor of
-    ``2 f_servo t``. Match the published variance against both closed forms.
+    Modern spectro payloads state ``with_fringe_tracking`` outright; take it.
+    Older ones do not, but they do publish ``systematic_var``, and the two
+    branches of ``performance.standard._systematic_variance`` differ by a
+    factor of ``2 f_servo t``, so the variance can be matched against both
+    closed forms. That inference has a crossover where the two forms coincide
+    (``2 f_servo t == 1``) and is only a fallback.
     """
+
+    declared = spectro.get("with_fringe_tracking")
+    if declared is not None:
+        return bool(declared), (
+            "characterization.spectro with_fringe_tracking payload key"
+        )
 
     published = spectro.get("systematic_var")
     servo_bw_hz = float(spectro.get("servo_bw_hz", 0.0) or 0.0)
@@ -1063,12 +1285,14 @@ def _infer_fringe_tracking(
     value = float(published)
     if abs(math.log(value / tracked)) <= abs(math.log(value / untracked)):
         return True, (
-            "inferred fringe-tracked from characterization.spectro "
-            "systematic_var = eps^2 B^2 t / (2 f_servo)"
+            "fallback inference (payload has no with_fringe_tracking key): "
+            "fringe-tracked, from characterization.spectro systematic_var = "
+            "eps^2 B^2 t / (2 f_servo)"
         )
     return False, (
-        "inferred not fringe-tracked from characterization.spectro "
-        "systematic_var = (eps B t)^2"
+        "fallback inference (payload has no with_fringe_tracking key): not "
+        "fringe-tracked, from characterization.spectro systematic_var = "
+        "(eps B t)^2"
     )
 
 
@@ -1247,15 +1471,25 @@ def _shape_on_grid(
 
 
 def _weighted_mean(
-    values: NDArray[np.float64], weights: NDArray[np.float64]
+    values: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    grid_um: NDArray[np.float64],
 ) -> float:
-    total = float(np.sum(weights))
+    """Band mean of ``values`` weighted by ``weights``, integrated over dlambda.
+
+    The analysis grid is log-uniform, so its cells are *not* equal in
+    wavelength; summing samples instead of integrating would tilt every shape
+    normalization toward the blue and leave the published normalization
+    factors a poor audit of the band integrals they are supposed to certify.
+    """
+
+    total = float(np.trapezoid(weights, grid_um))
     if total <= 0.0:
         raise ValueError(
             "characterization.hdc_ccf cannot normalize a spectral shape: the "
             "weighting photon-rate density sums to zero over the band."
         )
-    mean = float(np.sum(weights * values)) / total
+    mean = float(np.trapezoid(weights * values, grid_um)) / total
     if not (mean > 0.0) or not math.isfinite(mean):
         raise ValueError(
             "characterization.hdc_ccf spectral shape has a non-positive "
@@ -1310,9 +1544,16 @@ def _clip_tiny_negatives(values: NDArray[np.float64]) -> NDArray[np.float64]:
 def _r_scan_values(
     n_points: int, content_resolving_power: float
 ) -> NDArray[np.float64]:
+    """Log-spaced scan axis, capped at what the templates and grid carry.
+
+    The endpoint is reachable exactly: at ``r_out == content_resolving_power``
+    ``_ChannelBuilder._channelize`` bin-averages without a further convolution,
+    which is the correct zero-broadening limit.
+    """
+
     if n_points <= 1:
         return np.empty(0, dtype=np.float64)
-    r_max = min(_R_SCAN_MAX, _R_SCAN_CONTENT_FRACTION * content_resolving_power)
+    r_max = min(_R_SCAN_MAX, content_resolving_power)
     if r_max <= _R_SCAN_MIN:
         return np.empty(0, dtype=np.float64)
     return np.logspace(

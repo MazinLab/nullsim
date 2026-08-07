@@ -762,6 +762,11 @@ class SpectroCharacterization(BaseStage):
             "nsc_systematic_reduction": float(params.nsc_systematic_reduction),
             "null_floor": float(params.null_floor),
             "servo_bw_hz": float(servo_bw_hz),
+            # Which branch of _systematic_variance produced systematic_var.
+            # Downstream consumers (characterization.hdc_ccf) otherwise have to
+            # infer it by matching the published variance against both closed
+            # forms, which is ambiguous at 2 * servo_bw_hz * t == 1.
+            "with_fringe_tracking": bool(params.with_fringe_tracking),
             "optimal_chip_params": tuple(float(v) for v in result.params),
             "optimal_u_stack": u_stack.astype(np.complex128, copy=True),
             "wavelengths_m": tuple(float(w) for w in wavelengths_m),
