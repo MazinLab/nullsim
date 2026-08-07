@@ -114,6 +114,7 @@ from nullsim.outputs.plots.contrast_curves_multiband import contrast_curves_mult
 from nullsim.outputs.plots.debug_report import debug_report  # noqa: E402,F401
 from nullsim.outputs.plots.detection_space import detection_space  # noqa: E402,F401
 from nullsim.outputs.plots.fringe_observability import fringe_observability  # noqa: E402,F401
+from nullsim.outputs.plots.hdc_ccf import hdc_ccf  # noqa: E402,F401
 from nullsim.outputs.plots.imaging_reconstruction import imaging_reconstruction  # noqa: E402,F401
 from nullsim.outputs.plots.loss_budget import loss_budget  # noqa: E402,F401
 from nullsim.outputs.plots.null_transmission_map import null_transmission_map  # noqa: E402,F401
@@ -130,6 +131,7 @@ __all__ = [
     "debug_report",
     "detection_space",
     "fringe_observability",
+    "hdc_ccf",
     "imaging_reconstruction",
     "loss_budget",
     "null_transmission_map",
