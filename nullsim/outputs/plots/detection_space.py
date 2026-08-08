@@ -669,8 +669,9 @@ def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
     reads the labels back off the axes. That is the whole ghost-entry defence:
     a payload that yields no curve (all anchors non-detections, malformed
     arrays, no resolving power) leaves no artist and therefore no legend entry,
-    and the one identity that dedupes drawing -- the R-bearing label -- is by
-    construction the one that dedupes the legend.
+    and the single identity that dedupes drawing -- the per-record label with
+    the resolving power appended -- is by construction the one that dedupes the
+    legend.
 
     No convergence gating here, unlike the ``hdc_ccf`` diagnostic plot: that one
     gates on upstream spectro convergence because it renders a retune that may
@@ -701,7 +702,7 @@ def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
         # The R-bearing label is the binding contract for this overlay, so a
         # payload that cannot produce one is missing a required key, not a
         # curve to draw with a vaguer label.
-        label = _hdc_legend_label(payload)
+        label = _hdc_legend_label(record, payload)
         if label is None:
             logging.info(
                 "detection_space: performance.hdc payload for %r has no finite "
@@ -709,8 +710,9 @@ def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
                 _record_label(record),
             )
             continue
-        # One curve per distinct resolving power. Deduping on anything finer
-        # than the label would draw curves the legend cannot tell apart.
+        # One curve per (record identity, resolving power). Drawing and the
+        # legend key on the same string, so every drawn curve is legended and
+        # two cells alike in J, time, and R collapse to one.
         if label in seen:
             continue
         seen.add(label)
@@ -770,7 +772,9 @@ def _drawn_hdc_legend_entries(axes: plt.Axes) -> tuple[tuple[Line2D, str], ...]:
     seen: set[str] = set()
     for artist in (*axes.lines, *axes.collections):
         label = artist.get_label()
-        if not isinstance(label, str) or not label.startswith(_HDC_LEGEND_PREFIX):
+        # The family marker sits after the per-record instrument name, so this
+        # is a containment test, not a prefix test.
+        if not isinstance(label, str) or _HDC_LEGEND_PREFIX not in label:
             continue
         if label in seen:
             continue
@@ -819,8 +823,14 @@ def _finite_1d(values: Any) -> NDArrayFloat | None:
     return array
 
 
-def _hdc_legend_label(payload: dict) -> str | None:
-    """``"HDC CCF (R=3000)"``, or None when the payload states no finite R."""
+def _hdc_legend_label(record: RunRecord, payload: dict) -> str | None:
+    """``"<instrument> HDC CCF (J=4, 4h, R=3000)"``, or None without a finite R.
+
+    The characterization family's per-record identity with the resolving power
+    appended. Carrying the record identity matters: HDC contrast varies with J
+    exactly as the other families' does, so a J sweep has to yield one curve per
+    J rather than collapsing onto whichever cell was drawn first.
+    """
 
     try:
         resolving_power = float(payload.get("resolving_power_used"))
@@ -828,7 +838,9 @@ def _hdc_legend_label(payload: dict) -> str | None:
         return None
     if not math.isfinite(resolving_power):
         return None
-    return f"{_HDC_LEGEND_PREFIX} (R={resolving_power:g})"
+    return _curve_legend_label(
+        record, mode="hdc", extra=f"R={resolving_power:g}"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -1259,15 +1271,30 @@ def _paper_curve_records(runs: RunCollection) -> tuple[RunRecord, ...]:
     return selected if selected else records
 
 
-def _curve_legend_label(record: RunRecord, *, mode: str) -> str:
+def _curve_legend_label(
+    record: RunRecord,
+    *,
+    mode: str,
+    extra: str | None = None,
+) -> str:
+    """Per-record legend label for one curve family.
+
+    ``extra`` appends a family-specific qualifier inside the parentheses (the
+    HDC family's resolving power); the record identity ahead of it is shared, so
+    the three families read the same way down the legend.
+    """
+
     instrument = _instrument_label(record.config.run.name)
     jmag = _jmag_of_record(record)
     j_label = f"J={jmag:g}" if jmag is not None else _record_label(record)
     time_s = _contrast_reference_time_s(record)
     time_label = f", {_format_duration_hours(time_s)}" if time_s is not None else ""
+    suffix = f", {extra}" if extra else ""
     if mode == "char":
-        return f"{instrument} char-mode ({j_label}{time_label})"
-    return f"{instrument} ({j_label}{time_label})"
+        return f"{instrument} char-mode ({j_label}{time_label}{suffix})"
+    if mode == "hdc":
+        return f"{instrument} {_HDC_LEGEND_PREFIX} ({j_label}{time_label}{suffix})"
+    return f"{instrument} ({j_label}{time_label}{suffix})"
 
 
 def _instrument_label(run_name: str) -> str:

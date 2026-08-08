@@ -23,6 +23,7 @@ from nullsim.outputs.plots.detection_space import (
     _load_planet_overlay,
     _max_baseline_m,
     _observability_config,
+    _curve_legend_label,
     _plot_characterization_curves,
     _plot_detection_curves,
     _plot_hdc_curves,
@@ -435,8 +436,13 @@ def test_detection_space_overlays_hdc_ccf_curve() -> None:
     plt.close(fig)
 
 
-def test_detection_space_hdc_legend_label_carries_resolving_power() -> None:
+def test_detection_space_hdc_legend_label_mirrors_the_char_format_plus_r() -> None:
+    """The HDC label is the characterization family's per-record label with the
+    resolving power appended, so the three families read alike down the legend
+    and a J sweep stays distinguishable."""
+
     collection = _hdc_collection(_hdc_payload(resolving_power_used=2500.0))
+    record = collection.records[0]
     fig, axes = plt.subplots()
 
     _plot_detection_curves(axes, collection)
@@ -444,7 +450,10 @@ def test_detection_space_hdc_legend_label_carries_resolving_power() -> None:
     _attach_legends(axes, (), collection)
 
     labels = [text.get_text() for text in axes.get_legend().get_texts()]
-    assert "HDC CCF (R=2500)" in labels
+    char_label = _curve_legend_label(record, mode="char")
+    expected = char_label.replace("char-mode", "HDC CCF")[:-1] + ", R=2500)"
+    assert expected in labels
+    assert "J=4" in expected and "R=2500" in expected
     plt.close(fig)
 
 
@@ -582,19 +591,20 @@ def test_detection_space_hdc_r_sweep_draws_one_curve_per_resolving_power() -> No
 
     _plot_hdc_curves(axes, collection)
     hdc_lines = [
-        line for line in axes.lines if str(line.get_label()).startswith("HDC CCF")
+        line for line in axes.lines if "HDC CCF" in str(line.get_label())
     ]
     labels = [label for label in _legend_labels(axes, collection) if "HDC CCF" in label]
 
     assert len(hdc_lines) == 2
-    assert labels == ["HDC CCF (R=3000)", "HDC CCF (R=5000)"]
+    assert [label.rsplit(", ", 1)[-1] for label in labels] == ["R=3000)", "R=5000)"]
+    assert all("J=4" in label for label in labels)
     plt.close(fig)
 
 
-def test_detection_space_hdc_records_sharing_r_draw_once() -> None:
-    """Two cells at the same resolving power are indistinguishable once drawn,
-    so they collapse to one curve and one legend entry -- not one entry with
-    two overlapping curves behind it."""
+def test_detection_space_hdc_j_sweep_draws_one_curve_per_jmag() -> None:
+    """HDC contrast varies with J exactly as the detection and characterization
+    families' does, so the canonical J sweep must draw one curve per J rather
+    than collapsing onto whichever cell came first."""
 
     collection = _hdc_collection_from(
         (
@@ -605,13 +615,37 @@ def test_detection_space_hdc_records_sharing_r_draw_once() -> None:
     fig, axes = plt.subplots()
 
     _plot_hdc_curves(axes, collection)
-    hdc_lines = [
-        line for line in axes.lines if str(line.get_label()).startswith("HDC CCF")
-    ]
+    hdc_lines = [line for line in axes.lines if "HDC CCF" in str(line.get_label())]
+    labels = [label for label in _legend_labels(axes, collection) if "HDC CCF" in label]
+
+    assert len(hdc_lines) == 2
+    assert len(labels) == 2
+    assert any("J=4" in label for label in labels)
+    assert any("J=8" in label for label in labels)
+    assert all("R=3000" in label for label in labels)
+    plt.close(fig)
+
+
+def test_detection_space_hdc_identical_cells_draw_once() -> None:
+    """Two cells alike in J, integration time, and R are indistinguishable once
+    drawn, so they collapse to one curve and one legend entry -- not one entry
+    with two overlapping curves behind it."""
+
+    collection = _hdc_collection_from(
+        (
+            (4.0, _hdc_payload(resolving_power_used=3000.0)),
+            (4.0, _hdc_payload(resolving_power_used=3000.0)),
+        )
+    )
+    fig, axes = plt.subplots()
+
+    _plot_hdc_curves(axes, collection)
+    hdc_lines = [line for line in axes.lines if "HDC CCF" in str(line.get_label())]
     labels = [label for label in _legend_labels(axes, collection) if "HDC CCF" in label]
 
     assert len(hdc_lines) == 1
-    assert labels == ["HDC CCF (R=3000)"]
+    assert len(labels) == 1
+    assert "R=3000" in labels[0]
     plt.close(fig)
 
 
