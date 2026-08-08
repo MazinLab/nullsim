@@ -56,10 +56,23 @@ at unit contrast, solve ``SNR(c) = n`` for the contrast ``c``. Because the
 planet enters the signal linearly and the variance affinely, and ``V_sys`` does
 not depend on ``c`` in either regime, the condition is a quadratic with a
 closed-form positive root -- no iteration, so a whole contrast curve costs one
-pass per separation. The weights are frozen at ``c = 0``: second-order accurate
-in ``c P1 / v0`` only when ``V_sys`` is exactly zero, and first-order for any
-nonzero systematic, with a coefficient proportional to the systematic share of
-the variance ``eta_sys = V_sys / (t B2 + V_sys)`` (see the function docstring).
+pass per separation.
+
+The weights are frozen at ``c = 0``, and the resulting error is
+
+```text
+SNR^2_true / SNR^2_frozen = 1 - 2 c eta_sys (C2/A - D/H0) + O(c^2),
+eta_sys = V_sys / (t B2 + V_sys),
+D = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2,   H0 = B_w.
+```
+
+With ``V_sys = 0`` the linear term vanishes identically and the error is second
+order in ``c P1 / v0``. With ``V_sys > 0`` it is *generically* first order, but
+not unconditionally: the structural coefficient ``C2/A - D/H0`` is itself zero
+for a flat template against a flat leak, where the frozen and exact statistics
+in fact coincide to all orders. So the bias is set by spectral structure gated
+by the systematic share ``eta_sys``, not by the presence of a systematic alone.
+See the function docstring for the measured behavior.
 
 Pure numpy/scipy: no TOML, ``SimulationState``, or stage imports.
 """
@@ -753,9 +766,9 @@ def ccf_contrast_at_target_snr(
     - *Exactly photon-limited* (``V_sys = 0``): the frozen and exact statistics
       agree through the linear term in ``c P1 / v0``, so the error is **second
       order**. This is the only regime the closed form is essentially exact in.
-    - *Any nonzero systematic*: recomputed weights also change the leak
-      projection ``B_w(c)``, and hence ``V_sys``, at **first order**. The
-      general expansion is
+    - *Nonzero systematic, structured spectra*: recomputed weights also change
+      the leak projection ``B_w(c)``, and hence ``V_sys``, **generically at
+      first order**. The general expansion is
 
       ```text
       SNR^2_true / SNR^2_frozen = 1 - 2 c eta_sys (C2/A - D/H0) + O(c^2),
@@ -768,8 +781,13 @@ def ccf_contrast_at_target_snr(
       variance: it tends to 1 in the systematics-dominated limit and falls
       smoothly to 0 as the budget becomes photon-limited, which is what makes
       the first-order term switch on gradually rather than at a threshold.
-      ``C2/A - D/H0`` vanishes for flat spectra and grows with spectral
-      structure, so the bias is driven by structure, not by magnitude.
+      The structural coefficient ``C2/A - D/H0`` is the other gate: it is
+      identically zero for a flat template against a flat leak, where the
+      frozen and exact statistics coincide to *all* orders however large
+      ``V_sys`` is (the ``(1 + c P1/v0)`` factors cancel between numerator and
+      denominator), and it grows with spectral structure. So the bias needs
+      *both* a nonzero systematic and a structured spectrum; it is driven by
+      structure, not by magnitude.
 
     Measured on an 80-channel structured probe, the coefficient
     ``c eta_sys (C2/A - D/H0)`` reproduces the observed error to better than 5%
@@ -784,7 +802,10 @@ def ccf_contrast_at_target_snr(
     Raises ``ValueError`` if ``A <= 0``: a template with no surviving line
     structure (a lineless planet spectrum, or one whose lines all fall in
     masked channels) has no contrast at which it reaches the target, and
-    reporting ``inf`` would silently poison a contrast curve.
+    reporting ``inf`` would silently poison a contrast curve. Also raises
+    ``ValueError`` -- not ``OverflowError`` -- if ``V_sys`` or the contrast root
+    is not representable in float64, so a caller sweeping separation anchors has
+    a single exception type to catch per anchor.
     """
     arrays = _validate_rate_arrays(
         planet_rate_hz_per_channel_unit_contrast=(
@@ -830,13 +851,32 @@ def ccf_contrast_at_target_snr(
         np.sum(weights * weights * variance_rate_zero_contrast)
     )
     planet_selfnoise_coefficient = float(np.sum(weights * weights * planet_unit))
-    systematic_var_counts = _systematic_variance_counts(
-        float(np.sum(weights * leak_filtered)),
-        integration_time_s,
-        eps_systematic,
-        servo_bw_hz,
-        with_fringe_tracking,
-    )
+    leak_projection_hz = float(np.sum(weights * leak_filtered))
+    # `matched_filter_ccf` lets an overflowing V_sys surface as it comes: the
+    # no-fringe-tracking branch squares with `**`, which raises OverflowError,
+    # while the fringe-tracking branch multiplies and quietly yields inf. This
+    # entry point normalizes both to the ValueError it already documents for a
+    # non-representable result, so a caller sweeping separation anchors has one
+    # exception type to catch. Below the threshold nothing changes.
+    try:
+        systematic_var_counts = _systematic_variance_counts(
+            leak_projection_hz,
+            integration_time_s,
+            eps_systematic,
+            servo_bw_hz,
+            with_fringe_tracking,
+        )
+    except OverflowError:
+        systematic_var_counts = math.inf
+    if not math.isfinite(systematic_var_counts):
+        # Plain multiplication saturates to inf rather than raising, so this
+        # is safe to evaluate even when the square of it is not.
+        amplitude = eps_systematic * abs(leak_projection_hz) * integration_time_s
+        raise ValueError(
+            "systematic variance overflows float64; "
+            f"eps*B_w*t ~ {amplitude!r} with eps={eps_systematic!r}, "
+            f"B_w={leak_projection_hz!r}, t={integration_time_s!r}"
+        )
 
     # Solve in scaled variables. Forming the dimensional coefficients directly
     # overflows or underflows well inside the range of physically valid inputs:

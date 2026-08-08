@@ -321,6 +321,15 @@ Four magnitudes are pinned as tests, each against its analytic limit:
 planet's own shot noise sets the root; and `5e160` in the large-`V_sys` case
 above.
 
+One step further out, `V_sys` itself stops being representable: it is
+`(eps B_w t)^2` without fringe tracking, so `eps B_w t > ~1.3e154` overflows.
+Python's `**` raises `OverflowError` there while the fringe-tracking branch's
+plain multiplications saturate silently to `inf`. The solver catches both and
+re-raises as the `ValueError` it documents, quoting `eps B_w t`, so callers
+sweeping anchors have one exception type. `matched_filter_ccf` is deliberately
+left alone — changing what it raises would be a behavior change to a function
+with its own consumers.
+
 ### Two identities worth knowing
 
 `A = B2` analytically -- both equal `sum_i Ptilde1_i^2 / v0_i`, since `w_i` is
@@ -411,8 +420,24 @@ half the coefficient above:
 1 - SNR_true/SNR_frozen  ~=  c eta_sys (C2/A - D/H0).
 ```
 
-`C2/A - D/H0` vanishes for flat spectra and grows with spectral structure, so
-the bias is driven by structure, not by magnitude.
+`C2/A - D/H0` is the second gate, and it vanishes identically for a flat
+template against a flat leak. There the agreement is not merely second order but
+**exact to all orders**: with `x = c P1 / v0` flat, `G = A/(1+x)`,
+`H = H0/(1+x)` and `B2 + c C2 = A(1+x)`, so
+
+```text
+exact = c^2 t^2 (A/(1+x))^2 / (t A/(1+x) + K H0^2/(1+x)^2)
+      = c^2 t^2 A^2 / (t A (1+x) + K H0^2) = frozen.
+```
+
+Measured: a flat probe at `eta_sys = 0.9996` and `c P1 / v0 = 0.025` — a
+*larger* planet/leak ratio than the structured probe's 0.017, and more
+systematic-dominated — roundtrips with an error of `4.4e-16`, i.e. machine
+epsilon, against the structured probe's `3.6e-2`.
+
+So the bias needs *both* a nonzero systematic and spectral structure. It is
+driven by structure, not by magnitude, and the honest statement is "generically
+first order", not "first order whenever `V_sys > 0`".
 
 Measured on an 80-channel structured probe (`P1` a modulated line forest, `L`
 a modulated continuum, width-11 filter, no fringe tracking, `t = 3600 s`),
@@ -446,6 +471,11 @@ systematics-dominated corner. Where it is, it is optimistic by a few percent,
 and `matched_filter_ccf` is the cross-check.
 
 ### Failure convention
+
+Every unusable input raises `ValueError`, never `OverflowError` and never a
+sentinel value. That matters because the caller sweeps separation anchors and
+wants to record a non-detection for a bad anchor without aborting the curve, so
+it needs exactly one exception type to catch.
 
 `A <= 0` raises `ValueError` rather than returning `inf`. `A` is
 `sum_i Ptilde1_i^2 / v0_i` over usable channels, so it is zero only when the

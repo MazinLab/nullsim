@@ -788,3 +788,84 @@ def test_ccf_contrast_frozen_weight_bias_scales_with_the_systematic_share():
     assert strong_error / (strong_c * strong_eta) == pytest.approx(
         expected_slope, rel=0.05
     )
+
+
+def test_ccf_contrast_solver_raises_value_error_when_systematic_variance_overflows():
+    # eps * B_w * t ~ 1e155, whose square is past the float64 ceiling. The
+    # no-fringe-tracking branch squares with `**`, which raises OverflowError
+    # in matched_filter_ccf; the solver must normalize it to the ValueError it
+    # documents, so a per-anchor sweep has one exception type to catch.
+    args = (np.array([1e10]), np.array([1e170]), np.zeros(1), np.zeros(1))
+    with pytest.raises(ValueError, match="systematic variance overflows"):
+        ccf_contrast_at_target_snr(
+            *args,
+            **_solver_kwargs(
+                integration_time_s=1e145,
+                target_snr=5.0,
+                eps_systematic=1.0,
+                with_fringe_tracking=False,
+            ),
+        )
+
+    # The fringe-tracking branch multiplies rather than squaring, so it
+    # saturates to inf silently; it must reach the same ValueError.
+    with pytest.raises(ValueError, match="systematic variance overflows"):
+        ccf_contrast_at_target_snr(
+            *args,
+            **_solver_kwargs(
+                integration_time_s=1e160,
+                target_snr=5.0,
+                eps_systematic=1.0,
+                servo_bw_hz=1e-130,
+                with_fringe_tracking=True,
+            ),
+        )
+
+    # Just below the threshold the diagnostic semantics are unchanged.
+    solution = ccf_contrast_at_target_snr(
+        *args,
+        **_solver_kwargs(
+            integration_time_s=1e140,
+            target_snr=5.0,
+            eps_systematic=1.0,
+            with_fringe_tracking=False,
+        ),
+    )
+    assert solution.systematic_var_counts == pytest.approx(1e300, rel=1e-9)
+    assert solution.contrast_at_target_snr == pytest.approx(5e160, rel=1e-9)
+
+
+def test_flat_spectra_are_exact_despite_large_systematics():
+    # The structural coefficient C2/A - D/H0 vanishes identically for a flat
+    # template against a flat leak. In fact the frozen and exact statistics
+    # coincide to ALL orders there: with G = A/(1+x), H = H0/(1+x) and
+    # B2 + c C2 = A(1+x) for x = c P1 / v0, the (1+x) factors cancel between
+    # numerator and denominator. This is why the qualification is "generically
+    # first order", not "first order for any nonzero systematic".
+    n = 64
+    planet_unit = np.full(n, 0.05)
+    leak = np.full(n, 400.0)
+    zeros = np.zeros(n)
+    time_s, target = 3600.0, 5.0
+    kwargs = _solver_kwargs(
+        integration_time_s=time_s,
+        target_snr=target,
+        eps_systematic=5e-3,
+        with_fringe_tracking=False,
+        continuum_filter_width_channels=0,
+    )
+    solution = ccf_contrast_at_target_snr(planet_unit, leak, zeros, zeros, **kwargs)
+    eta_sys = solution.systematic_var_counts / (
+        time_s * solution.photon_var_zero_contrast + solution.systematic_var_counts
+    )
+    assert eta_sys > 0.9  # systematics dominate
+
+    contrast = solution.contrast_at_target_snr
+    budget = matched_filter_ccf(
+        _channels(contrast * planet_unit, leak), **_matched_filter_kwargs(kwargs)
+    )
+    ratio = budget.ccf_snr / target
+    # c P1 / v0 = 0.025 here, larger than the structured probe's 0.017 where
+    # the error was 3.6%. Flat, it is exact to machine precision.
+    assert contrast * planet_unit[0] / leak[0] > 0.02
+    assert ratio == pytest.approx(1.0, rel=1e-12)
