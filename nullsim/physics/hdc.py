@@ -56,8 +56,9 @@ at unit contrast, solve ``SNR(c) = n`` for the contrast ``c``. Because the
 planet enters the signal linearly and the variance affinely, and ``V_sys`` does
 not depend on ``c`` in either regime, the condition is a quadratic with a
 closed-form positive root -- no iteration, so a whole contrast curve costs one
-pass per separation. The weights are frozen at ``c = 0``, which is exact to
-first order in ``c P1 / v0``: the detection regime the function exists for.
+pass per separation. The weights are frozen at ``c = 0``: second-order accurate
+in ``c P1 / v0`` when photon-limited, first-order once systematics dominate
+(see the function docstring).
 
 Pure numpy/scipy: no TOML, ``SimulationState``, or stage imports.
 """
@@ -741,16 +742,30 @@ def ccf_contrast_at_target_snr(
     independent of ``c``, which is what makes the root closed-form rather than
     an iteration.
 
-    **Frozen-weights approximation.** The weights are evaluated at ``c = 0``,
-    so ``v0`` excludes the planet's own contribution to the variance while
-    ``C2`` still carries the planet shot noise into the denominator. Exact
-    weights would depend on the answer, which is what the closed form buys its
-    speed by avoiding. The two agree to first order in ``c P1 / v0``, so the
-    approximation is good wherever the planet is faint against the leak -- the
-    detection regime this function exists for, and the only regime where a
-    contrast curve means anything. Near ``c P1 ~ v0`` the returned contrast is
-    slightly optimistic; cross-check with `matched_filter_ccf` if a use case
-    ever lands there.
+    **Frozen-weights approximation, and where it degrades.** The weights are
+    evaluated at ``c = 0``, so ``v0`` excludes the planet's own contribution to
+    the *weighting* while ``C2`` still carries the planet shot noise into the
+    denominator. Exact weights would depend on the answer, which is what the
+    closed form buys its speed by avoiding. The accuracy is not uniform across
+    the two noise regimes:
+
+    - *Photon-limited* (``V_sys`` negligible): the frozen and exact statistics
+      agree through the linear term in ``c P1 / v0``, so the error is **second
+      order**. This is the regime the closed form is essentially exact in.
+    - *Systematics-dominated*: recomputed weights also change the leak
+      projection ``B_w(c)``, and hence ``V_sys``, at **first order** in
+      ``c P1 / v0``. The solver is then optimistic by roughly
+      ``2 c (C2/A - D/H0)`` with ``D = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2``
+      and ``H0 = B_w``. That difference vanishes for flat spectra and grows
+      with spectral structure: an 80-channel structured probe with
+      ``V_sys / V_ph ~ 90`` and ``max(c P1 / L) = 0.017`` recovers SNR 4.82
+      against a target of 5, i.e. 3.6% optimistic, and the error scales
+      linearly in ``eps``.
+
+    So the returned contrast is reliable wherever the planet is faint against
+    the leak *and* the budget is not deep in the systematics-dominated corner.
+    Where it is, treat the value as a few-percent-optimistic estimate and
+    cross-check with `matched_filter_ccf`.
 
     Raises ``ValueError`` if ``A <= 0``: a template with no surviving line
     structure (a lineless planet spectrum, or one whose lines all fall in
@@ -809,14 +824,39 @@ def ccf_contrast_at_target_snr(
         with_fringe_tracking,
     )
 
-    target_sq = target_snr * target_snr
-    quadratic_a = signal_coefficient**2 * integration_time_s**2
-    linear_b = target_sq * integration_time_s * planet_selfnoise_coefficient
-    constant_c = target_sq * (
-        integration_time_s * photon_var_zero_contrast + systematic_var_counts
+    # Solve in scaled variables. Forming the dimensional coefficients directly
+    # overflows or underflows well inside the range of physically valid inputs:
+    # A ~ 1e150 already squares past the float64 ceiling, and A^2 t^2 flushes to
+    # zero for rates around 1e-200. Substituting c = c0 x with the
+    # photon-limited root c0 = n / sqrt(A t) reduces the quadratic to
+    #
+    #     x^2 - p x - q = 0,    p = c0 C2 / A,    q = B2/A + V_sys/(A t),
+    #
+    # whose coefficients are ratios of like-dimensioned sums and so stay near
+    # unity no matter how the inputs are scaled. Every product is grouped to
+    # avoid ever forming A t or A^2.
+    contrast_scale = (target_snr / math.sqrt(signal_coefficient)) / math.sqrt(
+        integration_time_s
     )
-    discriminant = linear_b * linear_b + 4.0 * quadratic_a * constant_c
-    contrast = (linear_b + math.sqrt(discriminant)) / (2.0 * quadratic_a)
+    reduced_linear = contrast_scale * (
+        planet_selfnoise_coefficient / signal_coefficient
+    )
+    reduced_constant = (
+        photon_var_zero_contrast / signal_coefficient
+        + (systematic_var_counts / signal_coefficient) / integration_time_s
+    )
+    # hypot(p, 2 sqrt(q)) is sqrt(p^2 + 4q) without squaring either argument.
+    reduced_root = 0.5 * (
+        reduced_linear + math.hypot(reduced_linear, 2.0 * math.sqrt(reduced_constant))
+    )
+    contrast = contrast_scale * reduced_root
+    if not math.isfinite(contrast) or contrast <= 0.0:
+        raise ValueError(
+            f"the contrast solution is not representable (got {contrast!r}) for "
+            f"A={signal_coefficient!r}, B2={photon_var_zero_contrast!r}, "
+            f"C2={planet_selfnoise_coefficient!r}, V_sys={systematic_var_counts!r}, "
+            f"t={integration_time_s!r}, n={target_snr!r}; rescale the input rates"
+        )
 
     return CcfContrastSolution(
         contrast_at_target_snr=contrast,

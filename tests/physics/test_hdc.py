@@ -538,3 +538,167 @@ def test_ccf_contrast_no_ft_regime_still_finite():
     # t = 3600 s, f_servo = 100 Hz: (eps B_w t)^2 >> eps^2 B_w^2 t / (2 f),
     # so the static-offset regime costs contrast.
     assert without_ft > contrast(True)
+
+
+@pytest.mark.parametrize(
+    ("rate_magnitude", "time_s", "regime"),
+    [
+        # Old failure -> inf: A^2 overflows when squared directly.
+        (1e150, 1.0, "photon"),
+        # Old failure -> OverflowError: A^2 t^2 cannot be formed at all.
+        (1e150, 1e160, "photon"),
+        # Old failure -> ZeroDivisionError: A^2 t^2 flushes to zero.
+        (1e-200, 1.0, "self_noise"),
+    ],
+)
+def test_ccf_contrast_solver_survives_extreme_but_valid_magnitudes(
+    rate_magnitude, time_s, regime
+):
+    # The dimensional coefficients A^2 t^2, b^2 and 4ad each blow up or vanish
+    # well inside the range of representable rates. The scaled solve must
+    # return a finite positive root anyway, matching the analytic limit.
+    n = 4
+    rates = np.full(n, rate_magnitude)
+    zeros = np.zeros(n)
+    solution = ccf_contrast_at_target_snr(
+        rates,
+        rates,
+        zeros,
+        zeros,
+        **_solver_kwargs(
+            integration_time_s=time_s, target_snr=5.0, eps_systematic=0.0
+        ),
+    )
+    contrast = solution.contrast_at_target_snr
+    assert np.isfinite(contrast)
+    assert contrast > 0.0
+
+    a_coeff = solution.signal_coefficient
+    if regime == "photon":
+        # C2/A = 1 here but c0 C2/A << 2 sqrt(B2/A), so c -> n / sqrt(A t).
+        expected = 5.0 / (np.sqrt(a_coeff) * np.sqrt(time_s))
+    else:
+        # At 1e-200 Hz there are no photons in a second: the planet's own shot
+        # noise dominates and the root runs to c -> n^2 C2 / (A^2 t). Grouped
+        # so the reference value does not overflow either.
+        ratio = 5.0 / a_coeff
+        expected = ratio * (ratio * solution.planet_selfnoise_coefficient) / time_s
+    assert contrast == pytest.approx(expected, rel=1e-9)
+
+
+def _structured_probe():
+    """Nonuniform planet template and leak, 80 channels."""
+    n = 80
+    index = np.arange(n)
+    planet_unit = 0.2 + 2.0 * np.sin(index * 0.7) ** 2
+    planet_unit[::7] += 4.0
+    leak = 1.0e3 * (1.0 + 0.6 * np.cos(index * 0.31))
+    leak[::5] *= 1.4
+    return planet_unit, leak, np.zeros(n)
+
+
+def test_ccf_contrast_frozen_weights_are_first_order_when_systematics_dominate():
+    # The frozen-weight error is second order only in the photon limit. Once
+    # V_sys dominates, recomputed weights shift B_w(c) at FIRST order in
+    # c*P1/v0, so the solver is measurably optimistic. This test documents that
+    # known bias rather than hiding it.
+    planet_unit, leak, zeros = _structured_probe()
+    time_s, target = 3600.0, 5.0
+
+    def roundtrip(eps):
+        kwargs = _solver_kwargs(
+            integration_time_s=time_s,
+            target_snr=target,
+            eps_systematic=eps,
+            with_fringe_tracking=False,
+            continuum_filter_width_channels=11,
+        )
+        solution = ccf_contrast_at_target_snr(
+            planet_unit, leak, zeros, zeros, **kwargs
+        )
+        contrast = solution.contrast_at_target_snr
+        budget = matched_filter_ccf(
+            _channels(contrast * planet_unit, leak),
+            **_matched_filter_kwargs(kwargs),
+        )
+        return solution, budget.ccf_snr / target
+
+    # Photon-limited: the second-order error is invisible.
+    photon_solution, photon_ratio = roundtrip(0.0)
+    assert photon_solution.systematic_var_counts == 0.0
+    assert photon_ratio == pytest.approx(1.0, rel=1e-6)
+
+    # Systematics dominating by ~90x: the solver overshoots by a few percent.
+    systematic_solution, ratio = roundtrip(0.1)
+    assert systematic_solution.systematic_var_counts > 50.0 * (
+        time_s * systematic_solution.photon_var_zero_contrast
+    )
+    assert 0.90 <= ratio <= 1.02
+    with pytest.raises(AssertionError):
+        assert ratio == pytest.approx(1.0, rel=2e-2)
+
+    # First order, not second: halving eps halves the error.
+    _, half_ratio = roundtrip(0.05)
+    assert (1.0 - ratio) / (1.0 - half_ratio) == pytest.approx(2.0, rel=0.05)
+
+
+def test_ccf_contrast_solver_zeroes_weights_on_masked_and_noiseless_channels():
+    n = 12
+    planet_unit = np.full(n, 2.0)
+    planet_unit[3] = 7.0
+    leak = np.full(n, 500.0)
+    leak[[4, 9]] = 0.0  # v0 = 0: no noise budget, weight must be zeroed
+    sky = np.zeros(n)
+    dark = np.zeros(n)
+    telluric = np.ones(n)
+    telluric[[1, 2]] = 0.1  # masked out
+    time_s, target, eps, servo = 600.0, 5.0, 1e-2, 50.0
+
+    solution = ccf_contrast_at_target_snr(
+        planet_unit,
+        leak,
+        sky,
+        dark,
+        **_solver_kwargs(
+            integration_time_s=time_s,
+            target_snr=target,
+            eps_systematic=eps,
+            servo_bw_hz=servo,
+            with_fringe_tracking=True,
+            telluric_transmission_per_channel=telluric,
+            telluric_mask_threshold=0.5,
+        ),
+    )
+
+    usable = np.ones(n, dtype=bool)
+    usable[[1, 2, 4, 9]] = False
+    weights = solution.template_weights
+    assert weights.shape == (n,)
+    assert np.all(weights[~usable] == 0.0)
+    assert np.all(weights[usable] > 0.0)
+    # Filtering is off in _solver_kwargs, so Ptilde1 = P1 and Ltilde = L.
+    expected_weights = np.where(usable, planet_unit / np.where(leak > 0, leak, 1.0), 0.0)
+    assert weights == pytest.approx(expected_weights)
+
+    a_coeff = float(np.sum(weights * planet_unit))
+    b2_coeff = float(np.sum(weights**2 * leak))
+    c2_coeff = float(np.sum(weights**2 * planet_unit))
+    b_w = float(np.sum(weights * leak))
+    assert solution.signal_coefficient == pytest.approx(a_coeff)
+    assert solution.photon_var_zero_contrast == pytest.approx(b2_coeff)
+    assert solution.planet_selfnoise_coefficient == pytest.approx(c2_coeff)
+    assert solution.systematic_var_counts == pytest.approx(
+        eps**2 * b_w**2 * time_s / (2.0 * servo)
+    )
+    assert solution.target_snr == target
+
+    # The full field set Task 3 consumes, cross-checked against the quadratic.
+    quad_a = a_coeff**2 * time_s**2
+    quad_b = target**2 * time_s * c2_coeff
+    quad_d = target**2 * (time_s * b2_coeff + solution.systematic_var_counts)
+    expected_contrast = (
+        quad_b + np.sqrt(quad_b**2 + 4.0 * quad_a * quad_d)
+    ) / (2.0 * quad_a)
+    assert solution.contrast_at_target_snr == pytest.approx(
+        expected_contrast, rel=1e-12
+    )

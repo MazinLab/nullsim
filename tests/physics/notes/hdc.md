@@ -277,6 +277,38 @@ No iteration is needed, and that is only true because `V_sys` does not depend on
 `c`: both regimes scale with `B_w`, which is a property of the leak and the
 template, not of the planet.
 
+### Solving it without overflowing
+
+Evaluating that root literally does not survive contact with realistic input
+ranges. `A^2 t^2` overflows for `A ~ 1e150`, raises `OverflowError` outright at
+`t = 1e160`, and flushes to zero for rates around `1e-200` — all of which are
+representable float64 inputs whose exact roots are perfectly ordinary numbers.
+The implementation therefore substitutes `c = c0 x` with the photon-limited
+root
+
+```text
+c0 = n / sqrt(A t),
+```
+
+reducing the quadratic to
+
+```text
+x^2 - p x - q = 0,   p = c0 C2 / A,   q = B2/A + V_sys/(A t),
+```
+
+whose coefficients are ratios of like-dimensioned sums and stay near unity
+however the inputs are scaled. Every product is grouped to avoid ever forming
+`A t` or `A^2`: `c0` is `(n / sqrt(A)) / sqrt(t)`, and `V_sys/(A t)` is
+`(V_sys / A) / t`. The discriminant uses `hypot(p, 2 sqrt(q))` rather than
+`sqrt(p^2 + 4q)`, so neither argument is ever squared. Finally the returned
+root is checked finite and positive, and raises with the full coefficient set
+in the message if it is not.
+
+The three magnitudes above are pinned as tests, each against its analytic
+limit: `n / sqrt(A t)` in the photon-limited cases, and `n^2 C2 / (A^2 t)` in
+the `1e-200` case, where a second of integration collects no photons at all and
+the planet's own shot noise sets the root.
+
 ### Two identities worth knowing
 
 `A = B2` analytically -- both equal `sum_i Ptilde1_i^2 / v0_i`, since `w_i` is
@@ -311,8 +343,8 @@ contribution to the *weighting* while `C2` still carries the planet shot noise
 into the denominator. Exact weights would depend on the answer, which is
 precisely what the closed form avoids.
 
-The error is second order, not first. Expanding the true photon-limited
-statistic in `c P1 / v0`,
+**Photon-limited, the error is second order.** Expanding the true statistic in
+`c P1 / v0` with `V_sys = 0`,
 
 ```text
 t c^2 sum_i Ptilde1_i^2 / (v0_i + c P1_i) = t c^2 (A - c C2 + O(c^2)),
@@ -332,10 +364,48 @@ the square of the planet/leak ratio. That is why the roundtrip test asserts only
 measured, `8.3e-4 -> 1.0e-5` -- which drops the squared error by about four
 orders of magnitude.
 
-The practical statement: the approximation is good wherever the planet is faint
-against the leak, which is the detection regime and the only regime in which a
-contrast curve means anything. Near `c P1 ~ v0` the returned contrast is
-slightly optimistic, and `matched_filter_ccf` is the cross-check.
+**With systematics active, the error is first order.** The cancellation above
+is a property of the photon-limited denominator only. Writing
+`G(c) = sum_i Ptilde1_i^2 / v_i` and `H(c) = sum_i Ptilde1_i Ltilde_i / v_i`,
+the exact statistic is
+
+```text
+SNR^2(c) = c^2 t^2 G(c)^2 / (t G(c) + K H(c)^2),
+```
+
+with `K = eps^2 t / (2 f)` or `eps^2 t^2`. (The matched filter is invariant
+under an overall rescaling of the weights, which is why the same `c` appears
+in the solver's per-unit-contrast form and in `matched_filter_ccf`'s
+absolute one.) With `G = A - c C2 + O(c^2)` and `H = H0 - c D + O(c^2)`,
+`D = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2`, the systematics-dominated limit
+`K H^2 >> t G` gives
+
+```text
+SNR^2_true / SNR^2_frozen -> 1 - 2 c (C2/A - D/H0),
+```
+
+which is first order in `c` unless `C2/A = D/H0`. Those two ratios coincide for
+flat spectra and separate as spectral structure grows, so the bias is a
+structure effect, not a magnitude effect.
+
+Measured on an 80-channel structured probe (`P1` a modulated line forest, `L`
+a modulated continuum, width-11 filter, no fringe tracking, `t = 3600 s`):
+
+| `eps` | `V_sys / V_ph` | `max(c P1 / L)` | roundtrip SNR / target |
+|---|---|---|---|
+| 0 | 0 | 0.0018 | 1.000000 |
+| 0.05 | 23 | 0.0088 | 0.98173 |
+| 0.10 | 93 | 0.0172 | 0.96367 |
+
+The error doubles when `eps` doubles — first order, confirmed — and the
+photon-limited row is exact to the last digit shown. The pinned test asserts
+the ratio lands in `[0.90, 1.02]`, asserts it is *not* within `rel = 2e-2` of
+the target, and asserts the factor-of-two error scaling.
+
+The practical statement: the returned contrast is reliable wherever the planet
+is faint against the leak *and* the budget is not deep in the
+systematics-dominated corner. Where it is, it is optimistic by a few percent,
+and `matched_filter_ccf` is the cross-check.
 
 ### Failure convention
 
