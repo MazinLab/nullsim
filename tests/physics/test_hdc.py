@@ -702,3 +702,89 @@ def test_ccf_contrast_solver_zeroes_weights_on_masked_and_noiseless_channels():
     assert solution.contrast_at_target_snr == pytest.approx(
         expected_contrast, rel=1e-12
     )
+
+
+def test_ccf_contrast_solver_survives_large_systematic_over_small_signal():
+    # q = B2/A + V_sys/(A t) overflows on its own here (V_sys/A = 1e450) even
+    # though the true root, 5e160, is representable. sqrt(q) must be built as
+    # hypot(sqrt(B2/A), sqrt(V_sys)/(sqrt(A) sqrt(t))) so no term is ever
+    # formed at full exponent.
+    solution = ccf_contrast_at_target_snr(
+        np.array([1e10]),
+        np.array([1e170]),
+        np.zeros(1),
+        np.zeros(1),
+        **_solver_kwargs(
+            integration_time_s=1e140,
+            target_snr=5.0,
+            eps_systematic=1.0,
+            with_fringe_tracking=False,
+        ),
+    )
+    contrast = solution.contrast_at_target_snr
+    assert np.isfinite(contrast)
+    # Systematics dominate completely, so c -> n sqrt(V_sys) / (A t), grouped
+    # to keep the reference in range as well.
+    expected = (
+        5.0 * np.sqrt(solution.systematic_var_counts) / solution.signal_coefficient
+    ) / 1e140
+    assert contrast == pytest.approx(expected, rel=1e-9)
+    assert contrast == pytest.approx(5e160, rel=1e-9)
+
+
+def test_ccf_contrast_frozen_weight_bias_scales_with_the_systematic_share():
+    # The first-order coefficient is c * eta_sys * (C2/A - D/H0) with
+    # eta_sys = V_sys / (t B2 + V_sys), the systematic share of the
+    # zero-contrast variance. It is not a threshold effect: the bias is first
+    # order even when systematics are a minority of the budget.
+    planet_unit, leak, zeros = _structured_probe()
+    time_s, target = 3600.0, 5.0
+
+    def probe(eps):
+        kwargs = _solver_kwargs(
+            integration_time_s=time_s,
+            target_snr=target,
+            eps_systematic=eps,
+            with_fringe_tracking=False,
+            continuum_filter_width_channels=11,
+        )
+        solution = ccf_contrast_at_target_snr(
+            planet_unit, leak, zeros, zeros, **kwargs
+        )
+        contrast = solution.contrast_at_target_snr
+        budget = matched_filter_ccf(
+            _channels(contrast * planet_unit, leak),
+            **_matched_filter_kwargs(kwargs),
+        )
+        eta_sys = solution.systematic_var_counts / (
+            time_s * solution.photon_var_zero_contrast
+            + solution.systematic_var_counts
+        )
+        error = 1.0 - budget.ccf_snr / target
+        return eta_sys, contrast, error
+
+    weak_eta, weak_c, weak_error = probe(0.005)
+    strong_eta, strong_c, strong_error = probe(0.1)
+
+    # Weak systematics: a minority of the variance, but a real first-order bias.
+    assert 0.1 < weak_eta < 0.3
+    assert weak_error > 0.0
+    # Dominated.
+    assert strong_eta > 0.95
+
+    # The analytic first-order coefficient, computed independently.
+    filtered_planet = continuum_filter(planet_unit, 11)
+    filtered_leak = continuum_filter(leak, 11)
+    weights = filtered_planet / leak
+    a_coeff = float(np.sum(weights * filtered_planet))
+    c2_coeff = float(np.sum(weights**2 * planet_unit))
+    h0 = float(np.sum(weights * filtered_leak))
+    d_coeff = float(np.sum(filtered_planet * filtered_leak * planet_unit / leak**2))
+    expected_slope = c2_coeff / a_coeff - d_coeff / h0
+
+    assert weak_error / (weak_c * weak_eta) == pytest.approx(
+        expected_slope, rel=0.02
+    )
+    assert strong_error / (strong_c * strong_eta) == pytest.approx(
+        expected_slope, rel=0.05
+    )

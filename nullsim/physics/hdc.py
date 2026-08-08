@@ -57,8 +57,9 @@ planet enters the signal linearly and the variance affinely, and ``V_sys`` does
 not depend on ``c`` in either regime, the condition is a quadratic with a
 closed-form positive root -- no iteration, so a whole contrast curve costs one
 pass per separation. The weights are frozen at ``c = 0``: second-order accurate
-in ``c P1 / v0`` when photon-limited, first-order once systematics dominate
-(see the function docstring).
+in ``c P1 / v0`` only when ``V_sys`` is exactly zero, and first-order for any
+nonzero systematic, with a coefficient proportional to the systematic share of
+the variance ``eta_sys = V_sys / (t B2 + V_sys)`` (see the function docstring).
 
 Pure numpy/scipy: no TOML, ``SimulationState``, or stage imports.
 """
@@ -749,23 +750,36 @@ def ccf_contrast_at_target_snr(
     closed form buys its speed by avoiding. The accuracy is not uniform across
     the two noise regimes:
 
-    - *Photon-limited* (``V_sys`` negligible): the frozen and exact statistics
+    - *Exactly photon-limited* (``V_sys = 0``): the frozen and exact statistics
       agree through the linear term in ``c P1 / v0``, so the error is **second
-      order**. This is the regime the closed form is essentially exact in.
-    - *Systematics-dominated*: recomputed weights also change the leak
-      projection ``B_w(c)``, and hence ``V_sys``, at **first order** in
-      ``c P1 / v0``. The solver is then optimistic by roughly
-      ``2 c (C2/A - D/H0)`` with ``D = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2``
-      and ``H0 = B_w``. That difference vanishes for flat spectra and grows
-      with spectral structure: an 80-channel structured probe with
-      ``V_sys / V_ph ~ 90`` and ``max(c P1 / L) = 0.017`` recovers SNR 4.82
-      against a target of 5, i.e. 3.6% optimistic, and the error scales
-      linearly in ``eps``.
+      order**. This is the only regime the closed form is essentially exact in.
+    - *Any nonzero systematic*: recomputed weights also change the leak
+      projection ``B_w(c)``, and hence ``V_sys``, at **first order**. The
+      general expansion is
 
-    So the returned contrast is reliable wherever the planet is faint against
-    the leak *and* the budget is not deep in the systematics-dominated corner.
-    Where it is, treat the value as a few-percent-optimistic estimate and
-    cross-check with `matched_filter_ccf`.
+      ```text
+      SNR^2_true / SNR^2_frozen = 1 - 2 c eta_sys (C2/A - D/H0) + O(c^2),
+      eta_sys = V_sys / (t B2 + V_sys),
+      D = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2,   H0 = B_w,
+      ```
+
+      so the returned contrast is optimistic by ``c eta_sys (C2/A - D/H0)`` in
+      SNR. ``eta_sys`` is just the systematic share of the zero-contrast
+      variance: it tends to 1 in the systematics-dominated limit and falls
+      smoothly to 0 as the budget becomes photon-limited, which is what makes
+      the first-order term switch on gradually rather than at a threshold.
+      ``C2/A - D/H0`` vanishes for flat spectra and grows with spectral
+      structure, so the bias is driven by structure, not by magnitude.
+
+    Measured on an 80-channel structured probe, the coefficient
+    ``c eta_sys (C2/A - D/H0)`` reproduces the observed error to better than 5%
+    across ``eta_sys`` from 0.19 to 0.99: at ``eta_sys = 0.19`` the solver is
+    0.08% optimistic, at 0.99 it is 3.6%.
+
+    So the closed form is trustworthy when the planet is faint against the leak
+    *and* the systematic share of the variance is small. Otherwise treat the
+    value as optimistic at the percent level, or refine it with a single
+    `matched_filter_ccf` evaluation at the returned contrast.
 
     Raises ``ValueError`` if ``A <= 0``: a template with no surviving line
     structure (a lineless planet spectrum, or one whose lines all fall in
@@ -832,22 +846,28 @@ def ccf_contrast_at_target_snr(
     #
     #     x^2 - p x - q = 0,    p = c0 C2 / A,    q = B2/A + V_sys/(A t),
     #
-    # whose coefficients are ratios of like-dimensioned sums and so stay near
-    # unity no matter how the inputs are scaled. Every product is grouped to
-    # avoid ever forming A t or A^2.
-    contrast_scale = (target_snr / math.sqrt(signal_coefficient)) / math.sqrt(
-        integration_time_s
-    )
+    # which removes the A t and A^2 products. The reduced coefficients are not
+    # themselves near unity -- p and q each still span the dynamic range of the
+    # inputs, and q overflows on its own for a large V_sys over a small A. So q
+    # is never materialized: only sqrt(q) is needed, and taking the square root
+    # of each term first halves its exponent, which is what actually keeps the
+    # arithmetic in range.
+    sqrt_signal = math.sqrt(signal_coefficient)
+    sqrt_time = math.sqrt(integration_time_s)
+    contrast_scale = (target_snr / sqrt_signal) / sqrt_time
     reduced_linear = contrast_scale * (
         planet_selfnoise_coefficient / signal_coefficient
     )
-    reduced_constant = (
-        photon_var_zero_contrast / signal_coefficient
-        + (systematic_var_counts / signal_coefficient) / integration_time_s
+    # sqrt(q) = hypot(sqrt(B2/A), sqrt(V_sys/(A t))), with the systematic term
+    # grouped as sqrt(V_sys)/(sqrt(A) sqrt(t)): V_sys/A alone overflows for a
+    # large systematic against a small signal coefficient.
+    sqrt_reduced_constant = math.hypot(
+        math.sqrt(photon_var_zero_contrast / signal_coefficient),
+        (math.sqrt(systematic_var_counts) / sqrt_signal) / sqrt_time,
     )
     # hypot(p, 2 sqrt(q)) is sqrt(p^2 + 4q) without squaring either argument.
     reduced_root = 0.5 * (
-        reduced_linear + math.hypot(reduced_linear, 2.0 * math.sqrt(reduced_constant))
+        reduced_linear + math.hypot(reduced_linear, 2.0 * sqrt_reduced_constant)
     )
     contrast = contrast_scale * reduced_root
     if not math.isfinite(contrast) or contrast <= 0.0:

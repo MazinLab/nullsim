@@ -296,18 +296,30 @@ reducing the quadratic to
 x^2 - p x - q = 0,   p = c0 C2 / A,   q = B2/A + V_sys/(A t),
 ```
 
-whose coefficients are ratios of like-dimensioned sums and stay near unity
-however the inputs are scaled. Every product is grouped to avoid ever forming
-`A t` or `A^2`: `c0` is `(n / sqrt(A)) / sqrt(t)`, and `V_sys/(A t)` is
-`(V_sys / A) / t`. The discriminant uses `hypot(p, 2 sqrt(q))` rather than
-`sqrt(p^2 + 4q)`, so neither argument is ever squared. Finally the returned
-root is checked finite and positive, and raises with the full coefficient set
-in the message if it is not.
+which removes the `A t` and `A^2` products. It is *not* true that the reduced
+coefficients then sit near unity — `p` and `q` each still span the dynamic
+range of the inputs, and `q` overflows on its own whenever a large `V_sys`
+meets a small `A`. What actually keeps the arithmetic in range is that every
+surviving term enters through a square root, which halves its exponent:
 
-The three magnitudes above are pinned as tests, each against its analytic
-limit: `n / sqrt(A t)` in the photon-limited cases, and `n^2 C2 / (A^2 t)` in
-the `1e-200` case, where a second of integration collects no photons at all and
-the planet's own shot noise sets the root.
+- `c0` is computed as `(n / sqrt(A)) / sqrt(t)`, never `n / sqrt(A t)`.
+- `q` is never materialized. Only `sqrt(q)` is needed, and it is built as
+  `hypot(sqrt(B2/A), sqrt(V_sys) / (sqrt(A) sqrt(t)))`. The systematic term has
+  to be grouped that way rather than as `sqrt(V_sys / (A t))`: `V_sys / A`
+  alone overflows for `A ~ 1e-150` against `V_sys ~ 1e300`, which is reachable
+  with `P1 = 1e10`, `L = 1e170`, `t = 1e140`, `eps = 1` — a case whose true
+  root, `5e160`, is perfectly representable.
+- The discriminant is `hypot(p, 2 sqrt(q))` rather than `sqrt(p^2 + 4q)`, so
+  neither argument is ever squared.
+
+Finally the returned root is checked finite and positive, and raises with the
+full coefficient set in the message if it is not.
+
+Four magnitudes are pinned as tests, each against its analytic limit:
+`n / sqrt(A t)` in the two photon-limited cases; `n^2 C2 / (A^2 t)` in the
+`1e-200` case, where a second of integration collects no photons at all and the
+planet's own shot noise sets the root; and `5e160` in the large-`V_sys` case
+above.
 
 ### Two identities worth knowing
 
@@ -364,8 +376,9 @@ the square of the planet/leak ratio. That is why the roundtrip test asserts only
 measured, `8.3e-4 -> 1.0e-5` -- which drops the squared error by about four
 orders of magnitude.
 
-**With systematics active, the error is first order.** The cancellation above
-is a property of the photon-limited denominator only. Writing
+**With any nonzero systematic, the error is first order.** The cancellation
+above is a property of the `V_sys = 0` denominator specifically -- it is not a
+statement about systematics being "small enough". Writing
 `G(c) = sum_i Ptilde1_i^2 / v_i` and `H(c) = sum_i Ptilde1_i Ltilde_i / v_i`,
 the exact statistic is
 
@@ -377,30 +390,55 @@ with `K = eps^2 t / (2 f)` or `eps^2 t^2`. (The matched filter is invariant
 under an overall rescaling of the weights, which is why the same `c` appears
 in the solver's per-unit-contrast form and in `matched_filter_ccf`'s
 absolute one.) With `G = A - c C2 + O(c^2)` and `H = H0 - c D + O(c^2)`,
-`D = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2`, the systematics-dominated limit
-`K H^2 >> t G` gives
+`D = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2`, expanding at general `K` gives
 
 ```text
-SNR^2_true / SNR^2_frozen -> 1 - 2 c (C2/A - D/H0),
+SNR^2_true / SNR^2_frozen = 1 - 2 c eta_sys (C2/A - D/H0) + O(c^2),
+eta_sys = K H0^2 / (t A + K H0^2) = V_sys / (t B2 + V_sys),
 ```
 
-which is first order in `c` unless `C2/A = D/H0`. Those two ratios coincide for
-flat spectra and separate as spectral structure grows, so the bias is a
-structure effect, not a magnitude effect.
+using `A = B2`. So `eta_sys` is simply the systematic share of the
+zero-contrast variance. It tends to 1 in the systematics-dominated limit, which
+recovers `1 - 2c(C2/A - D/H0)`, and falls smoothly to 0 as the budget becomes
+photon-limited. The first-order term therefore switches on gradually with the
+systematic fraction rather than at a threshold — there is no regime with a
+nonzero `V_sys` in which the error is second order.
+
+The statistic itself is `SNR`, not `SNR^2`, so the observed fractional error is
+half the coefficient above:
+
+```text
+1 - SNR_true/SNR_frozen  ~=  c eta_sys (C2/A - D/H0).
+```
+
+`C2/A - D/H0` vanishes for flat spectra and grows with spectral structure, so
+the bias is driven by structure, not by magnitude.
 
 Measured on an 80-channel structured probe (`P1` a modulated line forest, `L`
-a modulated continuum, width-11 filter, no fringe tracking, `t = 3600 s`):
+a modulated continuum, width-11 filter, no fringe tracking, `t = 3600 s`),
+where `C2/A - D/H0 = 0.02247` analytically:
 
-| `eps` | `V_sys / V_ph` | `max(c P1 / L)` | roundtrip SNR / target |
-|---|---|---|---|
-| 0 | 0 | 0.0018 | 1.000000 |
-| 0.05 | 23 | 0.0088 | 0.98173 |
-| 0.10 | 93 | 0.0172 | 0.96367 |
+| `eps` | `eta_sys` | `c` | roundtrip SNR / target | error / (`c` `eta_sys`) |
+|---|---|---|---|---|
+| 0 | 0 | 0.176 | 1.000000 | — |
+| 0.005 | 0.189 | 0.195 | 0.999172 | 0.02245 |
+| 0.010 | 0.483 | 0.244 | 0.997359 | 0.02241 |
+| 0.020 | 0.789 | 0.382 | 0.993282 | 0.02230 |
+| 0.050 | 0.959 | 0.866 | 0.981731 | 0.02200 |
+| 0.100 | 0.989 | 1.705 | 0.963674 | 0.02154 |
 
-The error doubles when `eps` doubles — first order, confirmed — and the
-photon-limited row is exact to the last digit shown. The pinned test asserts
-the ratio lands in `[0.90, 1.02]`, asserts it is *not* within `rel = 2e-2` of
-the target, and asserts the factor-of-two error scaling.
+The last column is the measured first-order coefficient. It is constant to 4%
+across a five-fold range in `eta_sys` and a nine-fold range in `c`, and it
+agrees with the analytic `C2/A - D/H0 = 0.02247` to better than 1% at small
+`c`. Note the `eta_sys = 0.189` row: systematics are a *minority* of the
+variance there and the error is still first order, just small.
+
+Two tests pin this. One asserts the systematics-dominated roundtrip lands in
+`[0.90, 1.02]`, is *not* within `rel = 2e-2` of the target, and doubles when
+`eps` doubles. The other checks the `eta_sys` scaling directly, requiring
+`error / (c eta_sys)` to agree within 5% between a weak-systematic case
+(`eta_sys ~ 0.19`) and a dominated one (`eta_sys ~ 0.99`), and requiring the
+weak case to have a strictly nonzero error.
 
 The practical statement: the returned contrast is reliable wherever the planet
 is faint against the leak *and* the budget is not deep in the
