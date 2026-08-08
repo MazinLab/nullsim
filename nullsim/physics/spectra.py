@@ -247,10 +247,23 @@ def resample_flux_conserving(
 ) -> NDArray[np.float64]:
     """Bin-average ``values`` into the bins defined by ``target_edges_um``.
 
-    Integrates the source spectrum with a cumulative trapezoid, differences the
-    cumulative integral at the bin edges, and divides by the bin widths. The
-    returned bin means therefore reproduce the source integral over the covered
-    band exactly (up to the trapezoid rule on the source grid).
+    The source is taken to be piecewise linear between its samples -- the same
+    model the trapezoid rule assumes -- and its antiderivative is evaluated
+    *analytically* at the bin edges. Within cell ``[x_k, x_k+1]`` of width
+    ``h``, writing ``s = (p - x_k)/h``,
+
+    ```text
+    f(p)                 = y_k + s (y_k+1 - y_k)
+    integral(x_k -> p)   = h (y_k s + (y_k+1 - y_k) s^2 / 2)
+    ```
+
+    which is quadratic in ``s``. Linearly interpolating the cumulative integral
+    instead -- the obvious shortcut, and what this used to do -- is exact only
+    when a bin edge lands on a source sample, and errs by up to a third
+    otherwise: on a tent ``[0, 1, 0]`` over ``x = [0, 1, 2]``, the bin
+    ``[0.5, 1.5]`` holds 0.75 of flux and linear interpolation of the
+    cumulative returns 0.5. Bin means therefore reproduce the piecewise-linear
+    source integral exactly, edge placement notwithstanding.
     """
     wavelength = np.asarray(wavelength_um, dtype=np.float64)
     source = np.asarray(values, dtype=np.float64)
@@ -275,9 +288,22 @@ def resample_flux_conserving(
             f"target edges [{edges[0]}, {edges[-1]}] extend beyond the source "
             f"grid [{wavelength[0]}, {wavelength[-1]}]"
         )
+    # Exact cumulative at the source nodes: the trapezoid rule is exact for a
+    # piecewise-linear integrand.
     cum = cumulative_trapezoid(source, wavelength, initial=0.0)
-    integral_per_bin = np.diff(np.interp(edges, wavelength, cum))
-    return integral_per_bin / np.diff(edges)
+    # Locate each edge in its source cell and add the analytic within-cell part.
+    cell = np.clip(
+        np.searchsorted(wavelength, edges, side="right") - 1, 0, wavelength.size - 2
+    )
+    left = wavelength[cell]
+    widths = wavelength[cell + 1] - left
+    fraction = (edges - left) / widths
+    y_left = source[cell]
+    slope = source[cell + 1] - y_left
+    cum_at_edges = cum[cell] + widths * (
+        y_left * fraction + 0.5 * slope * fraction * fraction
+    )
+    return np.diff(cum_at_edges) / np.diff(edges)
 
 
 def doppler_shift(spectrum: TemplateSpectrum, rv_kms: float) -> TemplateSpectrum:
@@ -314,6 +340,21 @@ def convolve_to_resolving_power(
     The broadening actually applied is the quadrature difference
     ``1 / r_eff**2 = 1 / r_out**2 - 1 / r_in**2``, so chaining
     ``r_grid -> r_mid -> r_out`` matches the single hop ``r_grid -> r_out``.
+
+    **Outside-band model: no flux beyond the supplied grid.** The kernel is
+    applied with explicit zero padding, so light scattered past either end of
+    ``wavelength_um`` is lost and none is invented. The alternative scipy
+    default, edge replication, is not flux conserving: it fills the pad with a
+    copy of the edge *sample*, so a line sitting on the first channel is
+    smeared out of a pad full of copies of itself and comes back with 2.23x its
+    original flux. Reflection would conserve in-band flux but by fabricating a
+    mirror image of the spectrum, which is a stronger claim about the unobserved
+    band than "nothing is there".
+
+    The practical consequence is that the caller must supply margin: values
+    within about ``8 * sigma`` samples of either end are attenuated, so any
+    wavelength whose result matters -- in particular every channel edge passed
+    to `channelize` -- should sit at least that far inside the grid.
 
     Raises ``ValueError`` if the grid is not log-uniform (``d ln lambda``
     constant to 1e-6 relative) or if ``r_in <= r_out``.
@@ -356,6 +397,13 @@ def convolve_to_resolving_power(
     inv_r_eff_sq = 1.0 / r_out**2 - (0.0 if math.isinf(r_in) else 1.0 / r_in**2)
     r_eff = 1.0 / math.sqrt(inv_r_eff_sq)
     sigma_samples = r_grid / (r_eff * 2.0 * math.sqrt(2.0 * math.log(2.0)))
-    return gaussian_filter1d(
-        source, sigma_samples, mode="nearest", truncate=_KERNEL_TRUNCATE
+    # Explicit zero pad, convolve, crop. Equivalent to mode="constant" here,
+    # written out so the outside-band model is visible at the call site and the
+    # pad width is tied to the same truncation the kernel uses.
+    pad = int(math.ceil(_KERNEL_TRUNCATE * sigma_samples)) + 1
+    padded = np.zeros(source.size + 2 * pad, dtype=np.float64)
+    padded[pad : pad + source.size] = source
+    smoothed = gaussian_filter1d(
+        padded, sigma_samples, mode="constant", cval=0.0, truncate=_KERNEL_TRUNCATE
     )
+    return smoothed[pad : pad + source.size]

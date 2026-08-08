@@ -148,3 +148,74 @@ def test_convolve_accounts_for_input_resolution():
     mid = convolve_to_resolving_power(grid, values, 30_000.0)
     two_hop = convolve_to_resolving_power(grid, mid, 10_000.0, r_in=30_000.0)
     np.testing.assert_allclose(two_hop, one_hop, atol=1e-9)
+
+
+def test_resample_flux_conserving_is_exact_within_a_source_cell():
+    # A tent over x = [0, 1, 2]. The bin [0.5, 1.5] straddles the peak and lies
+    # strictly inside two half-cells, so no bin edge lands on a source sample.
+    # Truth: int_0.5^1 x dx + int_1^1.5 (2 - x) dx = 0.375 + 0.375 = 0.75.
+    # Linear interpolation of the cumulative returns 0.5, a 33% deficit.
+    wavelength = np.array([0.0, 1.0, 2.0]) + 1.0
+    values = np.array([0.0, 1.0, 0.0])
+    edges = np.array([1.5, 2.5])
+    (bin_mean,) = resample_flux_conserving(wavelength, values, edges)
+    assert bin_mean * (edges[1] - edges[0]) == pytest.approx(0.75, rel=1e-12)
+
+
+def test_resample_flux_conserving_matches_the_analytic_integral_on_subcells():
+    # Sub-cell bins on a random piecewise-linear source, against the exact
+    # quadratic antiderivative evaluated independently.
+    rng = np.random.default_rng(11)
+    wavelength = np.linspace(1.0, 2.0, 9)
+    values = rng.uniform(0.5, 4.0, wavelength.size)
+    edges = np.array([1.03, 1.09, 1.4, 1.65, 1.9375])
+    got = resample_flux_conserving(wavelength, values, edges)
+
+    def exact_integral(a, b):
+        total = 0.0
+        fine = np.linspace(a, b, 200_001)
+        total = np.trapezoid(np.interp(fine, wavelength, values), fine)
+        return total
+
+    expected = np.array(
+        [
+            exact_integral(a, b) / (b - a)
+            for a, b in zip(edges[:-1], edges[1:], strict=True)
+        ]
+    )
+    assert got == pytest.approx(expected, rel=1e-8)
+
+
+def test_convolve_does_not_invent_flux_at_the_grid_edges():
+    # Edge replication fills the pad with copies of the edge sample, so a delta
+    # on the first channel comes back with 2.23x its flux. Zero padding models
+    # "no flux outside the supplied grid": the delta keeps only the in-band half
+    # of its kernel, and nothing is created.
+    grid = constant_r_grid(1.0, 1.1, 20_000.0)
+    interior = np.zeros(grid.size)
+    interior[grid.size // 2] = 1.0
+    assert convolve_to_resolving_power(grid, interior, 2000.0).sum() == pytest.approx(
+        1.0, rel=1e-6
+    )
+
+    edge = np.zeros(grid.size)
+    edge[0] = 1.0
+    edge_flux = convolve_to_resolving_power(grid, edge, 2000.0).sum()
+    # A delta on the first sample keeps the right half of its kernel plus half
+    # of its own centre sample: 0.5 + g(0)/2 with g(0) = 1/(sigma sqrt(2 pi)).
+    sigma_samples = 20_000.0 / (2000.0 * 2.0 * np.sqrt(2.0 * np.log(2.0)))
+    expected = 0.5 + 0.5 / (sigma_samples * np.sqrt(2.0 * np.pi))
+    assert expected == pytest.approx(0.546972, rel=1e-5)
+    assert edge_flux == pytest.approx(expected, rel=1e-6)
+    assert edge_flux < 1.0  # never invents flux, which is the actual bug fixed
+
+
+def test_convolve_leaves_a_constant_flat_away_from_the_edges():
+    # Zero padding attenuates within ~8 sigma of each end, by construction.
+    # Away from that margin a constant must survive untouched.
+    grid = constant_r_grid(1.0, 1.5, 20_000.0)
+    flat = np.full(grid.size, 3.0)
+    out = convolve_to_resolving_power(grid, flat, 2000.0)
+    sigma_samples = 20_000.0 / (2000.0 * 2.0 * np.sqrt(2.0 * np.log(2.0)))
+    margin = int(np.ceil(8.0 * sigma_samples)) + 1
+    assert out[margin:-margin] == pytest.approx(3.0, rel=1e-9)

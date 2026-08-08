@@ -21,6 +21,31 @@ Rates arrive as high-resolution densities in Hz/um on a constant-R log grid.
 then bin-averages onto the channel edges, multiplying by the channel widths to
 get Hz per channel.
 
+Two numerical details in that chain, both found by the 2026-08-07 review.
+
+*The resample uses the analytic antiderivative.* The source is piecewise
+linear between samples, so its integral is piecewise *quadratic*; interpolating
+the cumulative linearly is exact only when a bin edge lands on a source sample.
+On a tent `[0, 1, 0]` over `x = [0, 1, 2]` the bin `[0.5, 1.5]` holds 0.75 of
+flux and linear interpolation returns 0.5, a 33% deficit. Within cell
+`[x_k, x_k+1]` of width `h`, with `s = (p - x_k)/h`, the exact partial integral
+is `h (y_k s + (y_k+1 - y_k) s^2 / 2)`, which is what the code now evaluates.
+At the oversampling the packaged templates use the old error was under 1%, but
+it scaled with how far bin edges fell from source samples, which is not a thing
+a caller controls.
+
+*The LSF pads with zeros, not by edge replication.* Scipy's `nearest` mode
+fills the pad with copies of the edge *sample*, so a line sitting on the first
+channel is smeared out of a pad full of copies of itself and returns 2.23x its
+flux. The convolution now pads explicitly with zeros -- outside-band model:
+no flux beyond the supplied grid -- convolves, and crops. An edge delta then
+keeps `0.5 + g(0)/2` of its flux, the right half of the kernel plus half its
+own centre sample, and nothing is ever created. Reflection would conserve
+in-band flux but only by fabricating a mirror image of the spectrum, a stronger
+claim about the unobserved band than "nothing is there". The cost is that the
+caller must leave margin: values within `~8 sigma` of either end are
+attenuated, so channel edges must sit at least that far inside the grid.
+
 Order matters. `resample_flux_conserving` returns bin *means*, which is already
 a boxcar average over each channel. Convolving after resampling would apply the
 LSF on top of that boxcar and over-smooth; convolving first, on the log-uniform
