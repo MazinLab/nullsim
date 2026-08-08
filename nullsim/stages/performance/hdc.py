@@ -308,8 +308,13 @@ class HdcPerformanceStage(BaseStage):
             n_dark_ports,
             float(params.awg_throughput),
         )
-        leak_shape_factor, leak_shape_model = _chromatic_leak_factors(
+        (
+            leak_shape_factor,
+            leak_shape_model,
+            leak_shape_notes,
+        ) = _chromatic_leak_factors(
             sensitivity=sensitivity,
+            performance=performance,
             separations_mas=separations_mas,
             grid_um=grid_um,
             leak_density=densities.leak_density,
@@ -488,6 +493,7 @@ class HdcPerformanceStage(BaseStage):
                 params, performance, n_dark_ports
             ),
             "leak_shape_model": leak_shape_model,
+            "leak_shape_fallback_reasons": leak_shape_notes,
             "upstream_sensitivity_link_source": linked_source,
             "source_model": (
                 "nullsim performance.hdc: "
@@ -984,31 +990,69 @@ def _sky_rate_hz_per_anchor(
 def _chromatic_leak_factors(
     *,
     sensitivity: dict[str, Any],
+    performance: dict[str, Any],
     separations_mas: NDArray[np.float64],
     grid_um: NDArray[np.float64],
     leak_density: NDArray[np.float64],
-) -> tuple[NDArray[np.float64] | None, str]:
-    """Per-anchor multiplicative leak shape from a chromatic residual surface.
+) -> tuple[NDArray[np.float64] | None, str, tuple[str | None, ...]]:
+    """Per-anchor multiplicative leak shape from the chromatic null profile.
 
-    ``sensitivity.detection_curve`` publishes
-    ``residual_starlight_contrast_by_wavelength`` -- an ``(n_sep, n_wl)``
-    surface -- whenever the config supplied a chromatic residual-contrast
-    table (``examples/hwo_space.toml`` does). Where it exists, the null is not
-    grey and the leak carries that wavelength structure, which changes the
-    leak's projection onto the planet template and therefore the whole
-    systematic term.
+    The residual-starlight surface is **not** the shape of the whole leak, and
+    treating it as one is badly wrong in the common case. Sensitivity combines
+    it with a grey base -- ``_apply_residual_starlight_to_effective_null``,
+    modes ``max`` / ``add`` / ``replace``, published as
+    ``residual_starlight_combine_mode`` -- and ``performance.standard`` then
+    raises further grey floors over the result
+    (``_contrast_curve_leakage_rates_from_null_curve`` takes elementwise maxima
+    with ``null_depth_residual`` and ``calibration_floor``). With a grey 1e-6
+    base and a 1e-10 residual under ``max``, the true null is grey everywhere;
+    normalizing the raw residual instead would make the entire leak chromatic
+    and invent structure that is not in the budget.
 
-    Each anchor's row is interpolated onto the analysis grid and normalized to
-    unit band mean *under the grey leak density as weight*, so multiplying it
-    in adds the structure while leaving the published band total untouched.
+    So the per-wavelength null is reconstructed the way the upstream stages
+    built it: ``combine(grey_base, residual(lambda))`` with the published mode,
+    then the performance grey floors, and only THEN normalized to unit band
+    mean (weighted by the grey leak density) to become the leak shape. The
+    grey base is ``effective_null_before_residual_starlight``, the scalar the
+    sensitivity stage actually passed to the combine -- not
+    ``effective_null_with_disk_by_separation``, which is the POST-combine curve
+    and would double count the residual.
 
-    Returns ``(factors_or_None, leak_shape_model)``; ``None`` means grey.
+    Returns ``(factors_or_None, leak_shape_model, per_anchor_fallback_notes)``.
+    ``None`` means every anchor is grey.
     """
+
+    notes: list[str | None] = [None] * separations_mas.size
 
     surface = sensitivity.get("residual_starlight_contrast_by_wavelength")
     wavelengths_um = sensitivity.get("residual_starlight_wavelengths_um")
+    combine_mode = sensitivity.get("residual_starlight_combine_mode")
+    grey_base = _positive_finite(
+        sensitivity.get("effective_null_before_residual_starlight")
+    )
+
     if surface is None or wavelengths_um is None:
-        return None, _GREY_LEAK_SHAPE_MODEL
+        return None, _GREY_LEAK_SHAPE_MODEL, tuple(notes)
+    if combine_mode not in ("max", "add", "replace"):
+        return (
+            None,
+            _GREY_LEAK_SHAPE_MODEL
+            + " A residual surface was published but "
+            f"residual_starlight_combine_mode={combine_mode!r} is not one of "
+            "max/add/replace, so the profile cannot be reconstructed and grey "
+            "is used.",
+            tuple(notes),
+        )
+    if grey_base is None and combine_mode != "replace":
+        return (
+            None,
+            _GREY_LEAK_SHAPE_MODEL
+            + " A residual surface was published but "
+            "effective_null_before_residual_starlight is unavailable, so the "
+            f"{combine_mode!r} combine has no grey base and grey is used.",
+            tuple(notes),
+        )
+
     values = np.asarray(surface, dtype=np.float64)
     axis_um = np.asarray(wavelengths_um, dtype=np.float64)
     if (
@@ -1017,21 +1061,103 @@ def _chromatic_leak_factors(
         or values.shape[1] != axis_um.size
         or axis_um.size < 2
         or not np.all(np.isfinite(values))
-        or np.all(values <= 0.0)
     ):
-        return None, _GREY_LEAK_SHAPE_MODEL
+        return None, _GREY_LEAK_SHAPE_MODEL, tuple(notes)
 
     order = np.argsort(axis_um)
     axis_um = axis_um[order]
     values = values[:, order]
+    floor = _grey_null_floor(performance)
+    base = 0.0 if grey_base is None else float(grey_base)
 
-    factors = np.empty((separations_mas.size, grid_um.size), dtype=np.float64)
+    factors = np.ones((separations_mas.size, grid_um.size), dtype=np.float64)
+    any_chromatic = False
     for index in range(separations_mas.size):
-        row = np.clip(values[index], 0.0, None)
-        shape = np.interp(grid_um, axis_um, row)
-        mean = _weighted_mean(shape, leak_density, grid_um)
-        factors[index] = shape / mean
-    return factors, _CHROMATIC_LEAK_SHAPE_MODEL
+        residual = np.clip(values[index], 0.0, None)
+        profile = np.interp(grid_um, axis_um, residual)
+        if combine_mode == "max":
+            profile = np.maximum(profile, base)
+        elif combine_mode == "add":
+            profile = profile + base
+        if floor > 0.0:
+            profile = np.maximum(profile, floor)
+        mean = _safe_weighted_mean(profile, leak_density, grid_um)
+        if mean is None:
+            # A valid all-zero residual row under ``replace`` leaves no
+            # profile to normalize. Grey for this anchor; never abort.
+            notes[index] = (
+                "chromatic leak shape degenerate at this anchor (combined "
+                "null profile has no positive band mean); fell back to grey"
+            )
+            continue
+        factors[index] = profile / mean
+        any_chromatic = True
+
+    if not any_chromatic:
+        return (
+            None,
+            _GREY_LEAK_SHAPE_MODEL
+            + " A residual surface was published but every anchor's combined "
+            "null profile was degenerate, so grey is used throughout.",
+            tuple(notes),
+        )
+    return factors, _chromatic_leak_shape_model(combine_mode, base, floor), tuple(
+        notes
+    )
+
+
+def _grey_null_floor(performance: dict[str, Any]) -> float:
+    """The grey floors performance.standard raises over the null curve.
+
+    Mirrors ``_contrast_curve_leakage_rates_from_null_curve``: the null curve
+    is maxed against ``null_depth_residual`` and ``calibration_floor`` before
+    becoming a leakage rate. Both are grey, so they flatten the profile.
+    """
+
+    floor = 0.0
+    for key in ("null_depth_residual", "calibration_floor"):
+        value = _positive_finite(performance.get(key))
+        if value is not None:
+            floor = max(floor, value)
+    return floor
+
+
+def _safe_weighted_mean(
+    values: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    grid_um: NDArray[np.float64],
+) -> float | None:
+    """`_weighted_mean` that reports degeneracy instead of raising."""
+
+    try:
+        return _weighted_mean(values, weights, grid_um)
+    except ValueError:
+        return None
+
+
+def _chromatic_leak_shape_model(
+    combine_mode: str, grey_base: float, floor: float
+) -> str:
+    return (
+        "CHROMATIC null. The per-wavelength null profile is reconstructed the "
+        "way the upstream stages built it, not taken raw from the residual "
+        f"surface: combine_mode={combine_mode!r} applied to a grey base of "
+        f"{grey_base:.6g} (sensitivity effective_null_before_residual_starlight, "
+        "the scalar that stage actually passed to the combine) and the "
+        "per-anchor row of residual_starlight_contrast_by_wavelength, then "
+        f"raised over a grey floor of {floor:.6g} "
+        "(max of performance.standard's null_depth_residual and "
+        "calibration_floor, mirroring "
+        "_contrast_curve_leakage_rates_from_null_curve). That combined "
+        "profile is normalized to unit band mean under the grey leak density, "
+        "so the wavelength structure enters while the published band total is "
+        "preserved. When the base dominates the residual the profile comes out "
+        "flat and the leak is effectively grey, which is the correct answer. "
+        "Anchors whose combined profile is degenerate fall back to grey "
+        "individually; see leak_shape_fallback_reasons. Because the leak shape "
+        "is anchor dependent, each anchor is rechannelized rather than scaled "
+        "off a grey reference."
+    )
 
 
 def _broadband_contrast(

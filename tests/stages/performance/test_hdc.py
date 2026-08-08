@@ -208,6 +208,7 @@ def test_performance_hdc_publishes_expected_payload_keys(
         "ccf_model",
         "detection_budget_model",
         "leak_shape_model",
+        "leak_shape_fallback_reasons",
         "upstream_performance_component",
         "upstream_sensitivity_component",
     }
@@ -549,67 +550,162 @@ def test_refine_contrast_corrects_a_shortfall_and_reports_it() -> None:
     assert first_snr == snr
 
 
-def test_chromatic_residual_structures_the_leak_spectrum(tmp_path: Path) -> None:
-    """A chromatic null must reach the leak's channel spectrum, not be greyed."""
+def _chromatic_state(
+    *,
+    surface: np.ndarray,
+    wavelengths_um: np.ndarray,
+    combine_mode: str,
+    grey_base: float,
+) -> SimulationState:
+    """A state whose performance link points at a chromatic sensitivity run."""
 
-    wl_um = np.linspace(_WL_MIN_UM, _WL_MAX_UM, 12)
-    # A strong ramp with a notch: unmistakable structure.
-    row = 1.0 + 4.0 * (wl_um - _WL_MIN_UM) / (_WL_MAX_UM - _WL_MIN_UM)
-    row[5:7] *= 0.1
-    surface = np.tile(row, (_N_ANCHORS, 1))
+    from nullsim.pipeline.state import Results
 
     sensitivity = _sensitivity_payload()
     sensitivity["residual_starlight_contrast_by_wavelength"] = surface
     sensitivity["residual_starlight_wavelengths_um"] = tuple(
-        float(w) for w in wl_um
+        float(w) for w in wavelengths_um
     )
+    sensitivity["residual_starlight_combine_mode"] = combine_mode
+    sensitivity["effective_null_before_residual_starlight"] = grey_base
 
     base = _state()
-    chromatic = replace(
-        base,
-        results=base.results.add_component(
-            "sensitivity.detection_curve.chromatic", sensitivity
-        ),
-    )
-    # Point the performance link at the chromatic sensitivity component.
-    performance = dict(
-        chromatic.results.components["performance.standard"]
-    )
+    comps = dict(base.results.components)
+    comps["sensitivity.detection_curve.chromatic"] = sensitivity
+    performance = dict(comps["performance.standard"])
     performance["upstream_sensitivity_component"] = (
         "sensitivity.detection_curve.chromatic"
     )
-    comps = dict(chromatic.results.components)
+    # No grey floor from the performance side for these cases.
+    performance["null_depth_residual"] = 0.0
+    performance["calibration_floor"] = None
     comps["performance.standard"] = performance
-    from nullsim.pipeline.state import Results
+    return replace(base, results=Results(components=comps))
 
-    chromatic = replace(chromatic, results=Results(components=comps))
 
-    grey_payload = _stage(_context(tmp_path)).apply(base).results.components[
+def _distinct_residual_rows(n_wl: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-anchor rows with visibly DIFFERENT structure, not one tiled row."""
+
+    wl_um = np.linspace(_WL_MIN_UM, _WL_MAX_UM, n_wl)
+    span = (wl_um - _WL_MIN_UM) / (_WL_MAX_UM - _WL_MIN_UM)
+    surface = np.empty((_N_ANCHORS, n_wl), dtype=np.float64)
+    for index in range(_N_ANCHORS):
+        if index % 2 == 0:
+            # Rising to the red.
+            surface[index] = 1.0e-6 * (1.0 + 6.0 * span)
+        else:
+            # Falling to the red: the opposite tilt.
+            surface[index] = 1.0e-6 * (7.0 - 6.0 * span)
+    return wl_um, surface
+
+
+def test_chromatic_residual_structures_the_leak_spectrum(tmp_path: Path) -> None:
+    """A chromatic null must reach each anchor's own leak channel spectrum."""
+
+    wl_um, surface = _distinct_residual_rows(12)
+    # replace: the residual IS the profile, so the structure passes straight
+    # through and each anchor keeps its own tilt.
+    state = _chromatic_state(
+        surface=surface,
+        wavelengths_um=wl_um,
+        combine_mode="replace",
+        grey_base=1.0e-9,
+    )
+
+    grey_payload = _stage(_context(tmp_path)).apply(_state()).results.components[
         "performance.hdc"
     ]
-    chromatic_payload = _stage(_context(tmp_path)).apply(
-        chromatic
-    ).results.components["performance.hdc"]
+    payload = _stage(_context(tmp_path)).apply(state).results.components[
+        "performance.hdc"
+    ]
 
     assert "GREY" in str(grey_payload["leak_shape_model"])
-    assert "CHROMATIC" in str(chromatic_payload["leak_shape_model"])
+    assert "CHROMATIC" in str(payload["leak_shape_model"])
 
-    grey_leak = np.asarray(grey_payload["ccf_leak_rate_hz_per_channel"][0])
-    chromatic_leak = np.asarray(
-        chromatic_payload["ccf_leak_rate_hz_per_channel"][0]
+    grey_leak = np.asarray(grey_payload["ccf_leak_rate_hz_per_channel"])
+    leak = np.asarray(payload["ccf_leak_rate_hz_per_channel"])
+
+    def red_blue_ratio(spectrum: np.ndarray) -> float:
+        half = spectrum.size // 2
+        return float(np.sum(spectrum[half:]) / np.sum(spectrum[:half]))
+
+    grey_ratio = red_blue_ratio(grey_leak[0])
+    # Anchor 0 rises to the red, anchor 1 falls: each must show its OWN tilt,
+    # which a single tiled row could never demonstrate.
+    assert red_blue_ratio(leak[0]) > 1.5 * grey_ratio
+    assert red_blue_ratio(leak[1]) < 0.7 * grey_ratio
+    # Band totals are preserved: the shape is band-mean normalized.
+    for index in (0, 1):
+        assert float(np.sum(leak[index])) == pytest.approx(
+            float(np.sum(grey_leak[index])), rel=0.02
+        )
+
+
+def test_grey_base_dominating_a_max_combine_keeps_the_leak_grey(
+    tmp_path: Path,
+) -> None:
+    """The regression: raw residual normalization invents structure.
+
+    Under ``max`` with a 1e-6 grey base and a 1e-10 residual, the true null is
+    grey at every wavelength. Normalizing the raw residual instead would make
+    the whole leak chromatic.
+    """
+
+    wl_um, surface = _distinct_residual_rows(12)
+    state = _chromatic_state(
+        surface=surface * 1.0e-4,  # residual now ~1e-10, orders below the base
+        wavelengths_um=wl_um,
+        combine_mode="max",
+        grey_base=1.0e-6,
     )
-    # Same band total (the shape is band-mean normalized)...
-    assert float(np.sum(chromatic_leak)) == pytest.approx(
-        float(np.sum(grey_leak)), rel=0.02
+
+    grey_leak = np.asarray(
+        _stage(_context(tmp_path)).apply(_state()).results.components[
+            "performance.hdc"
+        ]["ccf_leak_rate_hz_per_channel"]
     )
-    # ...but a genuinely different spectrum: the ramp must show up as a rising
-    # red/blue ratio that the grey leak does not have.
-    half = chromatic_leak.size // 2
-    grey_ratio = float(np.sum(grey_leak[half:]) / np.sum(grey_leak[:half]))
-    chromatic_ratio = float(
-        np.sum(chromatic_leak[half:]) / np.sum(chromatic_leak[:half])
+    leak = np.asarray(
+        _stage(_context(tmp_path)).apply(state).results.components[
+            "performance.hdc"
+        ]["ccf_leak_rate_hz_per_channel"]
     )
-    assert chromatic_ratio > 1.5 * grey_ratio
+
+    # Identical to the grey leak, not merely close in total.
+    assert np.allclose(leak, grey_leak, rtol=1.0e-9)
+
+
+def test_degenerate_residual_row_falls_back_to_grey_for_that_anchor(
+    tmp_path: Path,
+) -> None:
+    """An all-zero residual row is legal upstream and must not crash."""
+
+    wl_um, surface = _distinct_residual_rows(12)
+    surface[2] = 0.0
+    state = _chromatic_state(
+        surface=surface,
+        wavelengths_um=wl_um,
+        combine_mode="replace",
+        grey_base=0.0,
+    )
+
+    payload = _stage(_context(tmp_path)).apply(state).results.components[
+        "performance.hdc"
+    ]
+    notes = payload["leak_shape_fallback_reasons"]
+
+    # The curve survived, the bad anchor is greyed and says so.
+    assert np.all(np.isfinite(np.asarray(payload["ccf_contrast_5sigma"])))
+    assert int(payload["n_non_detections"]) == 0
+    assert notes[2] is not None and "degenerate" in str(notes[2])
+    assert notes[0] is None and notes[1] is None
+
+    grey_leak = np.asarray(
+        _stage(_context(tmp_path)).apply(_state()).results.components[
+            "performance.hdc"
+        ]["ccf_leak_rate_hz_per_channel"]
+    )
+    leak = np.asarray(payload["ccf_leak_rate_hz_per_channel"])
+    assert np.allclose(leak[2], grey_leak[2], rtol=1.0e-9)
 
 
 def test_sky_carries_the_awg_throughput(tmp_path: Path) -> None:
@@ -646,7 +742,10 @@ def test_zero_scalar_sky_does_not_zero_a_positive_per_anchor_sky(
         "performance.hdc"
     ]
     sky = np.asarray(payload["sky_rate_hz_per_anchor"], dtype=np.float64)
-    assert np.all(sky > 0.0)
+    expected = (
+        2.0e-3 * _N_DARK_PORTS * float(payload["awg_throughput_used"])
+    )
+    assert np.allclose(sky, expected)
     assert np.all(np.isfinite(payload["ccf_contrast_5sigma"]))
 
 
