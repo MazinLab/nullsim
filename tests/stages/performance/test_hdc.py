@@ -172,8 +172,8 @@ def test_performance_hdc_publishes_expected_payload_keys(
 ) -> None:
     expected = {
         "separations_mas",
-        "ccf_contrast_5sigma",
-        "broadband_contrast_5sigma",
+        "ccf_contrast_at_target",
+        "broadband_contrast_at_target",
         "ccf_contrast_gain",
         "target_snr",
         "integration_time_s",
@@ -220,8 +220,8 @@ def test_performance_hdc_curve_shapes_and_finiteness(
     payload: dict[str, object],
 ) -> None:
     separations = np.asarray(payload["separations_mas"], dtype=np.float64)
-    ccf = np.asarray(payload["ccf_contrast_5sigma"], dtype=np.float64)
-    broadband = np.asarray(payload["broadband_contrast_5sigma"], dtype=np.float64)
+    ccf = np.asarray(payload["ccf_contrast_at_target"], dtype=np.float64)
+    broadband = np.asarray(payload["broadband_contrast_at_target"], dtype=np.float64)
     gain = np.asarray(payload["ccf_contrast_gain"], dtype=np.float64)
 
     assert separations.shape == ccf.shape == broadband.shape == gain.shape
@@ -288,10 +288,10 @@ def test_contrast_curve_monotonicity_with_throughput(tmp_path: Path) -> None:
         _state(sensitivity_overrides={"throughputs": tuple(halved)})
     )
     left = np.asarray(
-        baseline.results.components["performance.hdc"]["ccf_contrast_5sigma"]
+        baseline.results.components["performance.hdc"]["ccf_contrast_at_target"]
     )
     right = np.asarray(
-        reduced.results.components["performance.hdc"]["ccf_contrast_5sigma"]
+        reduced.results.components["performance.hdc"]["ccf_contrast_at_target"]
     )
 
     assert right[3] > left[3]
@@ -353,8 +353,8 @@ def test_explicit_upstream_selector_and_most_recent_default(
 
     # More leak needs a brighter planet, so the two selections must differ.
     assert not np.allclose(
-        np.asarray(default_payload["ccf_contrast_5sigma"]),
-        np.asarray(explicit_payload["ccf_contrast_5sigma"]),
+        np.asarray(default_payload["ccf_contrast_at_target"]),
+        np.asarray(explicit_payload["ccf_contrast_at_target"]),
     )
 
     missing = _stage(_context(tmp_path), upstream_performance="performance.nope")
@@ -381,8 +381,8 @@ def test_deterministic(tmp_path: Path) -> None:
     right = second.results.components["performance.hdc"]
 
     assert np.array_equal(
-        np.asarray(left["ccf_contrast_5sigma"]),
-        np.asarray(right["ccf_contrast_5sigma"]),
+        np.asarray(left["ccf_contrast_at_target"]),
+        np.asarray(right["ccf_contrast_at_target"]),
     )
     assert np.array_equal(
         np.asarray(left["refined_snr_per_anchor"]),
@@ -401,7 +401,7 @@ def test_non_detection_anchor_records_nan_and_a_reason(tmp_path: Path) -> None:
     ).apply(_state())
     payload = result.results.components["performance.hdc"]
 
-    ccf = np.asarray(payload["ccf_contrast_5sigma"], dtype=np.float64)
+    ccf = np.asarray(payload["ccf_contrast_at_target"], dtype=np.float64)
     reasons = payload["non_detection_reasons"]
     assert np.all(np.isnan(ccf))
     assert int(payload["n_non_detections"]) == _N_ANCHORS
@@ -694,7 +694,7 @@ def test_degenerate_residual_row_falls_back_to_grey_for_that_anchor(
     notes = payload["leak_shape_fallback_reasons"]
 
     # The curve survived, the bad anchor is greyed and says so.
-    assert np.all(np.isfinite(np.asarray(payload["ccf_contrast_5sigma"])))
+    assert np.all(np.isfinite(np.asarray(payload["ccf_contrast_at_target"])))
     assert int(payload["n_non_detections"]) == 0
     assert notes[2] is not None and "degenerate" in str(notes[2])
     assert notes[0] is None and notes[1] is None
@@ -746,7 +746,7 @@ def test_zero_scalar_sky_does_not_zero_a_positive_per_anchor_sky(
         2.0e-3 * _N_DARK_PORTS * float(payload["awg_throughput_used"])
     )
     assert np.allclose(sky, expected)
-    assert np.all(np.isfinite(payload["ccf_contrast_5sigma"]))
+    assert np.all(np.isfinite(payload["ccf_contrast_at_target"]))
 
 
 def test_per_anchor_curves_interpolate_by_coordinate_not_by_index(
@@ -838,7 +838,7 @@ def test_refinement_side_error_is_caught_per_anchor(
         "performance.hdc"
     ]
     assert int(payload["n_non_detections"]) == _N_ANCHORS
-    assert np.all(np.isnan(np.asarray(payload["ccf_contrast_5sigma"])))
+    assert np.all(np.isnan(np.asarray(payload["ccf_contrast_at_target"])))
     assert all(
         "synthetic refinement failure" in str(reason)
         for reason in payload["non_detection_reasons"]
@@ -882,3 +882,131 @@ def test_zero_grey_base_keeps_the_chromatic_residual(
     grey_ratio = red_blue_ratio(grey_leak[0])
     assert red_blue_ratio(leak[0]) > 1.5 * grey_ratio
     assert red_blue_ratio(leak[1]) < 0.7 * grey_ratio
+
+
+def test_conflicting_upstream_sensitivity_selector_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Overriding the link would mix two solutions under one gain claim."""
+
+    state = _state()
+    other = _sensitivity_payload(throughputs=tuple(0.9 for _ in _THROUGHPUTS))
+    state = replace(
+        state,
+        results=state.results.add_component(
+            "sensitivity.detection_curve.other", other
+        ),
+    )
+
+    stage = _stage(
+        _context(tmp_path),
+        upstream_sensitivity="sensitivity.detection_curve.other",
+    )
+    with pytest.raises(ValueError) as excinfo:
+        stage.apply(state)
+    message = str(excinfo.value)
+    # Both names must appear so the user can see what conflicts with what.
+    assert "sensitivity.detection_curve.other" in message
+    assert "performance.standard" in message
+
+
+def test_upstream_sensitivity_selector_allowed_without_a_link(
+    tmp_path: Path,
+) -> None:
+    """With no link published, the explicit selector is the only signal."""
+
+    state = _state()
+    performance = dict(state.results.components["performance.standard"])
+    del performance["upstream_sensitivity_component"]
+    from nullsim.pipeline.state import Results
+
+    comps = dict(state.results.components)
+    comps["performance.standard"] = performance
+    state = replace(state, results=Results(components=comps))
+
+    payload = _stage(
+        _context(tmp_path), upstream_sensitivity="sensitivity.detection_curve"
+    ).apply(state).results.components["performance.hdc"]
+    assert (
+        payload["upstream_sensitivity_component"] == "sensitivity.detection_curve"
+    )
+    assert "publishes no sensitivity link" in str(
+        payload["upstream_sensitivity_link_source"]
+    )
+
+
+def test_five_sigma_aliases_appear_only_at_a_five_sigma_threshold(
+    tmp_path: Path,
+) -> None:
+    """A curve at another threshold must not be readable as 5 sigma."""
+
+    # The fixture inherits SNR 7, so the aliases must be absent.
+    seven = _stage(_context(tmp_path)).apply(_state()).results.components[
+        "performance.hdc"
+    ]
+    assert float(seven["comparison_target_snr"]) == pytest.approx(7.0)
+    assert "ccf_contrast_5sigma" not in seven
+    assert "broadband_contrast_5sigma" not in seven
+    assert "ccf_contrast_at_target" in seven
+
+    state = _state()
+    performance = dict(state.results.components["performance.standard"])
+    performance["target_snr"] = 5.0
+    from nullsim.pipeline.state import Results
+
+    comps = dict(state.results.components)
+    comps["performance.standard"] = performance
+    state = replace(state, results=Results(components=comps))
+
+    five = _stage(_context(tmp_path)).apply(state).results.components[
+        "performance.hdc"
+    ]
+    assert float(five["comparison_target_snr"]) == pytest.approx(5.0)
+    assert np.array_equal(
+        np.asarray(five["ccf_contrast_5sigma"]),
+        np.asarray(five["ccf_contrast_at_target"]),
+    )
+    assert np.array_equal(
+        np.asarray(five["broadband_contrast_5sigma"]),
+        np.asarray(five["broadband_contrast_at_target"]),
+    )
+
+
+def test_non_converged_refinement_is_a_non_detection(tmp_path: Path) -> None:
+    """A point that does not reach the threshold must not be published.
+
+    The reviewer's probe shape: the refinement lands well off target. Rather
+    than accept it because it merely improved on the solver's own answer, the
+    anchor is published as a non-detection.
+    """
+
+    import nullsim.stages.performance.hdc as module
+
+    calls = {"n": 0}
+
+    class _Budget:
+        def __init__(self, snr: float) -> None:
+            self.ccf_snr = snr
+
+    def wobbly(*args: object, **kwargs: object) -> object:
+        # Always well off target, and the second evaluation is closer than the
+        # first, so the correction step is "accepted" on the old rule.
+        calls["n"] += 1
+        return _Budget(2.0 if calls["n"] % 2 else 6.126)
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(module, "matched_filter_ccf", wobbly)
+    try:
+        payload = _stage(_context(tmp_path)).apply(_state()).results.components[
+            "performance.hdc"
+        ]
+    finally:
+        monkey.undo()
+
+    assert int(payload["n_non_detections"]) == _N_ANCHORS
+    assert np.all(np.isnan(np.asarray(payload["ccf_contrast_at_target"])))
+    assert all(
+        "refinement did not converge" in str(reason)
+        for reason in payload["non_detection_reasons"]
+    )
+    assert any("vs target" in str(reason) for reason in payload["non_detection_reasons"])

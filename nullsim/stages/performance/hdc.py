@@ -9,8 +9,11 @@ across the anchors is a CCF contrast curve — the HDC counterpart of the
 broadband curve ``performance.standard`` already publishes.
 
 As in characterization mode, nothing about the nuller changes: the null depth,
-the throughputs, the leakage, and the photon budgets are exactly the ones
-``performance.standard`` and ``sensitivity.detection_curve`` published. HDC is
+the throughputs, and the leakage are the ones ``performance.standard`` and
+``sensitivity.detection_curve`` published. The detected photon budget is not
+quite theirs -- dispersing the dark ports costs an extra ``awg_throughput`` on
+every optical rate, and detector dark is recharged per spectrograph channel
+rather than per port -- but nothing in the nuller itself moves. HDC is
 an after-the-fact analysis gain, bought by the spectral asymmetry between a
 smooth leaked-starlight continuum and the planet's line forest shifted off the
 stellar rest frame. Framing follows Wang, Mawet, Ruane, Hu & Benneke 2017,
@@ -29,11 +32,13 @@ analysis grid, the density normalizations, and the channel builder. Only the
   tilt of the flat-``F_lambda`` zero-point model that produced it
   (``physics/photometry.py``). The stellar template then contributes only its
   ``F_lambda`` shape, exactly as in characterization mode.
-* Both the planet throughput and the null are grey across the band here: the
-  sensitivity stage publishes one throughput per separation, and
-  ``performance.standard`` one leakage rate. So the anchors differ only in
-  amplitude, and the channelization is done once and scaled — exact, because
-  convolution and binning are linear.
+* The planet throughput is grey across the band -- the sensitivity stage
+  publishes one value per separation -- so the planet spectrum is channelized
+  once and scaled per anchor, which is exact because convolution and binning
+  are linear. The NULL need not be grey: when the sensitivity stage published a
+  chromatic residual surface, the per-wavelength null profile is reconstructed
+  per anchor and those anchors are rechannelized individually. Grey is the
+  fallback, not the model.
 
 Deterministic: the stage draws no random numbers.
 """
@@ -164,16 +169,44 @@ class HdcPerformanceStage(BaseStage):
         # and the leakage rate describing the same solution; falling back to
         # recency could pair this stage's throughputs with a different run's
         # leak.
+        linked = performance.get("upstream_sensitivity_component")
+        linked = linked if isinstance(linked, str) and linked else None
         sensitivity_request = params.upstream_sensitivity
-        linked_source = "performance.hdc upstream_sensitivity param"
-        if sensitivity_request is None:
-            linked = performance.get("upstream_sensitivity_component")
-            if isinstance(linked, str) and linked:
-                sensitivity_request = linked
-                linked_source = (
-                    f"{performance_name} upstream_sensitivity_component link"
+        if sensitivity_request is not None and linked is not None:
+            if sensitivity_request != linked:
+                # Overriding the link would take the broadband curve, the leak,
+                # and the sky from the performance stage's solution while
+                # taking the throughputs and the chromatic null from a
+                # different one -- and comparison_model would still claim both
+                # curves describe the same observation. There is no honest
+                # reading of that, so refuse it.
+                raise ValueError(
+                    "performance.hdc upstream_sensitivity "
+                    f"{sensitivity_request!r} conflicts with "
+                    f"{performance_name!r}, which was computed against "
+                    f"{linked!r}. Mixing them would pair one solution's "
+                    "broadband curve, leakage, and sky with another's planet "
+                    "throughputs and chromatic null while ccf_contrast_gain "
+                    "claims the two curves describe the same observation. "
+                    "Either drop upstream_sensitivity so the link is followed, "
+                    "or select a performance.standard component that used "
+                    f"{sensitivity_request!r}."
                 )
-        if sensitivity_request is None:
+            linked_source = (
+                "performance.hdc upstream_sensitivity param (agrees with the "
+                f"{performance_name} link)"
+            )
+        elif sensitivity_request is not None:
+            linked_source = (
+                "performance.hdc upstream_sensitivity param "
+                f"({performance_name} publishes no sensitivity link)"
+            )
+        elif linked is not None:
+            sensitivity_request = linked
+            linked_source = (
+                f"{performance_name} upstream_sensitivity_component link"
+            )
+        else:
             linked_source = "most recently added compatible component"
         sensitivity_name, sensitivity = _find_component(
             state,
@@ -418,8 +451,14 @@ class HdcPerformanceStage(BaseStage):
         )
         payload = {
             "separations_mas": separations_mas.astype(np.float64, copy=True),
-            "ccf_contrast_5sigma": contrast.astype(np.float64, copy=True),
-            "broadband_contrast_5sigma": broadband.astype(np.float64, copy=True),
+            # Threshold-generic names. comparison_target_snr is the
+            # authoritative threshold; the *_5sigma aliases below exist only
+            # when it really is 5, so a consumer cannot read "5 sigma" off a
+            # curve computed at some other target.
+            "ccf_contrast_at_target": contrast.astype(np.float64, copy=True),
+            "broadband_contrast_at_target": broadband.astype(
+                np.float64, copy=True
+            ),
             "ccf_contrast_gain": np.asarray(gain, dtype=np.float64),
             "target_snr": float(target_snr),
             "integration_time_s": float(integration_time_s),
@@ -502,6 +541,16 @@ class HdcPerformanceStage(BaseStage):
                 "spectral machinery shared with characterization.hdc_ccf."
             ),
         }
+        if math.isclose(float(target_snr), 5.0, rel_tol=1.0e-9, abs_tol=0.0):
+            # Back-compatible aliases, present ONLY at a genuine 5-sigma
+            # threshold. Absent otherwise, so a consumer that keys on them
+            # fails loudly instead of mislabelling the curve.
+            payload["ccf_contrast_5sigma"] = contrast.astype(
+                np.float64, copy=True
+            )
+            payload["broadband_contrast_5sigma"] = broadband.astype(
+                np.float64, copy=True
+            )
         results = state.results.add_component(component_name, payload)
         return replace(state, results=results)
 
@@ -561,31 +610,41 @@ _CCF_MODEL = (
     "filter is inverted -- nullsim.physics.hdc.ccf_contrast_at_target_snr "
     "solves SNR(c) = target_snr in closed form -- to give the faintest planet "
     "the same observation still detects. This is an after-the-fact analysis "
-    "gain at FIXED nuller performance: the null depth, planet throughputs, "
-    "leakage, and photon budgets are exactly the ones performance.standard and "
-    "sensitivity.detection_curve published, and nothing here changes them. "
-    "The closed form freezes the matched-filter weights at zero contrast, "
-    "which makes it generically FIRST-ORDER OPTIMISTIC once the systematic "
-    "share of the variance is non-negligible (see the solver docstring's "
-    "eta_sys expansion). Every anchor is therefore refined: one "
-    "matched_filter_ccf evaluation at the returned contrast gives the achieved "
-    "SNR and the solver's own bias (solver_optimism_per_anchor = "
-    "target/first_evaluation - 1, positive when the solver was optimistic, "
-    "always measured BEFORE any correction). The sequence is hard bounded: "
-    "solve, evaluate once, and if the achieved SNR is off target by more than "
-    "2%, apply exactly ONE correction and evaluate once more -- never further. "
-    "The correction is a Newton step in log-log space using the analytic slope "
+    "gain at FIXED nuller performance: the null depth, planet throughputs, and "
+    "leakage are the ones performance.standard and sensitivity.detection_curve "
+    "published, and nothing here changes them. The detected photon budget does "
+    "differ from theirs, because dispersing the dark ports is not free: every "
+    "optical rate carries an extra awg_throughput, and detector dark is "
+    "recharged per spectrograph channel rather than per port (see "
+    "detection_budget_model). The closed form freezes the matched-filter "
+    "weights at zero contrast, which makes it generically FIRST-ORDER BIASED "
+    "once the systematic share of the variance is non-negligible; the SIGN of "
+    "that bias is spectrum dependent -- the structural coefficient in the "
+    "solver's expansion can go either way, and probes have come out both "
+    "optimistic and pessimistic -- so the correction is two-sided. Every "
+    "anchor is therefore refined: one matched_filter_ccf evaluation at the "
+    "returned contrast gives the achieved SNR and the solver's own bias "
+    "(solver_optimism_per_anchor = target/first_evaluation - 1, positive when "
+    "the solver was optimistic and negative when it was pessimistic, always "
+    "measured BEFORE any correction). The sequence is hard bounded: solve, "
+    "evaluate once, and if the achieved SNR is off target by more than 2%, "
+    "apply exactly ONE correction and evaluate once more -- never further. The "
+    "correction is a Newton step in log-log space using the analytic slope "
     "d ln SNR / d ln c = 1 - (1/2)(c t C2)/(t B2 + c t C2 + V_sys), whose "
     "coefficients the solver already returns, so it costs no extra evaluation. "
     "It is not a fixed power of target/refined: SNR(c) is linear in c while "
     "the leak dominates the variance -- where a contrast curve lives -- and "
     "only becomes sqrt(c) once the planet's own shot noise takes over, so a "
-    "fixed square exponent overshoots in the linear regime. "
+    "fixed square exponent overshoots in the linear regime. If the final "
+    "evaluation is STILL off target by more than 2%, the anchor is published "
+    "as a NON-DETECTION rather than as a contrast: a curve point that does not "
+    "actually reach the stated threshold is worse than a missing one. "
     "refined_snr_per_anchor and post_correction_residual_per_anchor report "
-    "where it landed; corrected_anchor_count records how many anchors needed "
-    "the step. In the fixtures exercised so far that count is zero -- the "
-    "leak projection HDC suppresses leaves the solver almost unbiased -- but "
-    "that is fixture-supported observation, not a general guarantee."
+    "where the converged anchors landed; corrected_anchor_count records how "
+    "many needed the step. In the fixtures exercised so far that count is "
+    "zero -- the leak projection HDC suppresses leaves the solver almost "
+    "unbiased -- but that is fixture-supported observation, not a general "
+    "guarantee."
 )
 
 _GREY_LEAK_SHAPE_MODEL = (
@@ -1220,7 +1279,10 @@ def _refine_contrast(
     """Check the solved contrast against the true statistic and correct once.
 
     The closed-form solver freezes its matched-filter weights at zero contrast,
-    which is generically first-order optimistic once systematics are active.
+    which makes it first-order biased once systematics are active. The sign is
+    spectrum dependent -- the structural coefficient in the solver's expansion
+    can go either way, and probes have come out both optimistic and
+    pessimistic -- so the correction is two-sided, not a one-way top-up.
     The contract here is a hard-bounded three-step sequence, never more:
 
     1. one `matched_filter_ccf` evaluation at the solved contrast;
@@ -1274,21 +1336,44 @@ def _refine_contrast(
     contrast = float(solution.contrast_at_target_snr)
     first_snr = achieved(contrast)
     if not (math.isfinite(first_snr) and first_snr > 0.0):
-        return contrast, first_snr, first_snr, False
+        raise ValueError(
+            "refinement did not converge (the matched filter returned SNR "
+            f"{first_snr!r} at the solved contrast {contrast!r})"
+        )
     if abs(first_snr / target_snr - 1.0) <= _REFINEMENT_TOLERANCE:
         return contrast, first_snr, first_snr, False
 
+    # Off target: exactly one correction step is allowed.
+    best_contrast, best_snr, corrected = contrast, first_snr, False
     slope = _log_log_slope(solution, solver_kwargs["integration_time_s"], contrast)
     corrected_contrast = contrast * (target_snr / first_snr) ** (1.0 / slope)
-    if not (math.isfinite(corrected_contrast) and corrected_contrast > 0.0):
-        return contrast, first_snr, first_snr, False
-    corrected_snr = achieved(corrected_contrast)
-    if not (math.isfinite(corrected_snr) and corrected_snr > 0.0):
-        return contrast, first_snr, first_snr, False
-    # Only keep the step if it actually improved on the starting point.
-    if abs(corrected_snr - target_snr) >= abs(first_snr - target_snr):
-        return contrast, first_snr, first_snr, False
-    return corrected_contrast, corrected_snr, first_snr, True
+    if math.isfinite(corrected_contrast) and corrected_contrast > 0.0:
+        corrected_snr = achieved(corrected_contrast)
+        if (
+            math.isfinite(corrected_snr)
+            and corrected_snr > 0.0
+            and abs(corrected_snr - target_snr) < abs(first_snr - target_snr)
+        ):
+            best_contrast, best_snr, corrected = (
+                corrected_contrast,
+                corrected_snr,
+                True,
+            )
+
+    # Whatever the step achieved, the published point has to actually reach the
+    # threshold. Merely improving on a bad start is not enough.
+    if abs(best_snr - target_snr) / target_snr > _REFINEMENT_TOLERANCE:
+        stage = (
+            "after one correction step"
+            if corrected
+            else "and the single correction step did not help"
+        )
+        raise ValueError(
+            f"refinement did not converge (SNR {best_snr:.6g} vs target "
+            f"{target_snr:.6g}, {abs(best_snr / target_snr - 1.0):.1%} off, "
+            f"{stage})"
+        )
+    return best_contrast, best_snr, first_snr, corrected
 
 
 def _log_log_slope(solution: Any, integration_time_s: float, contrast: float) -> float:

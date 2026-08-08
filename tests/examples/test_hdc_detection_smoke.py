@@ -70,23 +70,24 @@ def test_hdc_detection_smoke_example_runs_and_produces_a_ccf_contrast_curve() ->
     )
 
     separations = np.asarray(payload["separations_mas"], dtype=float)
-    ccf = np.asarray(payload["ccf_contrast_5sigma"], dtype=float)
-    broadband = np.asarray(payload["broadband_contrast_5sigma"], dtype=float)
+    ccf = np.asarray(payload["ccf_contrast_at_target"], dtype=float)
+    broadband = np.asarray(payload["broadband_contrast_at_target"], dtype=float)
     gain = np.asarray(payload["ccf_contrast_gain"], dtype=float)
 
     assert separations.shape == ccf.shape == broadband.shape == gain.shape
     assert np.array_equal(separations, np.asarray(load_separations(), dtype=float))
 
-    # NaN anchors are legal (a non-detection is a real outcome), so the
-    # contract is "finite somewhere, positive wherever finite" rather than
-    # "finite everywhere".
-    finite_ccf = np.isfinite(ccf)
-    assert finite_ccf.any()
-    assert np.all(ccf[finite_ccf] > 0.0)
-
-    both_finite = finite_ccf & np.isfinite(broadband)
-    assert both_finite.any()
-    assert np.all(np.isfinite(gain[both_finite]))
+    # NaN anchors are legal in general (a non-detection is a real outcome),
+    # but the shipped config is chosen so every anchor detects -- which is what
+    # its header claims -- so assert the stronger contract here. A NaN
+    # appearing means the config drifted out of the regime it advertises.
+    assert np.all(np.isfinite(ccf)), (
+        "the shipped config claims every anchor detects; non-detections at "
+        f"{np.asarray(separations)[~np.isfinite(ccf)]} mas mean it drifted"
+    )
+    assert np.all(ccf > 0.0)
+    assert np.all(np.isfinite(broadband))
+    assert np.all(np.isfinite(gain))
 
     # The comparison basis is inherited, not configured. Pinning it against
     # the broadband payload is what proves the ratio is apples to apples.
@@ -100,7 +101,7 @@ def test_hdc_detection_smoke_example_runs_and_produces_a_ccf_contrast_curve() ->
     # 1 and the overlay would be pointless.
     assert payload["eps_systematic_used"] > 0.0
     assert payload["with_fringe_tracking_used"] is False
-    assert np.all(gain[both_finite] > 1.0)
+    assert np.all(gain > 1.0)
 
 
 def load_separations() -> list[float]:
