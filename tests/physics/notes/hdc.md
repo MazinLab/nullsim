@@ -29,7 +29,66 @@ Because both operations conserve the band integral, a flat density `f` over a
 band of width `W` must channelize to a total rate `f W`. That identity is the
 first pinned test.
 
-## Matched Filter
+## The Continuum Filter Is A Linear Projection
+
+The high-pass is
+
+```text
+H = I - S,      S = diag(1/c) K,     c = K 1,
+```
+
+with `K` the zero-padded boxcar of odd width `m >= 3`:
+`K_ij = 1/m` for `|i - j| <= m//2`, truncated to the array. Two properties do
+all the work.
+
+*`K` is symmetric.* Restricting a symmetric Toeplitz matrix to a principal
+submatrix leaves it symmetric, so `K = K^T` exactly, and therefore
+
+```text
+S   x = K x / c,
+S^T y = K (y / c),
+```
+
+one smoother application each. `H^T = I - S^T` follows. No dense `n x n` matrix
+is ever built; `continuum_filter` and `continuum_filter_adjoint` are the two
+calls, and a test pins the adjoint against the dense transpose at `1e-14`.
+
+*`S` preserves constants exactly.* `S 1 = diag(1/c) K 1 = diag(1/c) c = 1`, at
+the array edges as well as the interior, because `c` is precisely the in-array
+fraction of each window. So `H 1 = 0` everywhere and a flat stellar continuum
+is annihilated with no edge residual. (A ramp is killed only in the interior;
+the edge residual is second order in the slope.)
+
+### Why not a running median
+
+A median rejects the lines themselves, so it estimates the continuum with less
+self-subtraction. That is why it was the first choice here, and it was wrong.
+The estimator is a weighted sum of *filtered* counts, and a median has no
+closed-form covariance: filtered channels become differences of raw counts and
+neighbours correlate. Pairing that signal model with a raw diagonal variance
+understated the noise badly. Monte Carlo on the alternating-spectrum case
+(200k Poisson realizations through the actual median):
+
+```text
+claimed Var (diagonal-raw) = 1176.9   -> SNR 34.31
+measured Var               = 4275.7   -> SNR 18.00
+                             3.63x variance undercount, 1.91x SNR optimism
+```
+
+A linear `H` costs more self-subtraction -- the lines do drag a mean, and the
+filter leaves negative wings `m` channels wide around every line -- but it
+propagates exactly, and the cost is then *reported* by
+`self_subtraction_factor` instead of hiding in an unmodelled covariance. That
+is the whole trade. Boxcar rather than Gaussian because its support is exactly
+`m` channels, so the banded operator and its adjoint are exact with no kernel
+truncation to reason about.
+
+Worth noting that the median was not even winning on its own terms: measured
+against its own true variance it retained ~0.58 of the unfiltered SNR on the
+alternating case, against 0.637 for the boxcar. The apparent 1.111 it used to
+report was an artifact of the mismatched variance.
+
+## The Statistic, And What It Is Not
 
 Per channel `i`, with Poisson statistics the variance rate equals the mean rate:
 
@@ -37,22 +96,55 @@ Per channel `i`, with Poisson statistics the variance rate equals the mean rate:
 v_i = P_i + L_i + Sky_i + Dark_i     [Hz]
 ```
 
-Let `m_i` be a telluric keep-mask and let a tilde denote continuum filtering
-(subtraction of a running median of odd width >= 3). Treating channels as
-independent, the linear statistic `X = sum_i a_i N_i` with maximum SNR has
-weights proportional to (template)/(variance), giving
+Let `m_i` be a telluric keep-mask and `Ptilde = H P`. The statistic is the
+**photon-weighted CCF against a fixed template**,
 
 ```text
 w_i = m_i * Ptilde_i / v_i           [dimensionless]
+X   = w . (H N)                      [counts]
 S   = t * sum_i w_i Ptilde_i         [counts]
-V_ph = t * sum_i w_i^2 v_i           [counts^2]
 ```
 
-With those weights `V_ph = S` identically, so
+with weights set by the template and the photon variance alone.
+
+### Covariance propagation
+
+`Cov(N) = diag(v t)` for independent Poisson counts, so
+
+```text
+Var(X) = w^T H diag(v t) H^T w = t * sum_i u_i^2 v_i,     u = H^T w.
+```
+
+This is the correction the review forced. The raw diagonal `t sum_i w_i^2 v_i`
+is the variance of `w . N`, not of `w . (H N)`, and the two differ by however
+much the filter correlates the channels -- 23% on the width-3 line comb the MC
+test pins, and it grows as the filter narrows. Note that `u` is generally
+nonzero on telluric-masked channels even though `w` is zero there: masking a
+channel out of the *sum* does not stop the filter pulling that channel's
+photons into its neighbours, and the propagated variance says so.
+
+Only when filtering is bypassed does `u = w`, and then `V_ph = S` identically:
 
 ```text
 SNR_photon = S / sqrt(V_ph) = sqrt(t * sum_i Ptilde_i^2 / v_i).
 ```
+
+### This is not the optimal filter
+
+Under the full covariance `C = diag(v t) + K Ltilde Ltilde^T` -- photon noise
+plus the rank-one systematic -- the maximum-SNR weights are `C^-1 Ptilde`, which
+Sherman-Morrison gives in closed form. That filter actively projects out the
+leak direction and beats the fixed-template statistic by roughly an order of
+magnitude once systematics dominate.
+
+It is documented here as an **upper bound, not implemented**, because it assumes
+the leak spectrum `Ltilde` is known exactly. A filter that subtracts a leak it
+knows perfectly will always look good on paper; what an instrument can actually
+deliver is a leak estimate with its own errors, and the gain collapses with the
+knowledge. Adopting it is a design decision about which assumption to make, not
+a bug fix, so the module keeps the honest fixed-template statistic and labels
+it as such. Everything published -- module docstring, stage model strings --
+says "photon-weighted CCF", never "matched filter" unqualified.
 
 Two limits follow directly and are both pinned.
 
@@ -124,15 +216,22 @@ already folded into the rates.
 
 ## Self-Subtraction And `N_eff`
 
-The continuum filter removes some of the planet signal along with the continuum:
-broad planet features are indistinguishable from a stellar continuum. The
-quantity reported is an **SNR-retention ratio, not a flux ratio** -- the
-photon-limited matched-filter SNR of the filtered template divided by that of the
-unfiltered one, on the same unmasked channels and the same noise budget:
+The continuum filter costs the detection twice: it removes some of the planet
+signal along with the continuum (broad planet features are indistinguishable
+from a stellar continuum), and it correlates the photon noise. The reported
+quantity is an **SNR-retention ratio, not a flux ratio** -- the photon-limited
+SNR of the filtered statistic over the unfiltered one, on the same unmasked
+channels and the same noise budget:
 
 ```text
-self_subtraction_factor = sqrt(sum_i Ptilde_i^2 / v_i) / sqrt(sum_i P_i^2 / v_i).
+                          (t sum_i w_i Ptilde_i) / sqrt(t sum_i u_i^2 v_i)
+self_subtraction_factor = --------------------------------------------------,
+                                  sqrt(t sum_i P_i^2 / v_i)
 ```
+
+with `u = H^T w`. Since the numerator now carries the propagated variance, the
+ratio prices both costs rather than only the signal loss. At `width <= 0` the
+numerator is `sqrt(t sum_i P_i^2/v_i)` and the ratio is exactly 1.
 
 The obvious alternative, the weighted flux ratio
 `sum_i w_i Ptilde_i / sum_i w_i P_i`, does not work. For an
@@ -141,34 +240,51 @@ the lines while `P` is positive, and its denominator can pass through zero. The
 SNR ratio is non-negative by construction and answers the question a filter
 width is actually traded against.
 
-Note that the matched filter itself is untroubled by absorption: the signal
-`S = t sum_i Ptilde_i^2 / v_i` is positive whether the lines are in emission or
-absorption, since a negative template correlates with a negative data excess.
-Only the *summary diagnostic* needed the quadratic form.
+Note that the statistic itself is untroubled by absorption: the signal
+`S = t sum_i w_i Ptilde_i = t sum_i Ptilde_i^2/v_i` is positive whether the
+lines are in emission or absorption, since a negative template correlates with
+a negative data excess. Only the *summary diagnostic* needed the quadratic form.
 
-### It is not bounded by 1, and should not be
+### On whether it can exceed 1
 
-The name invites the reading "fraction retained", but there is no hard `(0, 1]`
-bound and none should be imposed. Take `P = [5, 0.1, 5, 0.1, 5, 0.1, 5]` on a
-flat leak of 100 with a width-3 median filter. The running median of an
-alternating sequence returns the *opposite* level at every interior sample, so
+Under the running median this diagnostic reported 1.11147 for
+`P = [5, 0.1, 5, 0.1, 5, 0.1, 5]` on a flat leak of 100 at width 3, and an
+earlier version of this note argued at length that the above-1 value was real
+and must not be clamped.
+
+It was not real. That number divided a *filtered* signal by an *unfiltered
+diagonal* variance; the apparent gain was the covariance defect showing up in a
+diagnostic. With the linear filter and the propagated variance the same case
+gives 0.637088, and a scan of 3000 random templates and widths found nothing
+above 0.85.
+
+What survives from the earlier argument is the caution, not the claim: **no
+upper bound is proven**. Do not clamp the value, range-validate it into
+`[0, 1]`, or render it as a percentage capped at 100%. If a configuration ever
+reports above 1 that is a result to look at, not a value to squash. What is now
+retracted is the assertion that above-1 is expected for absorption templates.
+
+### `N_eff`
+
+The effective channel count is the participation ratio of the weights,
 
 ```text
-Ptilde = [0, -4.9, +4.9, -4.9, +4.9, -4.9, 0],
+n_effective_channels = (sum_i |w_i|)^2 / sum_i w_i^2,
 ```
 
-and the factor comes out at 1.11147. That is the correct answer. The unfiltered
-template is a bright, nearly flat spectrum whose matched-filter SNR is limited
-by how little it varies; the filter converts narrow absorption dips riding that
-bright continuum into large signed excursions about zero, and a template with
-large signed excursions carries more matched-filter SNR than the near-flat one
-it came from. Deep absorption on a bright continuum is exactly the regime where
-high dispersion helps most, so a diagnostic that reported "1.0, nothing gained"
-there would be hiding the effect the technique exists to exploit.
+which equals `n` for `n` equally weighted channels and 1 when a single channel
+dominates. It answers "how many channels is this detection actually leaning
+on", which is the honest count to quote next to a sqrt(N) scaling argument.
 
-The honest statement is therefore: non-negative, typically at or below 1 for
-emission-line-like templates, and above 1 when absorption structure dominates
-over a bright continuum. Anything that clamps it is throwing away information.
+Two naming notes. The absolute value matters: the design spec writes
+`(sum_i w_i)^2 / sum_i w_i^2`, which is wrong for any template with both
+emission and absorption structure, where positive and negative weights cancel
+in the numerator and the ratio collapses toward zero even though every channel
+is contributing. `(sum |w_i|)^2` is what the code computes and what the note
+specifies. And the quantity counts *channels*, not lines: at any oversampling
+one spectral line occupies several channels, so the field is
+`n_effective_channels`, with `n_effective_lines` kept as a deprecated alias on
+`CcfBudget` and in the stage payloads.
 
 ### Conventions at the edges
 
@@ -332,18 +448,25 @@ with its own consumers.
 
 ### Two identities worth knowing
 
-`A = B2` analytically -- both equal `sum_i Ptilde1_i^2 / v0_i`, since `w_i` is
-`Ptilde1_i / v0_i` on the usable channels. (They are computed by different
-summations, `sum w Ptilde1` and `sum w^2 v0`, so they agree to rounding rather
-than bit for bit; do not assert equality on them.) The photon-limited limit
-(`C2 -> 0`, `V_sys -> 0`) therefore collapses to
+`A = B2` **only when filtering is bypassed.** With `H = I` both equal
+`sum_i Ptilde1_i^2 / v0_i`, since `w_i = Ptilde1_i / v0_i` on the usable
+channels; even then they are computed by different summations
+(`sum w Ptilde1` and `sum u^2 v0`) so they agree to rounding, not bit for bit,
+and should not be asserted equal. With a filter active `u = H^T w != w` and the
+identity fails outright: `B2 = sum_i u_i^2 v0_i` is the propagated photon
+variance rate, a different quantity from the signal coefficient. The
+photon-limited root is `n sqrt(B2)/(A t)` in general, collapsing to
 
 ```text
 c_photon = n / sqrt(A t),
 ```
 
-which is the `1/sqrt(t)` scaling a contrast curve should show, with `A` playing
-the role of an effective line-weighted rate.
+in the bypassed case. Either way it is the `1/sqrt(t)` scaling a contrast curve
+should show, with `A` playing the role of an effective line-weighted rate.
+(The overflow-safe substitution still uses `c0 = n / sqrt(A t)` as its scale;
+it no longer coincides with the photon-limited root when a filter is active,
+but it remains the right order of magnitude, which is all the substitution
+needs. `q = B2/A + V_sys/(A t)` stays a ratio of like-dimensioned sums.)
 
 The flat-template limit reproduces the broadband answer. With `P1_i = p` and
 `L_i = l` on all `n_ch` channels, no filtering and no mask, the quadratic
@@ -364,8 +487,8 @@ contribution to the *weighting* while `C2` still carries the planet shot noise
 into the denominator. Exact weights would depend on the answer, which is
 precisely what the closed form avoids.
 
-**Photon-limited, the error is second order.** Expanding the true statistic in
-`c P1 / v0` with `V_sys = 0`,
+**Photon-limited, the error is second order under a diagonal covariance.**
+Expanding the true statistic in `c P1 / v0` with `V_sys = 0`,
 
 ```text
 t c^2 sum_i Ptilde1_i^2 / (v0_i + c P1_i) = t c^2 (A - c C2 + O(c^2)),
@@ -385,109 +508,93 @@ the square of the planet/leak ratio. That is why the roundtrip test asserts only
 measured, `8.3e-4 -> 1.0e-5` -- which drops the squared error by about four
 orders of magnitude.
 
-**With a nonzero systematic, the error is generically first order.** It
-vanishes when the structural coefficient below is zero, and the frozen
-statistic is exact to all orders when `c P1_i / v0_i` is channel-independent.
-Outside those cases the cancellation that holds at `V_sys = 0` is a property of
-that denominator specifically -- it is not a statement about systematics being
-"small enough". Writing
-`G(c) = sum_i Ptilde1_i^2 / v_i` and `H(c) = sum_i Ptilde1_i Ltilde_i / v_i`,
-the exact statistic is
+**With a filter active, a small first-order term appears even photon-limited.**
+The `H^T` in the variance breaks the cancellation above: perturbing the weights
+perturbs `u = H^T w`, and that feeds back into `Var` in a way the frozen `C2`
+does not capture. Carrying it through, with
+`G(c) = sum_i Ptilde1_i^2/v_i`, `Phi(c) = sum_i (H^T(Ptilde1/v))_i^2 v_i`, and
+`J(c) = sum_i Ptilde1_i Ltilde_i / v_i`, the exact statistic is
 
 ```text
-SNR^2(c) = c^2 t^2 G(c)^2 / (t G(c) + K H(c)^2),
+SNR^2_true(c) = c^2 t^2 G(c)^2 / (t Phi(c) + K J(c)^2)
 ```
 
-with `K = eps^2 t / (2 f)` or `eps^2 t^2`. (The matched filter is invariant
-under an overall rescaling of the weights, which is why the same `c` appears
-in the solver's per-unit-contrast form and in `matched_filter_ccf`'s
-absolute one.) With `G = A - c C2 + O(c^2)` and `H = H0 - c D + O(c^2)`,
-`D = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2`, expanding at general `K` gives
+(the statistic is invariant under an overall rescaling of the weights, which is
+why the same `c` appears in the solver's per-unit-contrast form and in
+`matched_filter_ccf`'s absolute one). Expanding each of `G`, `Phi`, `J` to first
+order about `c = 0` and dividing by the frozen version gives
 
 ```text
-SNR^2_true / SNR^2_frozen = 1 - 2 c eta_sys (C2/A - D/H0) + O(c^2),
-eta_sys = K H0^2 / (t A + K H0^2) = V_sys / (t B2 + V_sys),
+SNR^2_true / SNR^2_frozen = 1 - 2 c Delta + O(c^2),
+
+Delta    = C2'/A - eta_ph E/B2 - eta_sys D/J0,
+eta_sys  = K J0^2 / (t A + K J0^2) = V_sys / (t B2 + V_sys),
+eta_ph   = 1 - eta_sys,
+C2'      = sum_i Ptilde1_i^2 P1_i / v0_i^2          (from dG/dc)
+E        = sum_i u0_i (H^T g)_i v0_i,  g = Ptilde1 P1 / v0^2   (from dPhi/dc)
+D        = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2   (from dJ/dc)
+J0       = B_w.
 ```
 
-using `A = B2`. So `eta_sys` is simply the systematic share of the
-zero-contrast variance. It tends to 1 in the systematics-dominated limit, which
-recovers `1 - 2c(C2/A - D/H0)`, and falls smoothly to 0 as the budget becomes
-photon-limited. The first-order term therefore switches on gradually with the
-systematic fraction rather than at a threshold — there is no regime with a
-nonzero `V_sys` in which the error is second order.
+Sanity check: without a filter `u0 = w0`, so `C2' = E = C2` and `B2 = A`, and
+`Delta` collapses to `eta_sys (C2/A - D/J0)` -- the earlier diagonal-covariance
+result, whose photon-limited end (`eta_sys = 0`) is identically zero. With a
+filter the photon-limited end is `C2'/A - E/B2`, which is *not* identically
+zero. On the structured probe it is `-8.27e-05`, some 330x below the
+systematics-driven end, and negative: the solver is very slightly pessimistic
+there.
 
-The statistic itself is `SNR`, not `SNR^2`, so the observed fractional error is
-half the coefficient above:
+The observed fractional error is half the `SNR^2` coefficient:
 
 ```text
-1 - SNR_true/SNR_frozen  ~=  c eta_sys (C2/A - D/H0).
+1 - SNR_true/SNR_frozen  ~=  c Delta(eta_sys).
 ```
 
-`C2/A - D/H0` is the second gate, and it vanishes identically for a flat
-template against a flat leak.
+Measured on an 80-channel structured probe (`P1` a modulated line forest, `L` a
+modulated continuum, width-11 filter, no fringe tracking, `t = 3600 s`):
 
-There is a stronger statement available, but it needs a stronger hypothesis:
-**the frozen statistic is exact to all orders when `x_i = c P1_i / v0_i` is
-channel-independent.** That is what makes the substitution below legal, since
-it requires factoring a single common `(1+x)` out of each sum:
-
-```text
-G = A/(1+x),   H = H0/(1+x),   B2 + c C2 = A(1+x),
-
-exact = c^2 t^2 (A/(1+x))^2 / (t A/(1+x) + K H0^2/(1+x)^2)
-      = c^2 t^2 A^2 / (t A (1+x) + K H0^2) = frozen.
-```
-
-Flat `P1` and flat `L` do *not* suffice on their own: `v0 = L + sky + dark`, so
-structured sky or dark makes `v0` vary, `x_i` vary with it, and the factoring
-fails. Measured on the same flat probe (`eta_sys = 0.9996`,
-`c P1 / v0 = 0.025`, a *larger* planet/leak ratio than the structured probe's
-0.017 and more systematic-dominated):
-
-| sky | `x` range | roundtrip error |
-|---|---|---|
-| none (`v0` uniform) | `[0.02501, 0.02501]` | `4.4e-16` |
-| alternating 0/80 Hz | `[0.02084, 0.02501]` | `1.0e-9` |
-
-The first row is machine epsilon — exact. The second shows the first-order
-cancellation surviving (`1e-9` against the structured probe's `3.6e-2`) while
-exactness does not: the residual re-enters at second order through the
-structural coefficient.
-
-So the bias needs *both* a nonzero systematic and spectral structure. It is
-driven by structure, not by magnitude, and the honest statement is "generically
-first order", not "first order whenever `V_sys > 0`".
-
-Measured on an 80-channel structured probe (`P1` a modulated line forest, `L`
-a modulated continuum, width-11 filter, no fringe tracking, `t = 3600 s`),
-where `C2/A - D/H0 = 0.02247` analytically:
-
-| `eps` | `eta_sys` | `c` | roundtrip SNR / target | error / (`c` `eta_sys`) |
+| `eps` | `eta_sys` | `c` | error | `(err/c) / Delta(eta_sys)` |
 |---|---|---|---|---|
-| 0 | 0 | 0.176 | 1.000000 | — |
-| 0.005 | 0.189 | 0.195 | 0.999172 | 0.02245 |
-| 0.010 | 0.483 | 0.244 | 0.997359 | 0.02241 |
-| 0.020 | 0.789 | 0.382 | 0.993282 | 0.02230 |
-| 0.050 | 0.959 | 0.866 | 0.981731 | 0.02200 |
-| 0.100 | 0.989 | 1.705 | 0.963674 | 0.02154 |
+| 0 | 0 | 0.180 | `-1.50e-05` | 1.009 |
+| 0.005 | 0.554 | 0.270 | `4.05e-03` | 0.996 |
+| 0.010 | 0.832 | 0.440 | `9.89e-03` | 0.988 |
+| 0.020 | 0.952 | 0.823 | `2.09e-02` | 0.975 |
+| 0.050 | 0.992 | 2.017 | `5.13e-02` | 0.939 |
 
-The last column is the measured first-order coefficient. It is constant to 4%
-across a five-fold range in `eta_sys` and a nine-fold range in `c`, and it
-agrees with the analytic `C2/A - D/H0 = 0.02247` to better than 1% at small
-`c`. Note the `eta_sys = 0.189` row: systematics are a *minority* of the
-variance there and the error is still first order, just small.
+The prediction holds to ~1% while `c` stays small and degrades to 6% at
+`c = 2`, where the `O(c^2)` terms bite. Note the `eta_sys = 0` row: the error is
+`-1.5e-05`, first order in `c` (verified by holding the probe fixed and varying
+`t`: `err/c` stays at `-8.3e-05` across a 10x range in `c` while `err/c^2` does
+not), but worth about a part in `1e5` and of no practical consequence.
 
 Two tests pin this. One asserts the systematics-dominated roundtrip lands in
 `[0.90, 1.02]`, is *not* within `rel = 2e-2` of the target, and doubles when
-`eps` doubles. The other checks the `eta_sys` scaling directly, requiring
-`error / (c eta_sys)` to agree within 5% between a weak-systematic case
-(`eta_sys ~ 0.19`) and a dominated one (`eta_sys ~ 0.99`), and requiring the
-weak case to have a strictly nonzero error.
+`eps` doubles. The other computes `Delta(eta_sys)` independently from the probe
+arrays and requires `error / c` to match it at `rel = 0.03` at both
+`eta_sys ~ 0.17` and `eta_sys ~ 0.89`, and pins the photon-limited end at
+`-8.268e-05`.
 
-The practical statement: the returned contrast is reliable wherever the planet
-is faint against the leak *and* the budget is not deep in the
-systematics-dominated corner. Where it is, it is optimistic by a few percent,
-and `matched_filter_ccf` is the cross-check.
+The practical statement is unchanged: the returned contrast is reliable
+wherever the planet is faint against the leak and the systematic share is
+small. Where it is not, it is optimistic by a few percent, and
+`matched_filter_ccf` is the cross-check.
+
+## Monte Carlo Validation
+
+`test_monte_carlo_photon_variance_matches_the_propagated_prediction` (marked
+`stats`) draws 100k Poisson realizations of the channel counts, runs each
+through the real `continuum_filter`, forms `X = w . (H N)`, and compares the
+empirical variance against `V_ph`. It also asserts the empirical mean matches
+`t sum_i w_i (H v)_i`, that the empirical SNR matches `ccf_snr`, and -- the
+regression guard -- that the old diagonal expression is more than 15% below the
+measured variance on this case.
+
+This is the test the module was missing. Every earlier test checked internal
+consistency: given the model, is the arithmetic right? None of them drew a
+photon, so none could see that the model itself mismatched its own estimator.
+`sqrt(2/N)` is a 0.45% standard error on a variance at `N = 100k`, so the 2%
+band is a comfortable three sigma and still catches the 23% error the diagonal
+formula makes here by a factor of ten.
 
 ### Failure convention
 

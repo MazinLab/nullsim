@@ -476,6 +476,10 @@ class HdcPerformanceStage(BaseStage):
                 float(band.lambda_min_um),
                 float(band.lambda_max_um),
             ),
+            "n_effective_channels_per_anchor": n_effective_lines.astype(
+                np.float64, copy=True
+            ),
+            # Deprecated alias, see CcfBudget.n_effective_lines.
             "n_effective_lines_per_anchor": n_effective_lines.astype(
                 np.float64, copy=True
             ),
@@ -605,7 +609,7 @@ class HdcPerformanceStage(BaseStage):
 
 
 _CCF_MODEL = (
-    "Detection-mode matched-filter cross-correlation after Wang, Mawet, Ruane, "
+    "Detection-mode photon-weighted cross-correlation after Wang, Mawet, Ruane, "
     "Hu & Benneke 2017, AJ 153, 183. At each separation anchor the matched "
     "filter is inverted -- nullsim.physics.hdc.ccf_contrast_at_target_snr "
     "solves SNR(c) = target_snr in closed form -- to give the faintest planet "
@@ -1257,7 +1261,11 @@ def _broadband_contrast(
 
 
 def _participation_ratio(weights: NDArray[np.float64]) -> float:
-    """``(sum |w|)^2 / sum w^2`` of the frozen matched-filter weights."""
+    """``(sum |w|)^2 / sum w^2`` of the frozen filter weights.
+
+    An effective *channel* count, not a line count: at any oversampling one
+    spectral line occupies several channels.
+    """
 
     values = np.asarray(weights, dtype=np.float64)
     square_sum = float(np.sum(values * values))

@@ -1,4 +1,4 @@
-"""Matched-filter cross-correlation (CCF) budget for high dispersion coronagraphy.
+"""Photon-weighted cross-correlation (CCF) budget for high dispersion coronagraphy.
 
 High dispersion coronagraphy (HDC) buys contrast by moving the planet detection
 from a broadband photometric comparison to a spectral one: the planet signal is
@@ -8,21 +8,40 @@ surviving line forest is then correlated against a template. The framing and the
 sqrt(N_lines) scaling follow Wang, Mawet, Ruane, Hu & Benneke 2017, AJ 153, 183
 ("Observing Exoplanets with High Dispersion Coronagraphy. I.").
 
+What this statistic is
+----------------------
+A **photon-weighted CCF with a fixed template**: the weights are
+``w_i = m_i Ptilde_i / v_i``, set by the template and the photon variance alone.
+It is *not* the optimal filter once a systematic is present. Under the rank-one
+systematic covariance the optimum is the Sherman-Morrison filter
+``C^-1 Ptilde`` with ``C = diag(v t) + K Ltilde Ltilde^T``, which actively
+projects out the leak direction and can beat this statistic by an order of
+magnitude in the systematics-dominated regime. That optimum is documented as an
+upper bound only, not implemented: it assumes the leak spectrum is known
+exactly, and buying a 10x paper gain against an assumption the instrument
+cannot deliver is not the trade this module makes. See the derivation note.
+
 Noise model
 -----------
 Work on ``n_ch`` spectrograph channels, each carrying rates in Hz: planet ``P``,
 leaked starlight ``L``, sky ``S_sky``, and detector dark ``D``. Let ``m_i`` be a
-telluric mask (1 where the atmospheric transmission clears a threshold) and let
-``~`` denote continuum filtering (`continuum_filter`, a running-median high-pass).
+telluric mask (1 where the atmospheric transmission clears a threshold), let
+``H`` be the linear continuum high-pass (`continuum_filter`: identity minus a
+normalized boxcar smoother), and write ``Ptilde = H P``, ``Ltilde = H L``.
 
 - Per-channel noise-variance rate ``v_i = P_i + L_i + S_sky,i + D_i`` (Hz).
   Poisson statistics make this both the mean and the variance rate.
-- Matched-filter weights for independent channels: ``w_i = m_i * Ptilde_i / v_i``.
-- Signal ``S = t * sum_i w_i Ptilde_i`` (counts).
-- Photon variance ``V_ph = t * sum_i w_i^2 v_i`` (counts^2). With the weights
-  above this collapses to ``V_ph = S``, so ``SNR_photon = sqrt(t sum_i
-  Ptilde_i^2 / v_i)`` -- the usual matched-filter result, and the broadband
-  ``S/sqrt(S+B)`` when the template is flat.
+- Weights for the fixed-template filter: ``w_i = m_i * Ptilde_i / v_i``.
+- The statistic is ``X = w . (H N)`` on observed counts ``N``, so
+  ``S = t * sum_i w_i Ptilde_i`` (counts).
+- Photon variance ``V_ph = t * w^T H diag(v) H^T w = t * sum_i u_i^2 v_i`` with
+  ``u = H^T w`` (counts^2). The filter correlates neighbouring channels, so the
+  raw diagonal ``t sum_i w_i^2 v_i`` is *not* the variance of this statistic --
+  using it understates the noise by up to a factor of a few. ``H`` is linear
+  precisely so this propagation is exact and closed-form; see
+  `continuum_filter` for why the running median it replaced could not be.
+  Only when filtering is bypassed does ``u = w`` and ``V_ph`` collapse to ``S``,
+  recovering the textbook ``S/sqrt(S+B)`` for a flat template.
 - Systematic: the leaked starlight fluctuates coherently across the band with
   fractional amplitude ``eps`` (null instability). What that fluctuation injects
   into the statistic is not the raw band leak but its projection onto the
@@ -39,14 +58,17 @@ telluric mask (1 where the atmospheric transmission clears a threshold) and let
 
 Two summary diagnostics come along for the ride:
 
-- ``self_subtraction_factor = sqrt(sum_i Ptilde_i^2/v_i) / sqrt(sum_i P_i^2/v_i)``:
-  the fraction of the achievable photon-limited *SNR* (not flux) that survives
-  the continuum filter, over the unmasked channels. Non-negative, 1.0 when
-  filtering is bypassed, and usually at or below 1 -- but it exceeds 1 when
-  absorption structure on a bright continuum turns into large signed
-  excursions under the running median, which is real and must not be clamped.
-- ``n_effective_lines = (sum_i |w_i|)^2 / sum_i w_i^2``: the participation ratio
-  of the weights, i.e. how many channels the statistic actually leans on.
+- ``self_subtraction_factor``: the photon-limited SNR of the filtered statistic
+  over ``sqrt(t sum_i P_i^2/v_i)``, the unfiltered one, on the same unmasked
+  channels. It now prices the whole cost of filtering -- signal lost to
+  self-subtraction *and* noise gained from the correlation ``H`` introduces.
+  Non-negative, exactly 1.0 when filtering is bypassed, usually below 1, but it
+  can exceed 1 when absorption structure on a bright continuum turns into large
+  signed excursions, which is real and must not be clamped.
+- ``n_effective_channels = (sum_i |w_i|)^2 / sum_i w_i^2``: the participation
+  ratio of the weights, i.e. how many channels the statistic actually leans on.
+  (Exposed as ``n_effective_lines`` too, a deprecated alias: the ratio counts
+  channels, and one line spans several of them at any oversampling.)
 
 Detection mode
 --------------
@@ -61,19 +83,18 @@ pass per separation.
 The weights are frozen at ``c = 0``, and the resulting error is
 
 ```text
-SNR^2_true / SNR^2_frozen = 1 - 2 c eta_sys (C2/A - D/H0) + O(c^2),
-eta_sys = V_sys / (t B2 + V_sys),
-D = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2,   H0 = B_w.
+SNR^2_true / SNR^2_frozen = 1 - 2 c Delta + O(c^2),
+Delta = C2'/A - eta_ph E/B2 - eta_sys D/J0,
+eta_sys = V_sys / (t B2 + V_sys),   eta_ph = 1 - eta_sys.
 ```
 
-With ``V_sys = 0`` the linear term vanishes identically and the error is second
-order in ``c P1 / v0``. With ``V_sys > 0`` it is *generically* first order, but
-not unconditionally: the structural coefficient ``C2/A - D/H0`` is itself zero
-for a flat template against a flat leak, and when ``c P1_i / v0_i`` is
-channel-independent as well (flat spectra with unstructured sky/dark) the
-frozen statistic is exact to all orders. So the bias is set by spectral
-structure gated by the systematic share ``eta_sys``, not by the presence of a
-systematic alone. See the function docstring for the measured behavior.
+``Delta`` interpolates between a photon-limited coefficient and a systematics
+one. The photon-limited end is small but, with a linear high-pass, no longer
+identically zero. Both ends vanish for a flat template against a flat leak, and
+when ``c P1_i / v0_i`` is channel-independent as well (flat spectra with
+unstructured sky/dark) the frozen statistic is exact to all orders. So the bias
+is set by spectral structure gated by the systematic share, not by the presence
+of a systematic alone. See the function docstring for the measured behavior.
 
 Pure numpy/scipy: no TOML, ``SimulationState``, or stage imports.
 """
@@ -86,7 +107,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.ndimage import median_filter
+from scipy.ndimage import uniform_filter1d
 
 from nullsim.physics.spectra import (
     constant_r_grid,
@@ -103,6 +124,7 @@ __all__ = [
     "ccf_vs_rv",
     "channelize",
     "continuum_filter",
+    "continuum_filter_adjoint",
     "matched_filter_ccf",
     "snr_vs_resolving_power",
 ]
@@ -179,7 +201,7 @@ class ChannelSpectra:
 
 @dataclass(frozen=True, eq=False)
 class CcfBudget:
-    """Matched-filter CCF signal, noise decomposition, and diagnostics.
+    """Photon-weighted CCF signal, noise decomposition, and diagnostics.
 
     Attributes
     ----------
@@ -188,7 +210,7 @@ class CcfBudget:
     ccf_snr_photon_limited:
         ``S / sqrt(V_ph)``: the same detection with the null instability off.
     signal_counts:
-        Matched-filter signal ``S = t sum_i w_i Ptilde_i`` (counts).
+        Filter signal ``S = t sum_i w_i Ptilde_i`` (counts).
     photon_var_counts, systematic_var_counts:
         The two noise variances (counts^2).
     systematic_ccf_leakage:
@@ -206,18 +228,25 @@ class CcfBudget:
         bypassed (``width <= 0``), unconditionally. 0.0 by convention when
         filtering is active and the template carries no signal at all.
 
-        Typically at or below 1 for emission-line-like templates, but it **can
-        exceed 1** and that is correct, not a bug: a running median converts
-        narrow absorption dips riding a bright continuum into large signed
-        excursions about zero, and those excursions can carry more
-        matched-filter SNR than the near-flat unfiltered spectrum they came
-        from. Do not clamp it.
+        In practice at or below 1. The above-1 values the running median used
+        to produce are gone: they came from dividing a filtered signal by an
+        unfiltered diagonal variance, and pricing the filter's noise penalty
+        removes the apparent gain (the pinned alternating case went from a
+        reported 1.111 to an honest 0.637). A scan of 3000 random templates
+        found nothing above 0.85. **No upper bound is proven, though**, so do
+        not clamp it, range-validate it into [0, 1], or render it as a
+        percentage capped at 100%.
 
         A weighted flux ratio would not do in its place: it changes sign for
         absorption-dominated templates, where the filtered template is negative,
         and its denominator can pass through zero.
-    n_effective_lines:
-        Participation ratio ``(sum_i |w_i|)^2 / sum_i w_i^2`` of the weights.
+    n_effective_channels:
+        Participation ratio ``(sum_i |w_i|)^2 / sum_i w_i^2`` of the weights:
+        how many channels the statistic actually leans on. Equals ``n`` for
+        ``n`` equally weighted channels and 1 when a single channel dominates.
+        Exposed as ``n_effective_lines`` too -- deprecated alias, kept so
+        existing payload consumers keep working; prefer the channel name, since
+        the ratio counts channels and one line spans several of them.
     n_channels_used:
         Channels with a non-zero weight budget (unmasked and ``v_i > 0``).
     template_weights:
@@ -231,9 +260,19 @@ class CcfBudget:
     systematic_var_counts: float
     systematic_ccf_leakage: float
     self_subtraction_factor: float
-    n_effective_lines: float
+    n_effective_channels: float
     n_channels_used: int
     template_weights: NDArray[np.float64]
+
+    @property
+    def n_effective_lines(self) -> float:
+        """Deprecated alias for `n_effective_channels`.
+
+        The ratio is a participation count over *channels*; at any oversampling
+        a single spectral line occupies several of them, so the old name
+        overstated the line count. Kept for payload compatibility.
+        """
+        return self.n_effective_channels
 
 
 def build_channel_edges(
@@ -292,25 +331,101 @@ def channelize(
     return bin_means * np.diff(edges)
 
 
-def continuum_filter(
-    values: NDArray[np.float64], width_channels: int
-) -> NDArray[np.float64]:
-    """High-pass a channel spectrum by subtracting a running median.
-
-    ``values - median_filter(values, size=width, mode="nearest")`` with ``width``
-    forced odd and at least 3 channels. The running median tracks the smooth
-    stellar-leak continuum without being dragged around by the narrow planet
-    lines, which is exactly the asymmetry HDC exploits.
-    """
-    array = np.asarray(values, dtype=np.float64)
-    if array.ndim != 1:
-        raise ValueError(f"values must be 1-D, got shape {array.shape}")
+def _odd_width(width_channels: int) -> int:
+    """Coerce a filter width to odd and at least 3 channels."""
     width = int(width_channels)
     if width < 3:
         width = 3
     if width % 2 == 0:
         width += 1
-    return array - median_filter(array, size=width, mode="nearest")
+    return width
+
+
+def _boxcar(values: NDArray[np.float64], width: int) -> NDArray[np.float64]:
+    """Zero-padded boxcar average: the symmetric banded operator ``K``.
+
+    ``K_ij = 1/width`` for ``|i - j| <= width // 2`` and zero otherwise,
+    truncated to the array. Restricting a symmetric Toeplitz matrix to a
+    principal submatrix leaves it symmetric, so ``K = K^T`` exactly -- which is
+    what makes the adjoint of the smoother cheap to write down.
+    """
+    return uniform_filter1d(
+        values, size=width, mode="constant", cval=0.0, axis=-1
+    )
+
+
+def _smoother_normalization(n_channels: int, width: int) -> NDArray[np.float64]:
+    """``c = K 1``: the in-array fraction of each window. 1 inside, <1 at edges."""
+    return _boxcar(np.ones(n_channels, dtype=np.float64), width)
+
+
+def _smooth(values: NDArray[np.float64], width: int) -> NDArray[np.float64]:
+    """Apply the low-pass smoother ``S = diag(1/c) K``.
+
+    Normalizing by the in-array window fraction makes ``S 1 = 1`` exactly, at
+    the edges as well as the interior, so the high-pass ``H = I - S``
+    annihilates a constant everywhere. A flat stellar continuum is therefore
+    removed exactly rather than leaving an edge residual.
+    """
+    return _boxcar(values, width) / _smoother_normalization(values.shape[-1], width)
+
+
+def _smooth_adjoint(values: NDArray[np.float64], width: int) -> NDArray[np.float64]:
+    """Apply ``S^T = K^T diag(1/c) = K diag(1/c)``, using ``K = K^T``."""
+    return _boxcar(
+        values / _smoother_normalization(values.shape[-1], width), width
+    )
+
+
+def continuum_filter(
+    values: NDArray[np.float64], width_channels: int
+) -> NDArray[np.float64]:
+    """High-pass a channel spectrum by subtracting a boxcar running mean.
+
+    ``H x = x - S x`` with ``S`` the width-normalized boxcar smoother, ``width``
+    forced odd and at least 3 channels. The smoother tracks the broad stellar
+    continuum; subtracting it leaves the narrow planet lines, which is the
+    asymmetry HDC exploits.
+
+    **Why a linear smoother and not a running median.** A median rejects the
+    lines themselves, so it estimates the continuum with less self-subtraction,
+    and that is why it was the first choice here. But it is nonlinear, and the
+    statistic built on top of it is a weighted sum of *filtered* counts whose
+    covariance then has no closed form. Pairing a median-filtered signal model
+    with a raw diagonal photon variance understates the noise badly -- 3.6x in
+    variance, 1.9x in SNR, on the alternating-spectrum case pinned in
+    ``tests/physics/test_hdc.py`` -- because the median of a window makes each
+    filtered channel a difference of raw counts and correlates neighbours.
+    A linear ``H`` costs more self-subtraction (the lines do drag a mean) but
+    propagates exactly: ``Cov(H N) = H diag(v t) H^T``, so
+    ``Var(w . H N) = t sum_i (H^T w)_i^2 v_i``. The self-subtraction is then
+    honestly reported by ``self_subtraction_factor`` instead of being hidden in
+    an unmodelled covariance. Boxcar rather than Gaussian because its support is
+    exactly ``width`` channels, so the banded operator and its adjoint are exact
+    with no kernel truncation to reason about.
+    """
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1:
+        raise ValueError(f"values must be 1-D, got shape {array.shape}")
+    width = _odd_width(width_channels)
+    return array - _smooth(array, width)
+
+
+def continuum_filter_adjoint(
+    values: NDArray[np.float64], width_channels: int
+) -> NDArray[np.float64]:
+    """Apply ``H^T``, the adjoint of `continuum_filter`.
+
+    Needed to propagate photon noise through the filter: for independent
+    per-channel counts with variance ``v_i t``, the statistic ``w . H N`` has
+    variance ``t sum_i (H^T w)_i^2 v_i``. Same signature convention as
+    `continuum_filter`.
+    """
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1:
+        raise ValueError(f"values must be 1-D, got shape {array.shape}")
+    width = _odd_width(width_channels)
+    return array - _smooth_adjoint(array, width)
 
 
 def _filtered(
@@ -320,6 +435,19 @@ def _filtered(
     if int(width_channels) <= 0:
         return np.asarray(values, dtype=np.float64)
     return continuum_filter(values, width_channels)
+
+
+def _filtered_adjoint(
+    values: NDArray[np.float64], width_channels: int
+) -> NDArray[np.float64]:
+    """`continuum_filter_adjoint`, with ``width_channels <= 0`` the identity.
+
+    Bypassed filtering means ``H = I``, so ``H^T = I`` too and the propagated
+    variance collapses back to the plain diagonal ``sum_i w_i^2 v_i``.
+    """
+    if int(width_channels) <= 0:
+        return np.asarray(values, dtype=np.float64)
+    return continuum_filter_adjoint(values, width_channels)
 
 
 def _telluric_mask(
@@ -440,7 +568,7 @@ def _weights(
     variance_rate_hz: NDArray[np.float64],
     keep: NDArray[np.bool_],
 ) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
-    """Matched-filter weights ``w = m * Ptilde / v``, zero on masked/empty channels."""
+    """Filter weights ``w = m * Ptilde / v``, zero on masked/empty channels."""
     usable = keep & (variance_rate_hz > 0.0)
     return _masked_ratio(template_hz, variance_rate_hz, usable), usable
 
@@ -456,7 +584,7 @@ def matched_filter_ccf(
     telluric_transmission_per_channel: NDArray[np.float64] | None,
     telluric_mask_threshold: float,
 ) -> CcfBudget:
-    """Matched-filter CCF signal-to-noise for one channelized observation.
+    """Photon-weighted CCF signal-to-noise for one channelized observation.
 
     See the module docstring for the noise model. ``continuum_filter_width_channels
     <= 0`` bypasses continuum filtering entirely (the template is used raw), which
@@ -483,10 +611,14 @@ def matched_filter_ccf(
     leak_filtered = _filtered(channels.leak_rate_hz, continuum_filter_width_channels)
 
     weights, usable = _weights(planet_filtered, variance_rate, keep)
+    # u = H^T w. The statistic is w . (H N) for independent Poisson counts N, so
+    # its variance is t sum_i u_i^2 v_i, NOT the raw diagonal t sum_i w_i^2 v_i:
+    # the filter correlates neighbouring channels.
+    noise_weights = _filtered_adjoint(weights, continuum_filter_width_channels)
 
     signal_counts = float(np.sum(weights * planet_filtered) * integration_time_s)
     photon_var_counts = float(
-        np.sum(weights * weights * variance_rate) * integration_time_s
+        np.sum(noise_weights * noise_weights * variance_rate) * integration_time_s
     )
     systematic_ccf_leakage = float(np.sum(weights * leak_filtered))
 
@@ -510,34 +642,31 @@ def matched_filter_ccf(
         else 0.0
     )
 
-    # SNR-retention ratio, not a flux ratio: the photon-limited matched-filter
-    # SNR of the filtered template over that of the unfiltered one, on the same
-    # unmasked channels and the same noise budget. See the CcfBudget docstring
-    # for why this can legitimately exceed 1.
+    # SNR-retention ratio, not a flux ratio: the photon-limited SNR of the
+    # filtered statistic over that of the unfiltered one, on the same unmasked
+    # channels and the same noise budget. The numerator now carries the
+    # H-propagated variance, so this measures the full cost of filtering --
+    # signal lost to self-subtraction *and* noise gained from the correlation
+    # the filter introduces. See the CcfBudget docstring for why it can exceed 1.
     if int(continuum_filter_width_channels) <= 0:
-        # Filtering bypassed: Ptilde is P by construction, so nothing was lost.
-        # Stated unconditionally so an all-zero template gives 1.0 rather than
-        # falling into 0/0.
+        # Filtering bypassed: H = I, so nothing was lost. Stated unconditionally
+        # so an all-zero template gives 1.0 rather than falling into 0/0.
         self_subtraction_factor = 1.0
     else:
-        snr_sq_filtered = float(
-            _masked_ratio(
-                planet_filtered * planet_filtered, variance_rate, usable
-            ).sum()
-        )
         snr_sq_unfiltered = float(
             _masked_ratio(planet * planet, variance_rate, usable).sum()
+            * integration_time_s
         )
         # No template signal at all to retain: report 0.0 by convention.
         self_subtraction_factor = (
-            math.sqrt(snr_sq_filtered / snr_sq_unfiltered)
+            ccf_snr_photon_limited / math.sqrt(snr_sq_unfiltered)
             if snr_sq_unfiltered > 0.0
             else 0.0
         )
 
     abs_sum = float(np.sum(np.abs(weights)))
     sq_sum = float(np.sum(weights * weights))
-    n_effective_lines = abs_sum * abs_sum / sq_sum if sq_sum > 0.0 else 0.0
+    n_effective_channels = abs_sum * abs_sum / sq_sum if sq_sum > 0.0 else 0.0
 
     return CcfBudget(
         ccf_snr=ccf_snr,
@@ -547,7 +676,7 @@ def matched_filter_ccf(
         systematic_var_counts=float(systematic_var_counts),
         systematic_ccf_leakage=systematic_ccf_leakage,
         self_subtraction_factor=self_subtraction_factor,
-        n_effective_lines=n_effective_lines,
+        n_effective_channels=n_effective_channels,
         n_channels_used=int(np.count_nonzero(usable)),
         template_weights=weights,
     )
@@ -637,7 +766,12 @@ def ccf_vs_rv(
         _require_same_grid(trial, data_channels, rv)
         template = _filtered(trial.planet_rate_hz, continuum_filter_width_channels)
         weights, _ = _weights(template, variance_rate, keep)
-        template_norm = math.sqrt(float(np.sum(weights * weights * variance_rate)))
+        # Normalize by the H-propagated noise of the trial template, not the
+        # raw diagonal: the filter correlates channels, so sqrt(w^T H D H^T w).
+        noise_weights = _filtered_adjoint(weights, continuum_filter_width_channels)
+        template_norm = math.sqrt(
+            float(np.sum(noise_weights * noise_weights * variance_rate))
+        )
         if template_norm <= 0.0:
             values[index] = 0.0
             continue
@@ -764,21 +898,30 @@ def ccf_contrast_at_target_snr(
     closed form buys its speed by avoiding. The accuracy is not uniform across
     the two noise regimes:
 
-    - *Exactly photon-limited* (``V_sys = 0``): the frozen and exact statistics
-      agree through the linear term in ``c P1 / v0``, so the error is **second
-      order** whatever the spectral structure.
+    - *Exactly photon-limited* (``V_sys = 0``): the residual slope is
+      ``C2'/A - E/B2``, which the linear high-pass makes small but **no longer
+      identically zero** -- ``H^T`` couples the weight perturbation into the
+      variance, so the exact cancellation that held under a diagonal
+      covariance does not survive. On the structured probe below it is
+      ``-8.3e-05``, some 330x smaller than the systematics-driven slope and
+      worth about a part in 1e5 on the returned contrast. Negative: the solver
+      is very slightly *pessimistic* there.
     - *Nonzero systematic, structured spectra*: recomputed weights also change
       the leak projection ``B_w(c)``, and hence ``V_sys``, **generically at
       first order**. The general expansion is
 
       ```text
-      SNR^2_true / SNR^2_frozen = 1 - 2 c eta_sys (C2/A - D/H0) + O(c^2),
-      eta_sys = V_sys / (t B2 + V_sys),
-      D = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2,   H0 = B_w,
+      SNR^2_true / SNR^2_frozen = 1 - 2 c Delta + O(c^2),
+      Delta = C2'/A - eta_ph E/B2 - eta_sys D/J0,
+      eta_sys = V_sys / (t B2 + V_sys),   eta_ph = 1 - eta_sys,
+      C2' = sum_i Ptilde1_i^2 P1_i / v0_i^2,
+      E   = sum_i u0_i (H^T g)_i v0_i,  g = Ptilde1 P1 / v0^2,
+      D   = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2,   J0 = B_w.
       ```
 
-      so the returned contrast is optimistic by ``c eta_sys (C2/A - D/H0)`` in
-      SNR. ``eta_sys`` is just the systematic share of the zero-contrast
+      so the returned contrast is optimistic by ``c Delta`` in SNR. Without a
+      filter ``u0 = w0``, ``C2' = E = C2``, and ``Delta`` collapses to the
+      familiar ``eta_sys (C2/A - D/J0)``. ``eta_sys`` is just the systematic share of the zero-contrast
       variance: it tends to 1 in the systematics-dominated limit and falls
       smoothly to 0 as the budget becomes photon-limited, which is what makes
       the first-order term switch on gradually rather than at a threshold.
@@ -794,10 +937,10 @@ def ccf_contrast_at_target_snr(
       ``v0`` vary, the ratio with it, and a residual reappears at second order
       through the structural coefficient.
 
-    Measured on an 80-channel structured probe, the coefficient
-    ``c eta_sys (C2/A - D/H0)`` reproduces the observed error to better than 5%
-    across ``eta_sys`` from 0.19 to 0.99: at ``eta_sys = 0.19`` the solver is
-    0.08% optimistic, at 0.99 it is 3.6%.
+    Measured on an 80-channel structured probe with a width-11 filter,
+    ``c Delta(eta_sys)`` reproduces the observed error to ~1% for
+    ``eta_sys <= 0.9``: 0.09% optimistic at ``eta_sys = 0.17``, 1.3% at 0.89,
+    5.1% at 0.99 (where higher-order terms cost the prediction ~6%).
 
     So the closed form is trustworthy when the planet is faint against the leak
     *and* the systematic share of the variance is small. Otherwise treat the
@@ -852,10 +995,17 @@ def ccf_contrast_at_target_snr(
             "no template signal survives continuum filtering and telluric "
             "masking (A <= 0), so no contrast reaches the target SNR"
         )
+    # B2 and C2 are the two halves of the H-propagated photon variance rate,
+    # v = v0 + c P1, split by their dependence on c. Using u = H^T w keeps the
+    # variance exact; using w would revert to the diagonal approximation. The
+    # split stays affine in c, so the target-SNR condition stays quadratic.
+    noise_weights = _filtered_adjoint(weights, continuum_filter_width_channels)
     photon_var_zero_contrast = float(
-        np.sum(weights * weights * variance_rate_zero_contrast)
+        np.sum(noise_weights * noise_weights * variance_rate_zero_contrast)
     )
-    planet_selfnoise_coefficient = float(np.sum(weights * weights * planet_unit))
+    planet_selfnoise_coefficient = float(
+        np.sum(noise_weights * noise_weights * planet_unit)
+    )
     leak_projection_hz = float(np.sum(weights * leak_filtered))
     # `matched_filter_ccf` lets an overflowing V_sys surface as it comes: the
     # no-fringe-tracking branch squares with `**`, which raises OverflowError,

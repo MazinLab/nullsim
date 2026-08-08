@@ -297,7 +297,11 @@ class HdcCcfStage(BaseStage):
                 budget, channels
             ),
             "self_subtraction_factor": float(budget.self_subtraction_factor),
-            "n_effective_lines": float(budget.n_effective_lines),
+            "n_effective_channels": float(budget.n_effective_channels),
+            # Deprecated alias: the participation ratio counts channels, and a
+            # line spans several of them. Kept so existing table/plot consumers
+            # keep resolving.
+            "n_effective_lines": float(budget.n_effective_channels),
             "n_channels_used": int(budget.n_channels_used),
             "n_channels": int(channels.n_channels),
             "telluric_masked_fraction": _telluric_masked_fraction(
@@ -497,7 +501,7 @@ class HdcCcfStage(BaseStage):
 
 
 _CCF_MODEL = (
-    "Matched-filter cross-correlation after Wang, Mawet, Ruane, Hu & Benneke "
+    "Photon-weighted cross-correlation after Wang, Mawet, Ruane, Hu & Benneke "
     "2017, AJ 153, 183 ('Observing Exoplanets with High Dispersion "
     "Coronagraphy. I.'). This is an after-the-fact analysis gain: it digs "
     "planets out of the noise at fixed nuller performance, changing no null "

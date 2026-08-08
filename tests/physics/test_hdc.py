@@ -5,6 +5,7 @@ import pytest
 from nullsim.physics.hdc import (
     ChannelSpectra,
     build_channel_edges,
+    continuum_filter_adjoint,
     ccf_contrast_at_target_snr,
     ccf_vs_rv,
     channelize,
@@ -65,11 +66,16 @@ def test_matched_filter_flat_template_recovers_broadband_snr():
 
 
 def test_orthogonal_leak_lines_give_zero_systematic_projection():
-    n = 200
+    # The linear high-pass has support exactly `width` channels wide, so
+    # "orthogonal" means the filtered supports do not overlap: planet and leak
+    # combs must be separated by more than the filter width. (The running
+    # median this replaced had no such spreading, which is exactly why its
+    # noise did not propagate in closed form.)
+    n = 400
     planet = np.zeros(n)
-    planet[10:200:20] = 5.0  # planet lines on even-decade channels
+    planet[20:400:40] = 5.0
     leak = np.full(n, 50.0)
-    leak[3:200:20] += 40.0  # leak lines elsewhere
+    leak[40:400:40] += 40.0  # 20 channels away, wider than the width-15 filter
     ch = _channels(planet, leak)
     budget = matched_filter_ccf(
         ch,
@@ -344,17 +350,20 @@ def test_self_subtraction_factor_for_sparse_absorption_dips():
     assert 0.0 < _factor(planet, leak, 5) < 1.0
 
 
-def test_self_subtraction_factor_exceeds_one_for_alternating_absorption():
-    # NOT a bug and NOT to be clamped. A width-3 running median on an
-    # alternating sequence returns the opposite level at every interior
-    # sample, so the filter turns a bright, nearly flat spectrum into large
-    # signed excursions about zero:
-    #     Ptilde = [0, -4.9, +4.9, -4.9, +4.9, -4.9, 0].
-    # A template with large signed excursions carries more matched-filter SNR
-    # than the near-flat one it came from, so the retention ratio is > 1.
+def test_self_subtraction_factor_on_the_alternating_absorption_case():
+    # Re-pinned for the linear filter. The width-3 boxcar on an alternating
+    # sequence gives Ptilde = [2.45, -3.267, +3.267, ..., 2.45] rather than the
+    # median's [0, -4.9, +4.9, ...], and the retained SNR now also pays for the
+    # noise correlation H introduces, so the factor lands at 0.637 instead of
+    # the 1.111 this case used to report.
+    #
+    # That 1.111 was not a real gain: the old number divided a filtered signal
+    # by an unfiltered diagonal variance. Measured against its own true
+    # variance the median statistic retained ~0.58 here, so the linear filter
+    # is in fact the better of the two once both are honestly costed.
     planet = np.array([5.0, 0.1, 5.0, 0.1, 5.0, 0.1, 5.0])
     leak = np.full(planet.size, 100.0)
-    assert _factor(planet, leak, 3) == pytest.approx(1.11147, rel=1e-3)
+    assert _factor(planet, leak, 3) == pytest.approx(0.637088, rel=1e-4)
 
 
 def test_self_subtraction_factor_edge_conventions():
@@ -390,11 +399,47 @@ def test_continuum_filter_removes_smooth_baseline_and_keeps_narrow_lines():
     baseline = 50.0 + 5.0 * np.linspace(0.0, 1.0, n)
     values = baseline.copy()
     values[10:200:20] += 30.0
-    filtered = continuum_filter(values, 15)
+    width = 15
+    filtered = continuum_filter(values, width)
     line_idx = np.arange(10, 200, 20)
-    other = np.setdiff1d(np.arange(n), line_idx)
-    assert np.all(filtered[line_idx] > 25.0)
-    assert np.max(np.abs(filtered[other])) < 1.0
+    half = width // 2
+    far = np.array(
+        [i for i in range(n) if np.min(np.abs(i - line_idx)) > half]
+    )
+
+    # Line spacing (20) exceeds the width, so each window holds exactly one
+    # line: the boxcar mean is lifted by 30/15 = 2 and the retained peak is
+    # 30 - 2 = 28 exactly.
+    assert filtered[line_idx] == pytest.approx(28.0)
+    # Away from every line the smooth baseline is gone. A constant is removed
+    # exactly at all channels (S preserves constants including at the edges);
+    # what is left is the ramp's second-order edge residual.
+    assert np.max(np.abs(filtered[far])) < 0.1
+    # Within a filter width of a line the linear smoother leaves negative
+    # wings -- the price of linearity, and the reason self-subtraction is
+    # larger than it was with a median.
+    wings = np.setdiff1d(np.arange(n), np.union1d(line_idx, far))
+    assert np.min(filtered[wings]) < -1.5
+
+
+def test_continuum_filter_annihilates_a_constant_exactly_everywhere():
+    # S 1 = 1 by the window-fraction normalization, so H 1 = 0 at the edges as
+    # well as the interior: a flat stellar continuum leaves no edge residual.
+    for n, width in ((7, 3), (64, 15), (200, 31)):
+        assert continuum_filter(np.full(n, 137.0), width) == pytest.approx(
+            np.zeros(n), abs=1e-12
+        )
+
+
+def test_continuum_filter_adjoint_matches_the_dense_transpose():
+    # The variance propagation is only correct if H^T really is the transpose.
+    for n, width in ((12, 3), (31, 7), (40, 15)):
+        basis = np.eye(n)
+        forward = np.stack([continuum_filter(basis[i], width) for i in range(n)]).T
+        adjoint = np.stack(
+            [continuum_filter_adjoint(basis[i], width) for i in range(n)]
+        ).T
+        assert adjoint == pytest.approx(forward.T, abs=1e-14)
 
 
 # --- Contrast-at-target-SNR solver (spec section 6, detection mode) ----------
@@ -598,10 +643,9 @@ def _structured_probe():
 
 
 def test_ccf_contrast_frozen_weights_are_first_order_when_systematics_dominate():
-    # The frozen-weight error is second order only in the photon limit. Once
-    # V_sys dominates, recomputed weights shift B_w(c) at FIRST order in
-    # c*P1/v0, so the solver is measurably optimistic. This test documents that
-    # known bias rather than hiding it.
+    # The frozen-weight error is small but nonzero in the photon limit and
+    # grows with the systematic share. This test documents that known bias
+    # rather than hiding it.
     planet_unit, leak, zeros = _structured_probe()
     time_s, target = 3600.0, 5.0
 
@@ -623,13 +667,17 @@ def test_ccf_contrast_frozen_weights_are_first_order_when_systematics_dominate()
         )
         return solution, budget.ccf_snr / target
 
-    # Photon-limited: the second-order error is invisible.
+    # Photon-limited. With the linear high-pass this is no longer *exactly*
+    # second order -- H^T couples the weight perturbation into the variance --
+    # but the residual slope is ~3e2 times smaller than the systematics-driven
+    # one, so the roundtrip is still good to a part in 1e4.
     photon_solution, photon_ratio = roundtrip(0.0)
     assert photon_solution.systematic_var_counts == 0.0
-    assert photon_ratio == pytest.approx(1.0, rel=1e-6)
+    assert photon_ratio == pytest.approx(1.0, rel=1e-4)
+    assert photon_ratio != pytest.approx(1.0, rel=1e-6)
 
-    # Systematics dominating by ~90x: the solver overshoots by a few percent.
-    systematic_solution, ratio = roundtrip(0.1)
+    # Systematics dominating by ~124x: the solver overshoots by a few percent.
+    systematic_solution, ratio = roundtrip(0.05)
     assert systematic_solution.systematic_var_counts > 50.0 * (
         time_s * systematic_solution.photon_var_zero_contrast
     )
@@ -638,8 +686,92 @@ def test_ccf_contrast_frozen_weights_are_first_order_when_systematics_dominate()
         assert ratio == pytest.approx(1.0, rel=2e-2)
 
     # First order, not second: halving eps halves the error.
-    _, half_ratio = roundtrip(0.05)
+    _, half_ratio = roundtrip(0.025)
     assert (1.0 - ratio) / (1.0 - half_ratio) == pytest.approx(2.0, rel=0.05)
+
+
+def _frozen_weight_slope(planet_unit, leak, width):
+    """Analytic first-order coefficient of the frozen-weight bias.
+
+    ``1 - SNR_true/SNR_frozen ~= c * Delta(eta_sys)`` with
+
+        Delta = C2'/A - eta_ph * E/B2 - eta_sys * D/J0
+
+    where the primed/extra terms are the ones the linear high-pass introduces:
+    ``C2' = sum Ptilde1^2 P1 / v0^2`` (from d/dc of the signal), and
+    ``E = sum u0 (H^T g) v0`` with ``g = Ptilde1 P1 / v0^2`` (from d/dc of the
+    H-propagated variance). Without a filter ``u0 = w0``, ``C2' = E = C2`` and
+    the whole thing collapses to ``eta_sys (C2/A - D/J0)``.
+    """
+    v0 = leak
+    filtered_planet = continuum_filter(planet_unit, width)
+    filtered_leak = continuum_filter(leak, width)
+    w0 = filtered_planet / v0
+    u0 = continuum_filter_adjoint(w0, width)
+    a_coeff = float(np.sum(w0 * filtered_planet))
+    b2 = float(np.sum(u0 * u0 * v0))
+    g = filtered_planet * planet_unit / v0**2
+    e_coeff = float(np.sum(u0 * continuum_filter_adjoint(g, width) * v0))
+    c2_prime = float(np.sum(filtered_planet**2 * planet_unit / v0**2))
+    d_coeff = float(
+        np.sum(filtered_planet * filtered_leak * planet_unit / v0**2)
+    )
+    j0 = float(np.sum(w0 * filtered_leak))
+
+    def slope(eta_sys):
+        return c2_prime / a_coeff - (1.0 - eta_sys) * e_coeff / b2 - eta_sys * (
+            d_coeff / j0
+        )
+
+    return slope
+
+
+def test_ccf_contrast_frozen_weight_bias_scales_with_the_systematic_share():
+    # The first-order coefficient interpolates between a photon-limited term
+    # and a systematics term, weighted by eta_sys = V_sys / (t B2 + V_sys).
+    # It is not a threshold effect: the bias is first order at every eta.
+    planet_unit, leak, zeros = _structured_probe()
+    time_s, target, width = 3600.0, 5.0, 11
+    slope = _frozen_weight_slope(planet_unit, leak, width)
+
+    def probe(eps):
+        kwargs = _solver_kwargs(
+            integration_time_s=time_s,
+            target_snr=target,
+            eps_systematic=eps,
+            with_fringe_tracking=False,
+            continuum_filter_width_channels=width,
+        )
+        solution = ccf_contrast_at_target_snr(
+            planet_unit, leak, zeros, zeros, **kwargs
+        )
+        contrast = solution.contrast_at_target_snr
+        budget = matched_filter_ccf(
+            _channels(contrast * planet_unit, leak),
+            **_matched_filter_kwargs(kwargs),
+        )
+        eta_sys = solution.systematic_var_counts / (
+            time_s * solution.photon_var_zero_contrast
+            + solution.systematic_var_counts
+        )
+        error = 1.0 - budget.ccf_snr / target
+        return eta_sys, contrast, error
+
+    weak_eta, weak_c, weak_error = probe(0.002)
+    strong_eta, strong_c, strong_error = probe(0.0125)
+
+    # Weak systematics: a minority of the variance, but a real first-order bias.
+    assert 0.1 < weak_eta < 0.3
+    assert weak_error > 0.0
+    assert strong_eta > 0.85
+
+    assert weak_error / weak_c == pytest.approx(slope(weak_eta), rel=0.03)
+    assert strong_error / strong_c == pytest.approx(slope(strong_eta), rel=0.03)
+
+    # The photon-limited end of the same formula: small, negative (the solver
+    # is very slightly pessimistic there), and no longer identically zero.
+    assert slope(0.0) == pytest.approx(-8.268e-05, rel=1e-3)
+    assert abs(slope(0.0)) < 0.01 * abs(slope(1.0))
 
 
 def test_ccf_contrast_solver_zeroes_weights_on_masked_and_noiseless_channels():
@@ -732,64 +864,6 @@ def test_ccf_contrast_solver_survives_large_systematic_over_small_signal():
     assert contrast == pytest.approx(5e160, rel=1e-9)
 
 
-def test_ccf_contrast_frozen_weight_bias_scales_with_the_systematic_share():
-    # The first-order coefficient is c * eta_sys * (C2/A - D/H0) with
-    # eta_sys = V_sys / (t B2 + V_sys), the systematic share of the
-    # zero-contrast variance. It is not a threshold effect: the bias is first
-    # order even when systematics are a minority of the budget.
-    planet_unit, leak, zeros = _structured_probe()
-    time_s, target = 3600.0, 5.0
-
-    def probe(eps):
-        kwargs = _solver_kwargs(
-            integration_time_s=time_s,
-            target_snr=target,
-            eps_systematic=eps,
-            with_fringe_tracking=False,
-            continuum_filter_width_channels=11,
-        )
-        solution = ccf_contrast_at_target_snr(
-            planet_unit, leak, zeros, zeros, **kwargs
-        )
-        contrast = solution.contrast_at_target_snr
-        budget = matched_filter_ccf(
-            _channels(contrast * planet_unit, leak),
-            **_matched_filter_kwargs(kwargs),
-        )
-        eta_sys = solution.systematic_var_counts / (
-            time_s * solution.photon_var_zero_contrast
-            + solution.systematic_var_counts
-        )
-        error = 1.0 - budget.ccf_snr / target
-        return eta_sys, contrast, error
-
-    weak_eta, weak_c, weak_error = probe(0.005)
-    strong_eta, strong_c, strong_error = probe(0.1)
-
-    # Weak systematics: a minority of the variance, but a real first-order bias.
-    assert 0.1 < weak_eta < 0.3
-    assert weak_error > 0.0
-    # Dominated.
-    assert strong_eta > 0.95
-
-    # The analytic first-order coefficient, computed independently.
-    filtered_planet = continuum_filter(planet_unit, 11)
-    filtered_leak = continuum_filter(leak, 11)
-    weights = filtered_planet / leak
-    a_coeff = float(np.sum(weights * filtered_planet))
-    c2_coeff = float(np.sum(weights**2 * planet_unit))
-    h0 = float(np.sum(weights * filtered_leak))
-    d_coeff = float(np.sum(filtered_planet * filtered_leak * planet_unit / leak**2))
-    expected_slope = c2_coeff / a_coeff - d_coeff / h0
-
-    assert weak_error / (weak_c * weak_eta) == pytest.approx(
-        expected_slope, rel=0.02
-    )
-    assert strong_error / (strong_c * strong_eta) == pytest.approx(
-        expected_slope, rel=0.05
-    )
-
-
 def test_ccf_contrast_solver_raises_value_error_when_systematic_variance_overflows():
     # eps * B_w * t ~ 1e155, whose square is past the float64 ceiling. The
     # no-fringe-tracking branch squares with `**`, which raises OverflowError
@@ -874,3 +948,71 @@ def test_flat_spectra_are_exact_despite_large_systematics():
     # the error was 3.6%. Flat, it is exact to machine precision.
     assert contrast * planet_unit[0] / leak[0] > 0.02
     assert ratio == pytest.approx(1.0, rel=1e-12)
+
+
+@pytest.mark.stats
+def test_monte_carlo_photon_variance_matches_the_propagated_prediction():
+    """Poisson realizations through the real filter must match V_ph.
+
+    This is the test that would have caught the covariance defect. The
+    estimator is X = w . (H N) on independent Poisson counts N, so its variance
+    is t sum_i (H^T w)_i^2 v_i. Pairing a filtered signal model with the raw
+    diagonal t sum_i w_i^2 v_i -- which is what this module did before the
+    linear filter landed -- understates the noise, and no analytic test that
+    only checks internal consistency can see it. Only drawing photons can.
+    """
+    n_channels, width = 200, 3
+    planet = np.zeros(n_channels)
+    planet[10::20] = 5.0
+    leak = np.full(n_channels, 100.0)
+    time_s = 500.0
+    channels = _channels(planet, leak)
+
+    budget = matched_filter_ccf(
+        channels,
+        integration_time_s=time_s,
+        eps_systematic=0.0,
+        servo_bw_hz=100.0,
+        with_fringe_tracking=True,
+        continuum_filter_width_channels=width,
+        telluric_transmission_per_channel=None,
+        telluric_mask_threshold=0.0,
+    )
+    weights = budget.template_weights
+    rate = channels.total_rate_hz()
+
+    n_realizations, chunk = 100_000, 10_000
+    rng = np.random.default_rng(20260807)
+    total = total_sq = 0.0
+    for _ in range(n_realizations // chunk):
+        counts = rng.poisson(np.broadcast_to(rate * time_s, (chunk, n_channels)))
+        # continuum_filter is 1-D by contract; the smoother underneath is not,
+        # so filter each realization the way the estimator would.
+        filtered = np.stack(
+            [continuum_filter(row, width) for row in counts.astype(np.float64)]
+        )
+        statistic = filtered @ weights
+        total += float(statistic.sum())
+        total_sq += float((statistic * statistic).sum())
+    empirical_mean = total / n_realizations
+    empirical_var = total_sq / n_realizations - empirical_mean**2
+
+    # sqrt(2/N) = 0.45% standard error on the variance; 2% is a comfortable
+    # band that still catches the 23% error the diagonal formula makes here.
+    assert empirical_var == pytest.approx(budget.photon_var_counts, rel=0.02)
+
+    # The mean of the statistic is the filtered total rate projected on w --
+    # planet plus whatever continuum survives the filter.
+    expected_mean = time_s * float(
+        np.sum(weights * continuum_filter(rate, width))
+    )
+    assert empirical_mean == pytest.approx(expected_mean, rel=0.05)
+
+    # And the defect is real: the old diagonal expression is off by ~23% here,
+    # far outside the MC band, so this assertion would have failed before.
+    diagonal_var = time_s * float(np.sum(weights * weights * rate))
+    assert diagonal_var / empirical_var < 0.85
+
+    # The empirical SNR of the reported signal against the drawn noise.
+    empirical_snr = budget.signal_counts / np.sqrt(empirical_var)
+    assert empirical_snr == pytest.approx(budget.ccf_snr, rel=0.02)
