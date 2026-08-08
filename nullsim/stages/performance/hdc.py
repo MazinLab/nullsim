@@ -836,6 +836,18 @@ def _refuse_mismatch(
     )
 
 
+def _finite_non_negative(value: Any) -> float | None:
+    """Coerce to a finite, non-negative float, or None if it is neither."""
+
+    if value is None:
+        return None
+    try:
+        candidate = float(value)
+    except (TypeError, ValueError):
+        return None
+    return candidate if math.isfinite(candidate) and candidate >= 0.0 else None
+
+
 def _positive_finite(value: Any) -> float | None:
     if value is None:
         return None
@@ -1027,7 +1039,11 @@ def _chromatic_leak_factors(
     surface = sensitivity.get("residual_starlight_contrast_by_wavelength")
     wavelengths_um = sensitivity.get("residual_starlight_wavelengths_um")
     combine_mode = sensitivity.get("residual_starlight_combine_mode")
-    grey_base = _positive_finite(
+    # Non-negative, not positive: a ZERO grey base is legal upstream for the
+    # max and add modes, and it is the case where the chromatic residual
+    # matters most -- max(0, r) = r and 0 + r = r both leave the residual
+    # standing. Requiring positivity here silently greyed exactly that.
+    grey_base = _finite_non_negative(
         sensitivity.get("effective_null_before_residual_starlight")
     )
 

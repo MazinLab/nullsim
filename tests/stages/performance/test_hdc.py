@@ -843,3 +843,42 @@ def test_refinement_side_error_is_caught_per_anchor(
         "synthetic refinement failure" in str(reason)
         for reason in payload["non_detection_reasons"]
     )
+
+
+@pytest.mark.parametrize("combine_mode", ["max", "add"])
+def test_zero_grey_base_keeps_the_chromatic_residual(
+    tmp_path: Path, combine_mode: str
+) -> None:
+    """A zero base is legal upstream and must not grey out the residual.
+
+    ``max(0, r)`` and ``0 + r`` both leave the residual standing, so this is
+    precisely the case where the chromatic structure matters most.
+    """
+
+    wl_um, surface = _distinct_residual_rows(12)
+    state = _chromatic_state(
+        surface=surface,
+        wavelengths_um=wl_um,
+        combine_mode=combine_mode,
+        grey_base=0.0,
+    )
+
+    payload = _stage(_context(tmp_path)).apply(state).results.components[
+        "performance.hdc"
+    ]
+    assert "CHROMATIC" in str(payload["leak_shape_model"])
+
+    grey_leak = np.asarray(
+        _stage(_context(tmp_path)).apply(_state()).results.components[
+            "performance.hdc"
+        ]["ccf_leak_rate_hz_per_channel"]
+    )
+    leak = np.asarray(payload["ccf_leak_rate_hz_per_channel"])
+
+    def red_blue_ratio(spectrum: np.ndarray) -> float:
+        half = spectrum.size // 2
+        return float(np.sum(spectrum[half:]) / np.sum(spectrum[:half]))
+
+    grey_ratio = red_blue_ratio(grey_leak[0])
+    assert red_blue_ratio(leak[0]) > 1.5 * grey_ratio
+    assert red_blue_ratio(leak[1]) < 0.7 * grey_ratio
