@@ -53,6 +53,7 @@ _DETECTION_COLOR = "C0"
 _CHARACTERIZATION_COLOR = "#27AE60"
 _IDEAL_CORONAGRAPH_COLOR = "0.35"
 _HDC_COLOR = "#8E44AD"
+_HDC_LEGEND_PREFIX = "HDC CCF"
 _IDEAL_CORONAGRAPH_STYLES: dict[int, dict[str, Any]] = {
     2: {"linestyle": (0, (5.0, 2.0)), "linewidth": 1.4},
     4: {"linestyle": (0, (2.0, 1.2)), "linewidth": 1.4},
@@ -664,6 +665,13 @@ def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
     Dash-dot rather than the characterization overlay's dashed styling, and its
     own colour, so the three curve families on the figure stay distinguishable.
 
+    Every artist drawn here carries its legend label, and `_attach_legends`
+    reads the labels back off the axes. That is the whole ghost-entry defence:
+    a payload that yields no curve (all anchors non-detections, malformed
+    arrays, no resolving power) leaves no artist and therefore no legend entry,
+    and the one identity that dedupes drawing -- the R-bearing label -- is by
+    construction the one that dedupes the legend.
+
     No convergence gating here, unlike the ``hdc_ccf`` diagnostic plot: that one
     gates on upstream spectro convergence because it renders a retune that may
     not have converged. A ``performance.hdc`` payload only exists when its
@@ -690,13 +698,22 @@ def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
                 _record_label(record),
             )
             continue
-        # Dedupe on the per-cell identity, as the characterization overlay
-        # does; the legend text itself comes from _hdc_legend_label, which is
-        # payload derived (the resolving power), not record derived.
-        key = _curve_legend_label(record, mode="det")
-        if key in seen:
+        # The R-bearing label is the binding contract for this overlay, so a
+        # payload that cannot produce one is missing a required key, not a
+        # curve to draw with a vaguer label.
+        label = _hdc_legend_label(payload)
+        if label is None:
+            logging.info(
+                "detection_space: performance.hdc payload for %r has no finite "
+                "resolving_power_used; skipping the HDC overlay for that cell.",
+                _record_label(record),
+            )
             continue
-        seen.add(key)
+        # One curve per distinct resolving power. Deduping on anything finer
+        # than the label would draw curves the legend cannot tell apart.
+        if label in seen:
+            continue
+        seen.add(label)
         # NaN anchors are non-detections by design (the CCF never reaches the
         # target SNR there), not failures — drop them and say how many.
         mask = (
@@ -717,6 +734,9 @@ def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
         if not segments:
             continue
         style = {**_line_style_for_record(record), "linestyle": "-."}
+        # Label the first drawn artist only: the legend wants one entry per
+        # curve, not one per segment.
+        artist_label: str | None = label
         for separations_segment, contrast_segment in segments:
             if separations_segment.size >= 2:
                 axes.plot(
@@ -725,6 +745,7 @@ def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
                     color=_HDC_COLOR,
                     **style,
                     zorder=5,
+                    label=artist_label,
                 )
             else:
                 axes.scatter(
@@ -733,7 +754,46 @@ def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
                     color=_HDC_COLOR,
                     s=18.0,
                     zorder=5,
+                    label=artist_label,
                 )
+            artist_label = None
+
+
+def _drawn_hdc_legend_entries(axes: plt.Axes) -> tuple[tuple[Line2D, str], ...]:
+    """Legend handles for the HDC curves actually drawn on ``axes``.
+
+    Read back off the artists rather than recomputed from the payloads, so a
+    payload that produced no curve cannot contribute a legend entry.
+    """
+
+    entries: list[tuple[Line2D, str]] = []
+    seen: set[str] = set()
+    for artist in (*axes.lines, *axes.collections):
+        label = artist.get_label()
+        if not isinstance(label, str) or not label.startswith(_HDC_LEGEND_PREFIX):
+            continue
+        if label in seen:
+            continue
+        seen.add(label)
+        if isinstance(artist, Line2D):
+            handle = Line2D(
+                [],
+                [],
+                color=artist.get_color(),
+                linestyle=artist.get_linestyle(),
+                linewidth=artist.get_linewidth(),
+            )
+        else:
+            handle = Line2D(
+                [],
+                [],
+                color=_HDC_COLOR,
+                linestyle="",
+                marker="o",
+                markersize=4.0,
+            )
+        entries.append((handle, label))
+    return tuple(entries)
 
 
 def _hdc_curve(record: RunRecord) -> dict | None:
@@ -759,15 +819,16 @@ def _finite_1d(values: Any) -> NDArrayFloat | None:
     return array
 
 
-def _hdc_legend_label(record: RunRecord) -> str:
-    payload = _hdc_curve(record) or {}
+def _hdc_legend_label(payload: dict) -> str | None:
+    """``"HDC CCF (R=3000)"``, or None when the payload states no finite R."""
+
     try:
         resolving_power = float(payload.get("resolving_power_used"))
     except (TypeError, ValueError):
-        return "HDC CCF"
+        return None
     if not math.isfinite(resolving_power):
-        return "HDC CCF"
-    return f"HDC CCF (R={resolving_power:g})"
+        return None
+    return f"{_HDC_LEGEND_PREFIX} (R={resolving_power:g})"
 
 
 # ----------------------------------------------------------------------
@@ -1025,22 +1086,10 @@ def _attach_legends(
         )
         labels.append(_curve_legend_label(record, mode="char"))
 
-    seen_hdc: set[str] = set()
-    for record in _paper_curve_records(runs):
-        if _hdc_curve(record) is None:
-            continue
-        label = _hdc_legend_label(record)
-        if label in seen_hdc:
-            continue
-        seen_hdc.add(label)
-        handles.append(
-            Line2D(
-                [],
-                [],
-                color=_HDC_COLOR,
-                **{**_line_style_for_record(record), "linestyle": "-."},
-            )
-        )
+    # Read the HDC entries back off the drawn artists: payload presence alone
+    # must not put a curve in the legend that never made it onto the axes.
+    for handle, label in _drawn_hdc_legend_entries(axes):
+        handles.append(handle)
         labels.append(label)
 
     coronagraph_orders = _ideal_coronagraph_orders(runs)

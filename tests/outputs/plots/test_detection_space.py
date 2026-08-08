@@ -387,8 +387,9 @@ def _hdc_payload(**overrides: object) -> dict:
         "separations_mas": np.asarray([1.0, 3.0, 10.0], dtype=np.float64),
         "ccf_contrast_5sigma": np.asarray([1.0e-5, 1.0e-6, 1.0e-7]),
         "broadband_contrast_5sigma": np.asarray([2.0e-5, 2.0e-6, 2.0e-7]),
-        # Finite gain below 1 is the normal photon-limited result, not an error.
-        "ccf_contrast_gain": 0.5,
+        # Per-anchor array, as production publishes it. Finite values below 1
+        # are the normal photon-limited result, not an error.
+        "ccf_contrast_gain": np.asarray([2.0, 0.5, 0.5]),
         "resolving_power_used": 3000.0,
         "comparison_time_s": 3600.0,
         "comparison_target_snr": 5.0,
@@ -406,6 +407,15 @@ def _hdc_collection(payload: dict | None) -> RunCollection:
         records=(record,),
         output_dir=Path("."),
     )
+
+
+def _legend_labels(axes, collection) -> list[str]:
+    """Legend labels after attaching, with a detection curve present so the
+    legend exists at all."""
+
+    _plot_detection_curves(axes, collection)
+    _attach_legends(axes, (), collection)
+    return [text.get_text() for text in axes.get_legend().get_texts()]
 
 
 def test_detection_space_overlays_hdc_ccf_curve() -> None:
@@ -499,19 +509,109 @@ def test_detection_space_hdc_all_nan_anchors_draws_nothing() -> None:
 
     assert not axes.lines
     assert not axes.collections
+    # No curve drawn means no legend entry: the entry must follow the artist,
+    # not the mere presence of a performance.hdc component.
+    assert not [label for label in _legend_labels(axes, collection) if "HDC CCF" in label]
     plt.close(fig)
 
 
-def test_detection_space_hdc_skips_payload_missing_keys() -> None:
-    """A payload without the curve keys is skipped, not crashed on."""
+def test_detection_space_hdc_skips_payload_missing_keys(caplog) -> None:
+    """A payload without the curve keys is skipped -- logged, no crash, and no
+    ghost legend entry."""
 
     collection = _hdc_collection({"resolving_power_used": 3000.0})
     fig, axes = plt.subplots()
 
-    _plot_hdc_curves(axes, collection)
+    with caplog.at_level("INFO", logger="root"):
+        _plot_hdc_curves(axes, collection)
 
+    assert "no usable separations_mas/ccf_contrast_5sigma pair" in caplog.text
     assert not axes.lines
     assert not axes.collections
+    assert not [label for label in _legend_labels(axes, collection) if "HDC CCF" in label]
+    plt.close(fig)
+
+
+def test_detection_space_hdc_requires_a_finite_resolving_power(caplog) -> None:
+    """The R-bearing label is the binding contract, so a payload with no finite
+    resolving_power_used is a missing required key -- a logged skip, not a
+    curve carrying a vaguer label."""
+
+    for missing in (None, float("nan")):
+        collection = _hdc_collection(_hdc_payload(resolving_power_used=missing))
+        fig, axes = plt.subplots()
+
+        caplog.clear()
+        with caplog.at_level("INFO", logger="root"):
+            _plot_hdc_curves(axes, collection)
+
+        assert "no finite resolving_power_used" in caplog.text
+        assert not axes.lines
+        assert not axes.collections
+        assert not [
+            label for label in _legend_labels(axes, collection) if "HDC CCF" in label
+        ]
+        plt.close(fig)
+
+
+def _hdc_collection_from(payloads: tuple[tuple[float, dict], ...]) -> RunCollection:
+    records = tuple(
+        _record_with_hdc_payload(
+            _synthetic_record(jmag=jmag, contrast_floor=1.0e-7), payload
+        )
+        for jmag, payload in payloads
+    )
+    return RunCollection(
+        config=records[0].config,
+        records=records,
+        output_dir=Path("."),
+    )
+
+
+def test_detection_space_hdc_r_sweep_draws_one_curve_per_resolving_power() -> None:
+    """An R sweep at fixed J and integration time must not have its later cells
+    suppressed by a coarser dedupe identity than the legend uses."""
+
+    collection = _hdc_collection_from(
+        (
+            (4.0, _hdc_payload(resolving_power_used=3000.0)),
+            (4.0, _hdc_payload(resolving_power_used=5000.0)),
+        )
+    )
+    fig, axes = plt.subplots()
+
+    _plot_hdc_curves(axes, collection)
+    hdc_lines = [
+        line for line in axes.lines if str(line.get_label()).startswith("HDC CCF")
+    ]
+    labels = [label for label in _legend_labels(axes, collection) if "HDC CCF" in label]
+
+    assert len(hdc_lines) == 2
+    assert labels == ["HDC CCF (R=3000)", "HDC CCF (R=5000)"]
+    plt.close(fig)
+
+
+def test_detection_space_hdc_records_sharing_r_draw_once() -> None:
+    """Two cells at the same resolving power are indistinguishable once drawn,
+    so they collapse to one curve and one legend entry -- not one entry with
+    two overlapping curves behind it."""
+
+    collection = _hdc_collection_from(
+        (
+            (4.0, _hdc_payload(resolving_power_used=3000.0)),
+            (8.0, _hdc_payload(resolving_power_used=3000.0)),
+        )
+    )
+    fig, axes = plt.subplots()
+
+    _plot_hdc_curves(axes, collection)
+    hdc_lines = [
+        line for line in axes.lines if str(line.get_label()).startswith("HDC CCF")
+    ]
+    labels = [label for label in _legend_labels(axes, collection) if "HDC CCF" in label]
+
+    assert len(hdc_lines) == 1
+    assert labels == ["HDC CCF (R=3000)"]
     plt.close(fig)
 
 
