@@ -4,7 +4,8 @@ The figure overlays detection-limit contrast curves per (instrument
 config × J-mag × integration-time) cell on top of the known-exoplanet
 population. Both detection-mode and characterization-mode 5σ curves
 are drawn — detection-mode as solid lines, characterization-mode as
-dashed lines of the matched colour. The exoplanet scatter is computed
+dashed lines of the matched colour, and ``performance.hdc`` CCF curves
+as dash-dot lines in their own colour. The exoplanet scatter is computed
 from a bundled NASA Exoplanet Archive snapshot under KILO paperv3's
 Lambertian reflected-light assumptions and filtered by observability
 from the telescope site (default: Mauna Kea, ``alt ≥ 45°``).
@@ -51,6 +52,7 @@ from nullsim.pipeline import register_plot
 _DETECTION_COLOR = "C0"
 _CHARACTERIZATION_COLOR = "#27AE60"
 _IDEAL_CORONAGRAPH_COLOR = "0.35"
+_HDC_COLOR = "#8E44AD"
 _IDEAL_CORONAGRAPH_STYLES: dict[int, dict[str, Any]] = {
     2: {"linestyle": (0, (5.0, 2.0)), "linewidth": 1.4},
     4: {"linestyle": (0, (2.0, 1.2)), "linewidth": 1.4},
@@ -117,6 +119,7 @@ def detection_space(
         _style_axes_atmosphere(axes)
         _plot_detection_curves(axes, runs)
         _plot_characterization_curves(axes, runs)
+        _plot_hdc_curves(axes, runs)
         _plot_ideal_coronagraph_curves(axes, runs)
         _plot_known_exoplanets(axes, planets)
         _decorate_axes(axes, stellar_diameter_mas=stellar_diameter_mas)
@@ -651,6 +654,123 @@ def _characterization_curve(record: RunRecord) -> dict | None:
 
 
 # ----------------------------------------------------------------------
+# HDC cross-correlation curves
+# ----------------------------------------------------------------------
+
+
+def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
+    """Overlay ``performance.hdc`` 5σ CCF curves as dash-dot lines.
+
+    Dash-dot rather than the characterization overlay's dashed styling, and its
+    own colour, so the three curve families on the figure stay distinguishable.
+
+    No convergence gating here, unlike the ``hdc_ccf`` diagnostic plot: that one
+    gates on upstream spectro convergence because it renders a retune that may
+    not have converged. A ``performance.hdc`` payload only exists when its
+    upstream resolved, and ``performance.standard`` publishes no convergence
+    predicate to gate on, so there is nothing to check.
+    """
+
+    seen: set[str] = set()
+    for record in _paper_curve_records(runs):
+        payload = _hdc_curve(record)
+        if payload is None:
+            continue
+        separations_mas = _finite_1d(payload.get("separations_mas"))
+        contrasts = _finite_1d(payload.get("ccf_contrast_5sigma"))
+        if (
+            separations_mas is None
+            or contrasts is None
+            or contrasts.shape != separations_mas.shape
+        ):
+            logging.info(
+                "detection_space: performance.hdc payload for %r carries no "
+                "usable separations_mas/ccf_contrast_5sigma pair; skipping the "
+                "HDC overlay for that cell.",
+                _record_label(record),
+            )
+            continue
+        # Dedupe on the per-cell identity, as the characterization overlay
+        # does; the legend text itself comes from _hdc_legend_label, which is
+        # payload derived (the resolving power), not record derived.
+        key = _curve_legend_label(record, mode="det")
+        if key in seen:
+            continue
+        seen.add(key)
+        # NaN anchors are non-detections by design (the CCF never reaches the
+        # target SNR there), not failures — drop them and say how many.
+        mask = (
+            np.isfinite(separations_mas)
+            & np.isfinite(contrasts)
+            & (separations_mas > 0.0)
+            & (contrasts > 0.0)
+            & (contrasts <= _MAX_PHYSICAL_CONTRAST)
+        )
+        dropped = int(contrasts.size - np.count_nonzero(mask))
+        if dropped:
+            warnings.warn(
+                "detection_space: dropped "
+                f"{dropped} non-detection or unphysical HDC CCF anchor(s).",
+                stacklevel=2,
+            )
+        segments = _valid_curve_segments(separations_mas, contrasts, mask)
+        if not segments:
+            continue
+        style = {**_line_style_for_record(record), "linestyle": "-."}
+        for separations_segment, contrast_segment in segments:
+            if separations_segment.size >= 2:
+                axes.plot(
+                    separations_segment,
+                    contrast_segment,
+                    color=_HDC_COLOR,
+                    **style,
+                    zorder=5,
+                )
+            else:
+                axes.scatter(
+                    separations_segment,
+                    contrast_segment,
+                    color=_HDC_COLOR,
+                    s=18.0,
+                    zorder=5,
+                )
+
+
+def _hdc_curve(record: RunRecord) -> dict | None:
+    for name, payload in record.result.state.results.components.items():
+        if name.startswith("performance.hdc") and isinstance(payload, dict):
+            return payload
+    logging.debug(
+        "detection_space: no performance.hdc component for %r; no HDC overlay.",
+        _record_label(record),
+    )
+    return None
+
+
+def _finite_1d(values: Any) -> NDArrayFloat | None:
+    if values is None:
+        return None
+    try:
+        array = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if array.ndim != 1 or array.size == 0:
+        return None
+    return array
+
+
+def _hdc_legend_label(record: RunRecord) -> str:
+    payload = _hdc_curve(record) or {}
+    try:
+        resolving_power = float(payload.get("resolving_power_used"))
+    except (TypeError, ValueError):
+        return "HDC CCF"
+    if not math.isfinite(resolving_power):
+        return "HDC CCF"
+    return f"HDC CCF (R={resolving_power:g})"
+
+
+# ----------------------------------------------------------------------
 # Planet overlay (KILO port)
 # ----------------------------------------------------------------------
 
@@ -904,6 +1024,24 @@ def _attach_legends(
             )
         )
         labels.append(_curve_legend_label(record, mode="char"))
+
+    seen_hdc: set[str] = set()
+    for record in _paper_curve_records(runs):
+        if _hdc_curve(record) is None:
+            continue
+        label = _hdc_legend_label(record)
+        if label in seen_hdc:
+            continue
+        seen_hdc.add(label)
+        handles.append(
+            Line2D(
+                [],
+                [],
+                color=_HDC_COLOR,
+                **{**_line_style_for_record(record), "linestyle": "-."},
+            )
+        )
+        labels.append(label)
 
     coronagraph_orders = _ideal_coronagraph_orders(runs)
     if coronagraph_orders and _ideal_coronagraph_curve_inputs(runs) is not None:

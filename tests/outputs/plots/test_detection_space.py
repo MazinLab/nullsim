@@ -25,6 +25,7 @@ from nullsim.outputs.plots.detection_space import (
     _observability_config,
     _plot_characterization_curves,
     _plot_detection_curves,
+    _plot_hdc_curves,
     _valid_curve_segments,
 )
 from nullsim.pipeline import RunResult, registry
@@ -351,6 +352,166 @@ def test_detection_space_still_gates_design_grid_margin() -> None:
     fig, axes = plt.subplots()
     with pytest.warns(UserWarning, match="characterization anchor"):
         _plot_characterization_curves(axes, collection)
+    plt.close(fig)
+
+
+def _record_with_hdc_payload(record: RunRecord, payload: dict) -> RunRecord:
+    """Return a copy of ``record`` carrying a synthetic performance.hdc payload."""
+
+    state = replace(
+        record.result.state,
+        results=replace(
+            record.result.state.results,
+            components={
+                **record.result.state.results.components,
+                "performance.hdc": payload,
+            },
+        ),
+    )
+    return RunRecord(
+        config=record.config,
+        result=RunResult(
+            state=state,
+            diagnostics={},
+            timings=(),
+            cache_hit_count=0,
+            config_hash="synthetic",
+        ),
+        run_dir=record.run_dir,
+        coord_tuple=record.coord_tuple,
+    )
+
+
+def _hdc_payload(**overrides: object) -> dict:
+    payload = {
+        "separations_mas": np.asarray([1.0, 3.0, 10.0], dtype=np.float64),
+        "ccf_contrast_5sigma": np.asarray([1.0e-5, 1.0e-6, 1.0e-7]),
+        "broadband_contrast_5sigma": np.asarray([2.0e-5, 2.0e-6, 2.0e-7]),
+        # Finite gain below 1 is the normal photon-limited result, not an error.
+        "ccf_contrast_gain": 0.5,
+        "resolving_power_used": 3000.0,
+        "comparison_time_s": 3600.0,
+        "comparison_target_snr": 5.0,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _hdc_collection(payload: dict | None) -> RunCollection:
+    record = _synthetic_record(jmag=4.0, contrast_floor=1.0e-7)
+    if payload is not None:
+        record = _record_with_hdc_payload(record, payload)
+    return RunCollection(
+        config=record.config,
+        records=(record,),
+        output_dir=Path("."),
+    )
+
+
+def test_detection_space_overlays_hdc_ccf_curve() -> None:
+    """The HDC CCF curve is drawn dash-dot, distinct from the dashed
+    characterization overlay it sits beside."""
+
+    collection = _hdc_collection(_hdc_payload())
+    fig, axes = plt.subplots()
+
+    _plot_hdc_curves(axes, collection)
+
+    assert len(axes.lines) == 1
+    line = axes.lines[0]
+    assert line.get_linestyle() == "-."
+    np.testing.assert_allclose(line.get_xdata(), [1.0, 3.0, 10.0])
+    np.testing.assert_allclose(line.get_ydata(), [1.0e-5, 1.0e-6, 1.0e-7])
+    plt.close(fig)
+
+
+def test_detection_space_hdc_legend_label_carries_resolving_power() -> None:
+    collection = _hdc_collection(_hdc_payload(resolving_power_used=2500.0))
+    fig, axes = plt.subplots()
+
+    _plot_detection_curves(axes, collection)
+    _plot_hdc_curves(axes, collection)
+    _attach_legends(axes, (), collection)
+
+    labels = [text.get_text() for text in axes.get_legend().get_texts()]
+    assert "HDC CCF (R=2500)" in labels
+    plt.close(fig)
+
+
+def test_detection_space_without_hdc_component_is_unchanged() -> None:
+    """Runs with no performance.hdc stage draw no HDC overlay and no legend
+    entry, and raise nothing."""
+
+    collection = _hdc_collection(None)
+    fig, axes = plt.subplots()
+
+    _plot_hdc_curves(axes, collection)
+    _plot_detection_curves(axes, collection)
+    _attach_legends(axes, (), collection)
+
+    assert len(axes.lines) == 1  # the detection curve alone
+    labels = [text.get_text() for text in axes.get_legend().get_texts()]
+    assert not [label for label in labels if "HDC CCF" in label]
+    plt.close(fig)
+
+
+def _plotted_separations(axes) -> list[float]:
+    """Every drawn x coordinate, from lines and from isolated-anchor scatters."""
+
+    values: list[float] = []
+    for line in axes.lines:
+        values.extend(np.asarray(line.get_xdata(), dtype=float).tolist())
+    for collection in axes.collections:
+        offsets = np.asarray(collection.get_offsets(), dtype=float)
+        if offsets.size:
+            values.extend(offsets[:, 0].tolist())
+    return sorted(values)
+
+
+def test_detection_space_drops_non_finite_hdc_anchors() -> None:
+    """NaN CCF anchors are non-detections by design, not failures: drop them
+    with a counted warning, plot the rest, and do not bridge the gap."""
+
+    payload = _hdc_payload(
+        ccf_contrast_5sigma=np.asarray([1.0e-5, np.nan, 1.0e-7]),
+    )
+    collection = _hdc_collection(payload)
+    fig, axes = plt.subplots()
+
+    with pytest.warns(UserWarning, match="HDC CCF anchor"):
+        _plot_hdc_curves(axes, collection)
+
+    assert _plotted_separations(axes) == [1.0, 10.0]
+    # The dropped middle anchor splits the curve rather than joining 1 to 10.
+    assert not axes.lines
+    plt.close(fig)
+
+
+def test_detection_space_hdc_all_nan_anchors_draws_nothing() -> None:
+    """An all-NaN CCF curve (every anchor a non-detection) is not an error."""
+
+    payload = _hdc_payload(ccf_contrast_5sigma=np.full(3, np.nan))
+    collection = _hdc_collection(payload)
+    fig, axes = plt.subplots()
+
+    with pytest.warns(UserWarning, match="HDC CCF anchor"):
+        _plot_hdc_curves(axes, collection)
+
+    assert not axes.lines
+    assert not axes.collections
+    plt.close(fig)
+
+
+def test_detection_space_hdc_skips_payload_missing_keys() -> None:
+    """A payload without the curve keys is skipped, not crashed on."""
+
+    collection = _hdc_collection({"resolving_power_used": 3000.0})
+    fig, axes = plt.subplots()
+
+    _plot_hdc_curves(axes, collection)
+
+    assert not axes.lines
+    assert not axes.collections
     plt.close(fig)
 
 
