@@ -54,6 +54,7 @@ _CHARACTERIZATION_COLOR = "#27AE60"
 _IDEAL_CORONAGRAPH_COLOR = "0.35"
 _HDC_COLOR = "#8E44AD"
 _HDC_LEGEND_PREFIX = "HDC CCF"
+_HDC_ARTIST_GID = "nullsim.detection_space.hdc_ccf"
 _IDEAL_CORONAGRAPH_STYLES: dict[int, dict[str, Any]] = {
     2: {"linestyle": (0, (5.0, 2.0)), "linewidth": 1.4},
     4: {"linestyle": (0, (2.0, 1.2)), "linewidth": 1.4},
@@ -741,7 +742,7 @@ def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
         artist_label: str | None = label
         for separations_segment, contrast_segment in segments:
             if separations_segment.size >= 2:
-                axes.plot(
+                artists = axes.plot(
                     separations_segment,
                     contrast_segment,
                     color=_HDC_COLOR,
@@ -750,14 +751,21 @@ def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
                     label=artist_label,
                 )
             else:
-                axes.scatter(
-                    separations_segment,
-                    contrast_segment,
-                    color=_HDC_COLOR,
-                    s=18.0,
-                    zorder=5,
-                    label=artist_label,
-                )
+                artists = [
+                    axes.scatter(
+                        separations_segment,
+                        contrast_segment,
+                        color=_HDC_COLOR,
+                        s=18.0,
+                        zorder=5,
+                        label=artist_label,
+                    )
+                ]
+            # Tag ownership on the artist itself. The legend harvest keys on
+            # this, not on the label text: a curve from some other family whose
+            # label merely mentions HDC must not be picked up.
+            for artist in artists:
+                artist.set_gid(_HDC_ARTIST_GID)
             artist_label = None
 
 
@@ -771,10 +779,12 @@ def _drawn_hdc_legend_entries(axes: plt.Axes) -> tuple[tuple[Line2D, str], ...]:
     entries: list[tuple[Line2D, str]] = []
     seen: set[str] = set()
     for artist in (*axes.lines, *axes.collections):
+        if artist.get_gid() != _HDC_ARTIST_GID:
+            continue
         label = artist.get_label()
-        # The family marker sits after the per-record instrument name, so this
-        # is a containment test, not a prefix test.
-        if not isinstance(label, str) or _HDC_LEGEND_PREFIX not in label:
+        # Continuation segments of a drawn curve carry matplotlib's underscore
+        # placeholder: one entry per curve, not per segment.
+        if not isinstance(label, str) or label.startswith("_"):
             continue
         if label in seen:
             continue

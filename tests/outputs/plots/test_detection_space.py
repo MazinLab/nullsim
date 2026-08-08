@@ -649,6 +649,29 @@ def test_detection_space_hdc_identical_cells_draw_once() -> None:
     plt.close(fig)
 
 
+def test_detection_space_legend_ignores_foreign_artists_mentioning_hdc() -> None:
+    """The legend harvest keys on the gid the HDC overlay stamps on its own
+    artists, not on label text. Another family's curve whose label merely
+    mentions HDC must not be pulled into the HDC legend block."""
+
+    collection = _hdc_collection(_hdc_payload())
+    fig, axes = plt.subplots()
+
+    axes.plot(
+        [1.0, 10.0],
+        [1.0e-4, 1.0e-5],
+        label="comparison against HDC CCF",
+    )
+    _plot_hdc_curves(axes, collection)
+    _plot_detection_curves(axes, collection)
+    _attach_legends(axes, (), collection)
+
+    labels = [text.get_text() for text in axes.get_legend().get_texts()]
+    assert "comparison against HDC CCF" not in labels
+    assert len([label for label in labels if "HDC CCF" in label]) == 1
+    plt.close(fig)
+
+
 def test_detection_space_uses_paper_jmag_styles() -> None:
     import matplotlib.pyplot as plt
 
