@@ -846,8 +846,10 @@ def _resolve_comparison_basis(
 
     if has_broadband_curve:
         model = (
-            "ccf_contrast_gain = broadband_contrast_5sigma / "
-            "ccf_contrast_5sigma, and both curves are guaranteed to describe "
+            "ccf_contrast_gain = broadband_contrast_at_target / "
+            "ccf_contrast_at_target (the *_contrast_5sigma aliases carry the "
+            "same arrays, but only when comparison_target_snr is exactly 5), "
+            "and both curves are guaranteed to describe "
             f"the SAME observation: integration time {integration_time_s:.6g} s "
             f"and target SNR {target_snr:.6g}, inherited from the broadband "
             f"curve's own metadata ({time_source}; {target_source}). The "
@@ -861,7 +863,7 @@ def _resolve_comparison_basis(
     else:
         model = (
             "No broadband curve was published upstream (empty "
-            "contrast_curve_mas), so broadband_contrast_5sigma and "
+            "contrast_curve_mas), so broadband_contrast_at_target and "
             "ccf_contrast_gain are NaN and there is nothing to match. The CCF "
             f"curve stands alone at integration time {integration_time_s:.6g} s "
             f"and target SNR {target_snr:.6g} ({time_source}; {target_source})."

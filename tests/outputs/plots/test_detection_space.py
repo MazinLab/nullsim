@@ -1008,3 +1008,45 @@ def test_hdc_label_omits_the_threshold_at_five_sigma() -> None:
 
     assert len(labels) == 1
     assert "σ" not in labels[0]
+
+
+def test_same_label_hdc_components_both_draw_under_one_legend_entry() -> None:
+    """Two components alike in J, time, R, and threshold but not in template.
+
+    Their labels are identical, so deduping the draw by label would silently
+    drop one. Both must render; the legend still shows a single entry, because
+    it is harvested off the drawn artists and deduped there.
+    """
+
+    record = _record_with_hdc_payloads(
+        _synthetic_record(jmag=4.0, contrast_floor=1.0e-7),
+        {
+            "performance.hdc": _hdc_payload(),
+            # Same R, time, and threshold: same label. Different curve.
+            "performance.hdc.venus": _hdc_payload(
+                ccf_contrast_at_target=np.asarray([4.0e-6, 4.0e-7, 4.0e-8]),
+            ),
+        },
+    )
+    collection = RunCollection(
+        config=record.config, records=(record,), output_dir=Path(".")
+    )
+    fig, axes = plt.subplots()
+    try:
+        _plot_hdc_curves(axes, collection)
+        drawn = [
+            line
+            for line in axes.lines
+            if line.get_gid() == "nullsim.detection_space.hdc_ccf"
+        ]
+        labels = [
+            label
+            for label in _legend_labels(axes, collection)
+            if "HDC CCF" in label
+        ]
+    finally:
+        plt.close(fig)
+
+    assert len(drawn) == 2
+    assert len({str(line.get_label()) for line in drawn} - {"_child0"}) >= 1
+    assert len(labels) == 1

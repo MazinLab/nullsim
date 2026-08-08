@@ -218,9 +218,9 @@ Contract notes (subtleties that are easy to get wrong):
   effective null (the published leakage-rate keys are debug-report inputs)
   and applies `nsc_systematic_reduction` only to the null-instability
   systematic term, not mean-leakage photon noise.
-- `characterization.spectro` and `characterization.detection_curve` (which
-  shares its `Params`) honor `NULLSIM_TORCH_COMPILE` for `compile_objective`
-  and force serial restarts when compilation is on.
+- `characterization.spectro` and `characterization.detection_curve` (whose
+  `Params` model is its own, not shared) both honor `NULLSIM_TORCH_COMPILE`
+  for `compile_objective` and force serial restarts when compilation is on.
   `characterization.hdc_ccf` runs no optimizer and has neither knob.
 
 Stage-family tests live under `tests/stages/`, with additional integration

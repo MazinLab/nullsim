@@ -686,13 +686,14 @@ def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
         # Every performance.hdc component, not just the first: a config can run
         # the stage more than once (two dark-port resolving powers, say), and
         # rendering only the first silently drops the rest.
-        for payload in _hdc_payloads(record):
-            _draw_one_hdc_curve(axes, record, payload, seen)
+        for name, payload in _hdc_payloads(record):
+            _draw_one_hdc_curve(axes, record, name, payload, seen)
 
 
 def _draw_one_hdc_curve(
     axes: plt.Axes,
     record: RunRecord,
+    name: str,
     payload: dict,
     seen: set[str],
 ) -> None:
@@ -723,12 +724,20 @@ def _draw_one_hdc_curve(
             _record_label(record),
         )
         return
-    # One curve per (record identity, resolving power). Drawing and the
-    # legend key on the same string, so every drawn curve is legended and
-    # two cells alike in J, time, and R collapse to one.
-    if label in seen:
+    # Dedupe DRAWING by label AND component name, not by label alone. Two
+    # components on one record can share a label legitimately -- same J, time,
+    # R, and threshold but different spectral templates -- and keying the draw
+    # on the label alone would silently drop one of them; component names are
+    # unique by construction (unique_component_name), so adding the name
+    # separates them. The label still has to be in the key, because two
+    # different records can carry the same component name and differ only in
+    # what the label says (an R sweep at fixed J). Identical labels collapse
+    # to a single legend entry regardless: the legend is harvested off the
+    # drawn artists and deduped there, so both curves render under one entry.
+    identity = f"{label}::{name}"
+    if identity in seen:
         return
-    seen.add(label)
+    seen.add(identity)
     # NaN anchors are non-detections by design (the CCF never reaches the
     # target SNR there), not failures — drop them and say how many.
     mask = (
@@ -822,11 +831,11 @@ def _drawn_hdc_legend_entries(axes: plt.Axes) -> tuple[tuple[Line2D, str], ...]:
     return tuple(entries)
 
 
-def _hdc_payloads(record: RunRecord) -> tuple[dict, ...]:
-    """Every ``performance.hdc`` payload on a record, in pipeline order."""
+def _hdc_payloads(record: RunRecord) -> tuple[tuple[str, dict], ...]:
+    """Every ``(name, payload)`` ``performance.hdc`` pair, in pipeline order."""
 
     payloads = tuple(
-        payload
+        (name, payload)
         for name, payload in record.result.state.results.components.items()
         if name.startswith("performance.hdc") and isinstance(payload, dict)
     )
