@@ -43,6 +43,7 @@ _STAGE_MODULES = (
     "nullsim.stages.sensitivity.detection_curve",
     "nullsim.stages.performance.standard",
     "nullsim.stages.performance.pdi",
+    "nullsim.stages.performance.hdc",
     "nullsim.stages.characterization.spectro",
     "nullsim.stages.characterization.detection_curve",
     "nullsim.stages.characterization.hdc_ccf",
