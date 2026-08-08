@@ -232,6 +232,123 @@ weights and the "data" together would be an autocorrelation and would be flat in
 because a same-length grid at different wavelengths would otherwise be
 correlated index by index and quietly return a wrong answer.
 
+## Contrast At A Target SNR (Detection Mode)
+
+`ccf_contrast_at_target_snr` inverts the matched filter: rather than scoring a
+known planet, it asks how faint a planet the same observation would still detect
+at SNR `n`. That inversion is what a CCF contrast curve is made of, so it runs
+once per separation anchor and has to be cheap.
+
+Let `P1_i` be the per-channel planet rate at *unit* band-integrated contrast, so
+the actual planet rate is `c P1_i`. The planet-free variance rate is
+`v0_i = L_i + sky_i + dark_i`. With weights frozen at zero contrast,
+
+```text
+w_i = m_i Ptilde1_i / v0_i,
+A   = sum_i w_i Ptilde1_i      [Hz per unit contrast]
+B2  = sum_i w_i^2 v0_i         [Hz]
+C2  = sum_i w_i^2 P1_i         [Hz per unit contrast]
+B_w = sum_i w_i Ltilde_i       [Hz]
+```
+
+the signal is `c A t`, the photon variance is `t B2 + c t C2` (the planet's own
+shot noise is the `C2` term), and `V_sys` is whichever of the two regimes
+applies. So
+
+```text
+SNR^2(c) = c^2 A^2 t^2 / (t B2 + c t C2 + V_sys).
+```
+
+Setting that equal to `n^2` and clearing the denominator gives a quadratic,
+
+```text
+(A^2 t^2) c^2 - (n^2 t C2) c - n^2 (t B2 + V_sys) = 0,
+```
+
+whose positive root is
+
+```text
+c = [n^2 t C2 + sqrt(n^4 t^2 C2^2 + 4 A^2 t^2 n^2 (t B2 + V_sys))] / (2 A^2 t^2).
+```
+
+The constant term is `<= 0` and the leading coefficient is `> 0` whenever
+`A > 0`, so the discriminant is non-negative and exactly one root is positive.
+No iteration is needed, and that is only true because `V_sys` does not depend on
+`c`: both regimes scale with `B_w`, which is a property of the leak and the
+template, not of the planet.
+
+### Two identities worth knowing
+
+`A = B2` analytically -- both equal `sum_i Ptilde1_i^2 / v0_i`, since `w_i` is
+`Ptilde1_i / v0_i` on the usable channels. (They are computed by different
+summations, `sum w Ptilde1` and `sum w^2 v0`, so they agree to rounding rather
+than bit for bit; do not assert equality on them.) The photon-limited limit
+(`C2 -> 0`, `V_sys -> 0`) therefore collapses to
+
+```text
+c_photon = n / sqrt(A t),
+```
+
+which is the `1/sqrt(t)` scaling a contrast curve should show, with `A` playing
+the role of an effective line-weighted rate.
+
+The flat-template limit reproduces the broadband answer. With `P1_i = p` and
+`L_i = l` on all `n_ch` channels, no filtering and no mask, the quadratic
+reduces term by term (after multiplying through by `l^2 / p^2`) to
+
+```text
+c^2 (n_ch p t)^2 - n^2 c (n_ch p t) - n^2 (n_ch l t) = 0,
+```
+
+which is `S^2 = n^2 (S + B)` with `S = c P_tot t` and `B = L_tot t`. The pinned
+test compares against the closed-form root of that scalar quadratic at
+`rel = 1e-10`.
+
+### The frozen-weights caveat
+
+The weights are evaluated at `c = 0`, so `v0` excludes the planet's own
+contribution to the *weighting* while `C2` still carries the planet shot noise
+into the denominator. Exact weights would depend on the answer, which is
+precisely what the closed form avoids.
+
+The error is second order, not first. Expanding the true photon-limited
+statistic in `c P1 / v0`,
+
+```text
+t c^2 sum_i Ptilde1_i^2 / (v0_i + c P1_i) = t c^2 (A - c C2 + O(c^2)),
+```
+
+and the frozen version,
+
+```text
+c^2 A^2 t / (B2 + c C2) = t c^2 A / (1 + c C2 / A) = t c^2 (A - c C2 + O(c^2)),
+```
+
+agree through the linear term. The residual is `O((c C2 / A)^2)`, i.e. roughly
+the square of the planet/leak ratio. That is why the roundtrip test asserts only
+`rel = 2e-2` at a leak of `1e3` per channel and tightens to `rel = 1e-10` at
+`1e7`: raising the leak by `1e4` raises `c` by roughly `1e2` (since
+`c ~ sqrt(L)` in the photon limit) and so drops `c P1 / v0` by roughly `1e2` --
+measured, `8.3e-4 -> 1.0e-5` -- which drops the squared error by about four
+orders of magnitude.
+
+The practical statement: the approximation is good wherever the planet is faint
+against the leak, which is the detection regime and the only regime in which a
+contrast curve means anything. Near `c P1 ~ v0` the returned contrast is
+slightly optimistic, and `matched_filter_ccf` is the cross-check.
+
+### Failure convention
+
+`A <= 0` raises `ValueError` rather than returning `inf`. `A` is
+`sum_i Ptilde1_i^2 / v0_i` over usable channels, so it is zero only when the
+filtered template vanishes everywhere it is allowed to count: a lineless planet
+spectrum, or one whose lines all land in telluric-masked channels. There is no
+contrast at which such a template reaches the target, and an `inf` propagating
+into a contrast curve would be read as "no constraint" rather than "the input
+was unusable". The other guards (`t > 0`, `n > 0` finite, finite non-negative
+rates of equal length, and the shared `eps`/`servo_bw` checks) are the same ones
+`matched_filter_ccf` applies, via the extracted `_validate_noise_params`.
+
 ## Citations
 
 - Wang, J., Mawet, D., Ruane, G., Hu, R., and Benneke, B. 2017, AJ 153, 183.

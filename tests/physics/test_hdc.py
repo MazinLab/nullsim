@@ -5,6 +5,7 @@ import pytest
 from nullsim.physics.hdc import (
     ChannelSpectra,
     build_channel_edges,
+    ccf_contrast_at_target_snr,
     ccf_vs_rv,
     channelize,
     continuum_filter,
@@ -394,3 +395,146 @@ def test_continuum_filter_removes_smooth_baseline_and_keeps_narrow_lines():
     other = np.setdiff1d(np.arange(n), line_idx)
     assert np.all(filtered[line_idx] > 25.0)
     assert np.max(np.abs(filtered[other])) < 1.0
+
+
+# --- Contrast-at-target-SNR solver (spec section 6, detection mode) ----------
+
+
+def _line_comb_unit_contrast(n=200, spacing=20, height=1.0):
+    """Planet rate per channel at unit band-integrated contrast."""
+    p1 = np.zeros(n)
+    p1[spacing // 2 :: spacing] = height
+    return p1
+
+
+def _solver_kwargs(**overrides):
+    kwargs = dict(
+        integration_time_s=3600.0,
+        target_snr=5.0,
+        eps_systematic=1e-3,
+        servo_bw_hz=100.0,
+        with_fringe_tracking=True,
+        continuum_filter_width_channels=0,
+        telluric_transmission_per_channel=None,
+        telluric_mask_threshold=0.0,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _matched_filter_kwargs(solver_kwargs):
+    """The matched_filter_ccf kwargs corresponding to a solver call."""
+    shared = dict(solver_kwargs)
+    shared.pop("target_snr")
+    return shared
+
+
+def test_ccf_contrast_solver_matches_matched_filter_roundtrip():
+    # Solve for c at target 5, then evaluate matched_filter_ccf with
+    # planet = c * P1 on the same channels/kwargs: SNR must come back to 5.
+    # The solver freezes the weights at c=0 while the filter rebuilds them
+    # with the planet included, so the agreement is only first-order in the
+    # planet/leak ratio.
+    n = 200
+    p1 = _line_comb_unit_contrast(n)
+    zeros = np.zeros(n)
+
+    def roundtrip(leak_level):
+        leak = np.full(n, leak_level)
+        kwargs = _solver_kwargs()
+        solution = ccf_contrast_at_target_snr(
+            p1, leak, zeros, zeros, **kwargs
+        )
+        contrast = solution.contrast_at_target_snr
+        budget = matched_filter_ccf(
+            _channels(contrast * p1, leak), **_matched_filter_kwargs(kwargs)
+        )
+        return budget.ccf_snr
+
+    assert roundtrip(1.0e3) == pytest.approx(5.0, rel=2e-2)
+    # Planet term negligible against the leak: the frozen-weight error is
+    # second order in planet/leak, so a 1e4x deeper leak recovers 5.0 exactly.
+    assert roundtrip(1.0e7) == pytest.approx(5.0, rel=1e-10)
+
+
+def test_ccf_contrast_solver_flat_case_reduces_to_broadband_quadratic():
+    # Flat P1, flat leak, no filtering, no mask, eps = 0. The channelized
+    # matched filter must collapse onto the scalar broadband condition
+    # S^2 = n^2 (S + B) with S = c * P_tot * t and B = L_tot * t.
+    n_ch = 64
+    p_per_channel = 0.02
+    l_per_channel = 40.0
+    time_s = 1800.0
+    target = 7.0
+    p1 = np.full(n_ch, p_per_channel)
+    leak = np.full(n_ch, l_per_channel)
+    zeros = np.zeros(n_ch)
+
+    solution = ccf_contrast_at_target_snr(
+        p1,
+        leak,
+        zeros,
+        zeros,
+        **_solver_kwargs(
+            integration_time_s=time_s, target_snr=target, eps_systematic=0.0
+        ),
+    )
+
+    # Positive root of (c P t)^2 - n^2 c P t - n^2 L t = 0 with P, L totals.
+    p_tot_t = n_ch * p_per_channel * time_s
+    l_tot_t = n_ch * l_per_channel * time_s
+    disc = target**4 * p_tot_t**2 + 4.0 * p_tot_t**2 * target**2 * l_tot_t
+    expected = (target**2 * p_tot_t + np.sqrt(disc)) / (2.0 * p_tot_t**2)
+    assert solution.contrast_at_target_snr == pytest.approx(expected, rel=1e-10)
+
+
+def test_ccf_contrast_degrades_monotonically_with_eps():
+    n = 200
+    p1 = _line_comb_unit_contrast(n)
+    leak = np.full(n, 1.0e3)
+    zeros = np.zeros(n)
+
+    contrasts = [
+        ccf_contrast_at_target_snr(
+            p1,
+            leak,
+            zeros,
+            zeros,
+            **_solver_kwargs(
+                eps_systematic=eps, integration_time_s=1.0e5, servo_bw_hz=1.0
+            ),
+        ).contrast_at_target_snr
+        for eps in (0.0, 1e-3, 1e-2)
+    ]
+    assert contrasts[0] < contrasts[1] < contrasts[2]
+
+
+def test_ccf_contrast_solver_raises_without_template_signal():
+    n = 50
+    zeros = np.zeros(n)
+    with pytest.raises(ValueError, match="template signal"):
+        ccf_contrast_at_target_snr(
+            zeros, np.full(n, 100.0), zeros, zeros, **_solver_kwargs()
+        )
+
+
+def test_ccf_contrast_no_ft_regime_still_finite():
+    n = 200
+    p1 = _line_comb_unit_contrast(n)
+    leak = np.full(n, 1.0e3)
+    zeros = np.zeros(n)
+
+    def contrast(with_ft):
+        return ccf_contrast_at_target_snr(
+            p1,
+            leak,
+            zeros,
+            zeros,
+            **_solver_kwargs(eps_systematic=1e-2, with_fringe_tracking=with_ft),
+        ).contrast_at_target_snr
+
+    without_ft = contrast(False)
+    assert np.isfinite(without_ft)
+    # t = 3600 s, f_servo = 100 Hz: (eps B_w t)^2 >> eps^2 B_w^2 t / (2 f),
+    # so the static-offset regime costs contrast.
+    assert without_ft > contrast(True)
