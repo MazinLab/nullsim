@@ -69,10 +69,11 @@ D = sum_i Ptilde1_i Ltilde_i P1_i / v0_i^2,   H0 = B_w.
 With ``V_sys = 0`` the linear term vanishes identically and the error is second
 order in ``c P1 / v0``. With ``V_sys > 0`` it is *generically* first order, but
 not unconditionally: the structural coefficient ``C2/A - D/H0`` is itself zero
-for a flat template against a flat leak, where the frozen and exact statistics
-in fact coincide to all orders. So the bias is set by spectral structure gated
-by the systematic share ``eta_sys``, not by the presence of a systematic alone.
-See the function docstring for the measured behavior.
+for a flat template against a flat leak, and when ``c P1_i / v0_i`` is
+channel-independent as well (flat spectra with unstructured sky/dark) the
+frozen statistic is exact to all orders. So the bias is set by spectral
+structure gated by the systematic share ``eta_sys``, not by the presence of a
+systematic alone. See the function docstring for the measured behavior.
 
 Pure numpy/scipy: no TOML, ``SimulationState``, or stage imports.
 """
@@ -765,7 +766,7 @@ def ccf_contrast_at_target_snr(
 
     - *Exactly photon-limited* (``V_sys = 0``): the frozen and exact statistics
       agree through the linear term in ``c P1 / v0``, so the error is **second
-      order**. This is the only regime the closed form is essentially exact in.
+      order** whatever the spectral structure.
     - *Nonzero systematic, structured spectra*: recomputed weights also change
       the leak projection ``B_w(c)``, and hence ``V_sys``, **generically at
       first order**. The general expansion is
@@ -782,12 +783,16 @@ def ccf_contrast_at_target_snr(
       smoothly to 0 as the budget becomes photon-limited, which is what makes
       the first-order term switch on gradually rather than at a threshold.
       The structural coefficient ``C2/A - D/H0`` is the other gate: it is
-      identically zero for a flat template against a flat leak, where the
-      frozen and exact statistics coincide to *all* orders however large
-      ``V_sys`` is (the ``(1 + c P1/v0)`` factors cancel between numerator and
-      denominator), and it grows with spectral structure. So the bias needs
-      *both* a nonzero systematic and a structured spectrum; it is driven by
-      structure, not by magnitude.
+      identically zero for a flat template against a flat leak, and it grows
+      with spectral structure, so the bias needs *both* a nonzero systematic
+      and a structured spectrum. In the special case where the per-channel
+      ratio ``c P1_i / v0_i`` is channel-independent (flat spectra *and*
+      unstructured sky/dark, so that the ``(1 + c P1/v0)`` factors are common
+      and cancel between numerator and denominator), the frozen and exact
+      statistics coincide to *all* orders however large ``V_sys`` is. Flat
+      ``P1`` and ``L`` alone do not suffice: structured sky or dark makes
+      ``v0`` vary, the ratio with it, and a residual reappears at second order
+      through the structural coefficient.
 
     Measured on an 80-channel structured probe, the coefficient
     ``c eta_sys (C2/A - D/H0)`` reproduces the observed error to better than 5%

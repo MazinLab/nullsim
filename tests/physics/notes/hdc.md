@@ -385,9 +385,12 @@ the square of the planet/leak ratio. That is why the roundtrip test asserts only
 measured, `8.3e-4 -> 1.0e-5` -- which drops the squared error by about four
 orders of magnitude.
 
-**With any nonzero systematic, the error is first order.** The cancellation
-above is a property of the `V_sys = 0` denominator specifically -- it is not a
-statement about systematics being "small enough". Writing
+**With a nonzero systematic, the error is generically first order.** It
+vanishes when the structural coefficient below is zero, and the frozen
+statistic is exact to all orders when `c P1_i / v0_i` is channel-independent.
+Outside those cases the cancellation that holds at `V_sys = 0` is a property of
+that denominator specifically -- it is not a statement about systematics being
+"small enough". Writing
 `G(c) = sum_i Ptilde1_i^2 / v_i` and `H(c) = sum_i Ptilde1_i Ltilde_i / v_i`,
 the exact statistic is
 
@@ -421,19 +424,35 @@ half the coefficient above:
 ```
 
 `C2/A - D/H0` is the second gate, and it vanishes identically for a flat
-template against a flat leak. There the agreement is not merely second order but
-**exact to all orders**: with `x = c P1 / v0` flat, `G = A/(1+x)`,
-`H = H0/(1+x)` and `B2 + c C2 = A(1+x)`, so
+template against a flat leak.
+
+There is a stronger statement available, but it needs a stronger hypothesis:
+**the frozen statistic is exact to all orders when `x_i = c P1_i / v0_i` is
+channel-independent.** That is what makes the substitution below legal, since
+it requires factoring a single common `(1+x)` out of each sum:
 
 ```text
+G = A/(1+x),   H = H0/(1+x),   B2 + c C2 = A(1+x),
+
 exact = c^2 t^2 (A/(1+x))^2 / (t A/(1+x) + K H0^2/(1+x)^2)
       = c^2 t^2 A^2 / (t A (1+x) + K H0^2) = frozen.
 ```
 
-Measured: a flat probe at `eta_sys = 0.9996` and `c P1 / v0 = 0.025` — a
-*larger* planet/leak ratio than the structured probe's 0.017, and more
-systematic-dominated — roundtrips with an error of `4.4e-16`, i.e. machine
-epsilon, against the structured probe's `3.6e-2`.
+Flat `P1` and flat `L` do *not* suffice on their own: `v0 = L + sky + dark`, so
+structured sky or dark makes `v0` vary, `x_i` vary with it, and the factoring
+fails. Measured on the same flat probe (`eta_sys = 0.9996`,
+`c P1 / v0 = 0.025`, a *larger* planet/leak ratio than the structured probe's
+0.017 and more systematic-dominated):
+
+| sky | `x` range | roundtrip error |
+|---|---|---|
+| none (`v0` uniform) | `[0.02501, 0.02501]` | `4.4e-16` |
+| alternating 0/80 Hz | `[0.02084, 0.02501]` | `1.0e-9` |
+
+The first row is machine epsilon — exact. The second shows the first-order
+cancellation surviving (`1e-9` against the structured probe's `3.6e-2`) while
+exactness does not: the residual re-enters at second order through the
+structural coefficient.
 
 So the bias needs *both* a nonzero systematic and spectral structure. It is
 driven by structure, not by magnitude, and the honest statement is "generically

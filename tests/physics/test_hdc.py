@@ -838,10 +838,15 @@ def test_ccf_contrast_solver_raises_value_error_when_systematic_variance_overflo
 def test_flat_spectra_are_exact_despite_large_systematics():
     # The structural coefficient C2/A - D/H0 vanishes identically for a flat
     # template against a flat leak. In fact the frozen and exact statistics
-    # coincide to ALL orders there: with G = A/(1+x), H = H0/(1+x) and
-    # B2 + c C2 = A(1+x) for x = c P1 / v0, the (1+x) factors cancel between
-    # numerator and denominator. This is why the qualification is "generically
-    # first order", not "first order for any nonzero systematic".
+    # coincide to ALL orders when x_i = c P1_i / v0_i is channel-independent:
+    # only then can a single common (1+x) be factored out of each sum, giving
+    # G = A/(1+x), H = H0/(1+x), B2 + c C2 = A(1+x), and cancelling between
+    # numerator and denominator. Sky and dark are zero here, so v0 = leak is
+    # uniform and this case satisfies that hypothesis by construction -- hence
+    # the 1e-12 tolerance. With structured sky the ratio varies, exactness is
+    # lost (~1e-9 residual) though the first-order cancellation survives.
+    # This is why the qualification is "generically first order", not "first
+    # order for any nonzero systematic".
     n = 64
     planet_unit = np.full(n, 0.05)
     leak = np.full(n, 400.0)
