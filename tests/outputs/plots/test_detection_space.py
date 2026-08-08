@@ -386,7 +386,7 @@ def _record_with_hdc_payload(record: RunRecord, payload: dict) -> RunRecord:
 def _hdc_payload(**overrides: object) -> dict:
     payload = {
         "separations_mas": np.asarray([1.0, 3.0, 10.0], dtype=np.float64),
-        "ccf_contrast_5sigma": np.asarray([1.0e-5, 1.0e-6, 1.0e-7]),
+        "ccf_contrast_at_target": np.asarray([1.0e-5, 1.0e-6, 1.0e-7]),
         "broadband_contrast_5sigma": np.asarray([2.0e-5, 2.0e-6, 2.0e-7]),
         # Per-anchor array, as production publishes it. Finite values below 1
         # are the normal photon-limited result, not an error.
@@ -492,7 +492,7 @@ def test_detection_space_drops_non_finite_hdc_anchors() -> None:
     with a counted warning, plot the rest, and do not bridge the gap."""
 
     payload = _hdc_payload(
-        ccf_contrast_5sigma=np.asarray([1.0e-5, np.nan, 1.0e-7]),
+        ccf_contrast_at_target=np.asarray([1.0e-5, np.nan, 1.0e-7]),
     )
     collection = _hdc_collection(payload)
     fig, axes = plt.subplots()
@@ -509,7 +509,7 @@ def test_detection_space_drops_non_finite_hdc_anchors() -> None:
 def test_detection_space_hdc_all_nan_anchors_draws_nothing() -> None:
     """An all-NaN CCF curve (every anchor a non-detection) is not an error."""
 
-    payload = _hdc_payload(ccf_contrast_5sigma=np.full(3, np.nan))
+    payload = _hdc_payload(ccf_contrast_at_target=np.full(3, np.nan))
     collection = _hdc_collection(payload)
     fig, axes = plt.subplots()
 
@@ -534,7 +534,7 @@ def test_detection_space_hdc_skips_payload_missing_keys(caplog) -> None:
     with caplog.at_level("INFO", logger="root"):
         _plot_hdc_curves(axes, collection)
 
-    assert "no usable separations_mas/ccf_contrast_5sigma pair" in caplog.text
+    assert "no usable separations_mas/ccf_contrast_at_target pair" in caplog.text
     assert not axes.lines
     assert not axes.collections
     assert not [label for label in _legend_labels(axes, collection) if "HDC CCF" in label]
@@ -899,3 +899,112 @@ def test_detection_space_omits_design_context_and_caption_text(tmp_path: Path) -
     assert "Assumed stellar diameter" not in svg_text
     assert "exoplanets within" not in svg_text
     plt.close("all")
+
+
+def _record_with_hdc_payloads(
+    record: RunRecord, payloads: dict[str, dict]
+) -> RunRecord:
+    """A record carrying several named ``performance.hdc`` components."""
+
+    state = replace(
+        record.result.state,
+        results=replace(
+            record.result.state.results,
+            components={
+                **record.result.state.results.components,
+                **payloads,
+            },
+        ),
+    )
+    return RunRecord(
+        config=record.config,
+        result=RunResult(
+            state=state,
+            diagnostics={},
+            timings=(),
+            cache_hit_count=0,
+            config_hash="hdc-multi",
+        ),
+        run_dir=record.run_dir,
+        coord_tuple=record.coord_tuple,
+    )
+
+
+def test_detection_space_overlays_every_hdc_component() -> None:
+    """Two HDC stages on one record must both draw, not just the first."""
+
+    record = _record_with_hdc_payloads(
+        _synthetic_record(jmag=4.0, contrast_floor=1.0e-7),
+        {
+            "performance.hdc": _hdc_payload(resolving_power_used=3000.0),
+            "performance.hdc.high_r": _hdc_payload(
+                resolving_power_used=30000.0,
+                ccf_contrast_at_target=np.asarray([5.0e-6, 5.0e-7, 5.0e-8]),
+            ),
+        },
+    )
+    collection = RunCollection(
+        config=record.config, records=(record,), output_dir=Path(".")
+    )
+    fig, axes = plt.subplots()
+    try:
+        _plot_hdc_curves(axes, collection)
+        labels = [
+            artist.get_label()
+            for artist in axes.lines
+            if artist.get_gid() == "nullsim.detection_space.hdc_ccf"
+            and not str(artist.get_label()).startswith("_")
+        ]
+    finally:
+        plt.close(fig)
+
+    assert len(labels) == 2
+    assert any("R=3000" in label for label in labels)
+    assert any("R=30000" in label for label in labels)
+
+
+def test_hdc_label_reads_its_own_time_and_threshold() -> None:
+    """Exposure and threshold come from the HDC payload, not the record."""
+
+    payload = _hdc_payload(
+        comparison_time_s=7200.0,
+        comparison_target_snr=7.0,
+    )
+    collection = _hdc_collection(payload)
+    fig, axes = plt.subplots()
+    try:
+        _plot_hdc_curves(axes, collection)
+        labels = [
+            str(artist.get_label())
+            for artist in axes.lines
+            if artist.get_gid() == "nullsim.detection_space.hdc_ccf"
+            and not str(artist.get_label()).startswith("_")
+        ]
+    finally:
+        plt.close(fig)
+
+    assert len(labels) == 1
+    label = labels[0]
+    # 7200 s is the payload's own comparison_time_s, not the record's
+    # performance.standard reference time.
+    assert "2h" in label
+    # A non-5 threshold must be named so the curve cannot pass for 5 sigma.
+    assert "7σ" in label
+
+
+def test_hdc_label_omits_the_threshold_at_five_sigma() -> None:
+    collection = _hdc_collection(_hdc_payload(comparison_target_snr=5.0))
+    fig, axes = plt.subplots()
+    try:
+        _plot_hdc_curves(axes, collection)
+        labels = [
+            str(artist.get_label())
+            for artist in axes.lines
+            if artist.get_gid() == "nullsim.detection_space.hdc_ccf"
+            and not str(artist.get_label()).startswith("_")
+        ]
+    finally:
+        plt.close(fig)
+
+    assert len(labels) == 1
+    assert "σ" not in labels[0]

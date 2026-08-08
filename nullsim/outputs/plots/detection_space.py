@@ -661,7 +661,7 @@ def _characterization_curve(record: RunRecord) -> dict | None:
 
 
 def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
-    """Overlay ``performance.hdc`` 5σ CCF curves as dash-dot lines.
+    """Overlay every ``performance.hdc`` CCF curve as dash-dot lines.
 
     Dash-dot rather than the characterization overlay's dashed styling, and its
     own colour, so the three curve families on the figure stay distinguishable.
@@ -683,90 +683,102 @@ def _plot_hdc_curves(axes: plt.Axes, runs: RunCollection) -> None:
 
     seen: set[str] = set()
     for record in _paper_curve_records(runs):
-        payload = _hdc_curve(record)
-        if payload is None:
-            continue
-        separations_mas = _finite_1d(payload.get("separations_mas"))
-        contrasts = _finite_1d(payload.get("ccf_contrast_5sigma"))
-        if (
-            separations_mas is None
-            or contrasts is None
-            or contrasts.shape != separations_mas.shape
-        ):
-            logging.info(
-                "detection_space: performance.hdc payload for %r carries no "
-                "usable separations_mas/ccf_contrast_5sigma pair; skipping the "
-                "HDC overlay for that cell.",
-                _record_label(record),
-            )
-            continue
-        # The R-bearing label is the binding contract for this overlay, so a
-        # payload that cannot produce one is missing a required key, not a
-        # curve to draw with a vaguer label.
-        label = _hdc_legend_label(record, payload)
-        if label is None:
-            logging.info(
-                "detection_space: performance.hdc payload for %r has no finite "
-                "resolving_power_used; skipping the HDC overlay for that cell.",
-                _record_label(record),
-            )
-            continue
-        # One curve per (record identity, resolving power). Drawing and the
-        # legend key on the same string, so every drawn curve is legended and
-        # two cells alike in J, time, and R collapse to one.
-        if label in seen:
-            continue
-        seen.add(label)
-        # NaN anchors are non-detections by design (the CCF never reaches the
-        # target SNR there), not failures — drop them and say how many.
-        mask = (
-            np.isfinite(separations_mas)
-            & np.isfinite(contrasts)
-            & (separations_mas > 0.0)
-            & (contrasts > 0.0)
-            & (contrasts <= _MAX_PHYSICAL_CONTRAST)
+        # Every performance.hdc component, not just the first: a config can run
+        # the stage more than once (two dark-port resolving powers, say), and
+        # rendering only the first silently drops the rest.
+        for payload in _hdc_payloads(record):
+            _draw_one_hdc_curve(axes, record, payload, seen)
+
+
+def _draw_one_hdc_curve(
+    axes: plt.Axes,
+    record: RunRecord,
+    payload: dict,
+    seen: set[str],
+) -> None:
+    """Draw one ``performance.hdc`` payload's CCF curve, if it has one."""
+
+    separations_mas = _finite_1d(payload.get("separations_mas"))
+    contrasts = _finite_1d(_hdc_contrast_values(payload))
+    if (
+        separations_mas is None
+        or contrasts is None
+        or contrasts.shape != separations_mas.shape
+    ):
+        logging.info(
+            "detection_space: performance.hdc payload for %r carries no "
+            "usable separations_mas/ccf_contrast_at_target pair; skipping "
+            "the HDC overlay for that cell.",
+            _record_label(record),
         )
-        dropped = int(contrasts.size - np.count_nonzero(mask))
-        if dropped:
-            warnings.warn(
-                "detection_space: dropped "
-                f"{dropped} non-detection or unphysical HDC CCF anchor(s).",
-                stacklevel=2,
+        return
+    # The R-bearing label is the binding contract for this overlay, so a
+    # payload that cannot produce one is missing a required key, not a
+    # curve to draw with a vaguer label.
+    label = _hdc_legend_label(record, payload)
+    if label is None:
+        logging.info(
+            "detection_space: performance.hdc payload for %r has no finite "
+            "resolving_power_used; skipping the HDC overlay for that cell.",
+            _record_label(record),
+        )
+        return
+    # One curve per (record identity, resolving power). Drawing and the
+    # legend key on the same string, so every drawn curve is legended and
+    # two cells alike in J, time, and R collapse to one.
+    if label in seen:
+        return
+    seen.add(label)
+    # NaN anchors are non-detections by design (the CCF never reaches the
+    # target SNR there), not failures — drop them and say how many.
+    mask = (
+        np.isfinite(separations_mas)
+        & np.isfinite(contrasts)
+        & (separations_mas > 0.0)
+        & (contrasts > 0.0)
+        & (contrasts <= _MAX_PHYSICAL_CONTRAST)
+    )
+    dropped = int(contrasts.size - np.count_nonzero(mask))
+    if dropped:
+        warnings.warn(
+            "detection_space: dropped "
+            f"{dropped} non-detection or unphysical HDC CCF anchor(s).",
+            stacklevel=2,
+        )
+    segments = _valid_curve_segments(separations_mas, contrasts, mask)
+    if not segments:
+        return
+    style = {**_line_style_for_record(record), "linestyle": "-."}
+    # Label the first drawn artist only: the legend wants one entry per
+    # curve, not one per segment.
+    artist_label: str | None = label
+    for separations_segment, contrast_segment in segments:
+        if separations_segment.size >= 2:
+            artists = axes.plot(
+                separations_segment,
+                contrast_segment,
+                color=_HDC_COLOR,
+                **style,
+                zorder=5,
+                label=artist_label,
             )
-        segments = _valid_curve_segments(separations_mas, contrasts, mask)
-        if not segments:
-            continue
-        style = {**_line_style_for_record(record), "linestyle": "-."}
-        # Label the first drawn artist only: the legend wants one entry per
-        # curve, not one per segment.
-        artist_label: str | None = label
-        for separations_segment, contrast_segment in segments:
-            if separations_segment.size >= 2:
-                artists = axes.plot(
+        else:
+            artists = [
+                axes.scatter(
                     separations_segment,
                     contrast_segment,
                     color=_HDC_COLOR,
-                    **style,
+                    s=18.0,
                     zorder=5,
                     label=artist_label,
                 )
-            else:
-                artists = [
-                    axes.scatter(
-                        separations_segment,
-                        contrast_segment,
-                        color=_HDC_COLOR,
-                        s=18.0,
-                        zorder=5,
-                        label=artist_label,
-                    )
-                ]
-            # Tag ownership on the artist itself. The legend harvest keys on
-            # this, not on the label text: a curve from some other family whose
-            # label merely mentions HDC must not be picked up.
-            for artist in artists:
-                artist.set_gid(_HDC_ARTIST_GID)
-            artist_label = None
+            ]
+        # Tag ownership on the artist itself. The legend harvest keys on
+        # this, not on the label text: a curve from some other family whose
+        # label merely mentions HDC must not be picked up.
+        for artist in artists:
+            artist.set_gid(_HDC_ARTIST_GID)
+        artist_label = None
 
 
 def _drawn_hdc_legend_entries(axes: plt.Axes) -> tuple[tuple[Line2D, str], ...]:
@@ -810,15 +822,43 @@ def _drawn_hdc_legend_entries(axes: plt.Axes) -> tuple[tuple[Line2D, str], ...]:
     return tuple(entries)
 
 
-def _hdc_curve(record: RunRecord) -> dict | None:
-    for name, payload in record.result.state.results.components.items():
-        if name.startswith("performance.hdc") and isinstance(payload, dict):
-            return payload
-    logging.debug(
-        "detection_space: no performance.hdc component for %r; no HDC overlay.",
-        _record_label(record),
+def _hdc_payloads(record: RunRecord) -> tuple[dict, ...]:
+    """Every ``performance.hdc`` payload on a record, in pipeline order."""
+
+    payloads = tuple(
+        payload
+        for name, payload in record.result.state.results.components.items()
+        if name.startswith("performance.hdc") and isinstance(payload, dict)
     )
-    return None
+    if not payloads:
+        logging.debug(
+            "detection_space: no performance.hdc component for %r; no HDC "
+            "overlay.",
+            _record_label(record),
+        )
+    return payloads
+
+
+def _hdc_contrast_values(payload: dict) -> Any:
+    """The CCF contrast curve, threshold-generic key first.
+
+    ``ccf_contrast_5sigma`` is only an alias, and the stage publishes it only
+    when the threshold really is 5 sigma, so it is the fallback rather than the
+    contract.
+    """
+
+    values = payload.get("ccf_contrast_at_target")
+    if values is None:
+        values = payload.get("ccf_contrast_5sigma")
+    return values
+
+
+def _hdc_threshold_sigma(payload: dict) -> float | None:
+    try:
+        threshold = float(payload.get("comparison_target_snr"))
+    except (TypeError, ValueError):
+        return None
+    return threshold if math.isfinite(threshold) and threshold > 0.0 else None
 
 
 def _finite_1d(values: Any) -> NDArrayFloat | None:
@@ -836,10 +876,16 @@ def _finite_1d(values: Any) -> NDArrayFloat | None:
 def _hdc_legend_label(record: RunRecord, payload: dict) -> str | None:
     """``"<instrument> HDC CCF (J=4, 4h, R=3000)"``, or None without a finite R.
 
-    The characterization family's per-record identity with the resolving power
-    appended. Carrying the record identity matters: HDC contrast varies with J
-    exactly as the other families' does, so a J sweep has to yield one curve per
-    J rather than collapsing onto whichever cell was drawn first.
+    Everything inside the parentheses except the record identity comes from
+    THIS payload, not from the record's first ``performance.standard``: the
+    exposure is the HDC stage's own ``comparison_time_s`` (the basis both its
+    curves were computed at), and the threshold is its
+    ``comparison_target_snr``. Reading the time off ``performance.standard``
+    would mislabel any cell where the two disagree, and two HDC components on
+    one record would otherwise be labelled identically.
+
+    The threshold is named only when it is not 5 sigma, so the common case
+    stays uncluttered and an unusual one cannot pass for the default.
     """
 
     try:
@@ -848,9 +894,26 @@ def _hdc_legend_label(record: RunRecord, payload: dict) -> str | None:
         return None
     if not math.isfinite(resolving_power):
         return None
+    extra = f"R={resolving_power:g}"
+    threshold = _hdc_threshold_sigma(payload)
+    if threshold is not None and not math.isclose(
+        threshold, 5.0, rel_tol=1.0e-9, abs_tol=0.0
+    ):
+        extra = f"{extra}, {threshold:g}\u03c3"
     return _curve_legend_label(
-        record, mode="hdc", extra=f"R={resolving_power:g}"
+        record,
+        mode="hdc",
+        extra=extra,
+        time_s=_hdc_comparison_time_s(payload),
     )
+
+
+def _hdc_comparison_time_s(payload: dict) -> float | None:
+    try:
+        value = float(payload.get("comparison_time_s"))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0.0 else None
 
 
 # ----------------------------------------------------------------------
@@ -1286,18 +1349,22 @@ def _curve_legend_label(
     *,
     mode: str,
     extra: str | None = None,
+    time_s: float | None = None,
 ) -> str:
     """Per-record legend label for one curve family.
 
     ``extra`` appends a family-specific qualifier inside the parentheses (the
-    HDC family's resolving power); the record identity ahead of it is shared, so
-    the three families read the same way down the legend.
+    HDC family's resolving power, and its threshold when that is not 5 sigma);
+    the record identity ahead of it is shared, so the three families read the
+    same way down the legend. ``time_s`` overrides the record-level contrast
+    reference time for families that carry their own exposure -- the HDC
+    overlay does, and using the record's would mislabel it.
     """
 
     instrument = _instrument_label(record.config.run.name)
     jmag = _jmag_of_record(record)
     j_label = f"J={jmag:g}" if jmag is not None else _record_label(record)
-    time_s = _contrast_reference_time_s(record)
+    time_s = time_s if time_s is not None else _contrast_reference_time_s(record)
     time_label = f", {_format_duration_hours(time_s)}" if time_s is not None else ""
     suffix = f", {extra}" if extra else ""
     if mode == "char":
