@@ -41,14 +41,22 @@
 #   ccf_contrast_gain      7.538   with the two knobs below
 #   ccf_contrast_gain      0.163   with them removed (photon limited)
 #
-# The switch costs the broadband curve a factor 87 at 10 mas (2.43e-6 ->
+# The switch costs the broadband curve a factor 62.6 at 10 mas (2.43e-6 ->
 # 1.52e-4) and the CCF curve only a factor 1.35 (1.49e-5 -> 2.01e-5). That
 # asymmetry is the entire result.
 #
 # The gain is the SAME at every anchor, and that is structural rather than a
-# coincidence: this instrument's planet throughput and its null are both grey
-# across the band, so the two curves scale with separation identically and the
-# overlay is two parallel lines. A chromatic null would break the degeneracy.
+# coincidence -- but it is a property of `performance.hdc`'s inputs, not of the
+# instrument. The stage receives one planet throughput per separation from
+# `sensitivity.detection_curve` and one leakage rate from
+# `performance.standard`, both already band averaged, and it spreads them
+# across the band as grey. Under that approximation the CCF and broadband
+# curves scale with separation identically, so the overlay is two parallel
+# lines. The physical chip is NOT grey: its unitaries are wavelength
+# dependent and `physics/planet_throughput.py` evaluates the dark-port
+# throughput per wavelength before averaging. Feeding `performance.hdc` the
+# per-wavelength curves instead of the band averages would break the
+# degeneracy; the flat gain is a statement about the current interface.
 #
 # The injected planet contrast of 1e-4 is far brighter than a real
 # reflected-light Earth analogue (~1e-9) and only sets the scene; the contrast

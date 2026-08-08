@@ -283,7 +283,7 @@ Registered plots:
 | Name | File | Purpose |
 |---|---|---|
 | `contrast_curve` | `outputs/plots/__init__.py` | Basic contrast curve plot. |
-| `detection_space` | `outputs/plots/detection_space.py` | Exoplanet population overlay with contrast curves; overlays `performance.hdc` CCF curves as dash-dot lines of the matching colour, labelled with each record's J/time/R identity. |
+| `detection_space` | `outputs/plots/detection_space.py` | Exoplanet population overlay with contrast curves; overlays `performance.hdc` CCF curves as dash-dot lines in one fixed HDC colour, with each record's J/time/R identity carried by the label rather than the colour. |
 | `subaperture_layout` | `outputs/plots/subaperture_layout.py` | Pupil/sub-aperture layout panels. |
 | `uv_coverage_grid` | `outputs/plots/uv_coverage_grid.py` | KILO-style UV coverage grid. |
 | `chip_diagnostics` | `outputs/plots/chip_diagnostics.py` | Detection-chip power, matrix, DAC, and spectrum diagnostics. |

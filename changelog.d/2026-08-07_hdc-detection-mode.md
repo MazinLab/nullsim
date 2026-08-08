@@ -35,15 +35,25 @@ CCF contrast curve — the HDC counterpart of the broadband curve
   post-correction residual published so the caller can see how good the root
   was.
 - **`detection_space` overlays HDC**: `performance.hdc` curves are drawn as
-  dash-dot lines in the matching record colour, labelled with that record's
-  J magnitude, integration time, and resolving power so several records stay
+  dash-dot lines in one fixed HDC colour, distinct from the broadband curves.
+  Record identity is carried by the label — J magnitude, integration time, and
+  resolving power — not by the colour, so several records stay
   distinguishable. Legend entries are derived from the curves actually drawn
   and selected by artist gid.
+- **New example config `examples/test/hdc_ccf_systematics.toml`**: the
+  characterization-mode smoke chain with a quasi-static 1e-3 null instability
+  on the leaked starlight, hand set through
+  `residual_speckle_stability_factor` with `with_fringe_tracking = false` to
+  select the non-averaging branch of the systematic variance. The broadband
+  band SNR falls from 387.4 to 3.1 while the cross-correlation only falls from
+  70.5 to 33.1 — the regime HDC exists for, and the companion to the
+  photon-limited `hdc_ccf_smoke.toml` where HDC correctly loses. The config
+  header carries the budget and the caveats, chiefly that the fluctuation's
+  correlation time is asserted rather than derived from anything upstream.
 - **New example config `examples/test/hdc_detection_smoke.toml`**: the
   detection-mode counterpart of `hdc_ccf_smoke.toml`, four modes around an M2V
   host, seven separation anchors, dark ports dispersed at R = 3000, with the
-  `detection_space` overlay. It carries the same quasi-static leak instability
-  as `hdc_ccf_systematics.toml`, and for the same reason — `ccf_contrast_gain`
-  is 7.5 with the instability and 0.16 without it, so a photon-limited example
-  would have shown an overlay demonstrating that HDC loses. Runs in under four
-  seconds.
+  `detection_space` overlay. It carries the same quasi-static leak instability,
+  and for the same reason — `ccf_contrast_gain` is 7.5 with the instability and
+  0.16 without it, so a photon-limited example would have shown an overlay
+  demonstrating that HDC loses. Runs in under four seconds.
