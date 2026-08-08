@@ -31,6 +31,11 @@ _SERVO_BW_HZ = 100.0
 _INTEGRATION_TIME_S = 3600.0
 _PLANET_RV_KMS = 30.0
 _TARGET_SNR = 5.0
+# Deliberately different from _INTEGRATION_TIME_S and from the 5.0 default:
+# the broadband curve is stored at its own reference time and target, and the
+# stage must inherit BOTH or the gain divides mismatched observations.
+_CONTRAST_CURVE_TIME_S = 1800.0
+_BROADBAND_TARGET_SNR = 7.0
 _SKY_RATE_HZ_PER_PORT = 1.0e-3
 _DARK_RATE_HZ_PER_PORT = 1.0e-4
 _N_DARK_PORTS = 3
@@ -66,11 +71,11 @@ def _performance_payload(
         dark_rate_hz_per_port=_DARK_RATE_HZ_PER_PORT,
         sky_rate_hz_per_port=_SKY_RATE_HZ_PER_PORT,
         n_dark_ports=_N_DARK_PORTS,
-        integration_time_s=_INTEGRATION_TIME_S,
+        integration_time_s=_CONTRAST_CURVE_TIME_S,
         eps=eps_systematic,
         with_fringe_tracking=bool(with_fringe_tracking),
         servo_bw_hz=_SERVO_BW_HZ,
-        target_snr=_TARGET_SNR,
+        target_snr=_BROADBAND_TARGET_SNR,
         planet_throughput_per_sep=_THROUGHPUTS,
     )
     payload: dict[str, object] = {
@@ -83,9 +88,11 @@ def _performance_payload(
         "servo_bw_hz": _SERVO_BW_HZ,
         "integration_time_for_target_snr_s": _INTEGRATION_TIME_S,
         "integration_time_s": _INTEGRATION_TIME_S,
-        "target_snr": _TARGET_SNR,
+        "contrast_curve_reference_time_s": _CONTRAST_CURVE_TIME_S,
+        "target_snr": _BROADBAND_TARGET_SNR,
         "contrast_curve_mas": _SEPARATIONS_MAS,
         "contrast_curve_value": contrast_value,
+        "upstream_sensitivity_component": "sensitivity.detection_curve",
     }
     if with_fringe_tracking is not None:
         payload["with_fringe_tracking"] = with_fringe_tracking
@@ -171,6 +178,14 @@ def test_performance_hdc_publishes_expected_payload_keys(
         "target_snr",
         "integration_time_s",
         "integration_time_source",
+        "comparison_time_s",
+        "comparison_target_snr",
+        "comparison_model",
+        "post_correction_residual_per_anchor",
+        "sky_rate_hz_per_anchor",
+        "ccf_leak_rate_hz_per_channel",
+        "ccf_planet_rate_hz_per_channel_unit_contrast",
+        "upstream_sensitivity_link_source",
         "resolving_power_used",
         "n_channels",
         "n_effective_lines_per_anchor",
@@ -404,15 +419,55 @@ def test_declares_hashed_template_dependencies(tmp_path: Path) -> None:
     assert "performance.hdc.telluric_template" in sources
 
 
-def test_integration_time_falls_back_to_target_snr_time(
+def test_comparison_basis_is_inherited_from_the_broadband_curve(
     payload: dict[str, object],
 ) -> None:
+    """The gain must divide curves computed at the same time and threshold.
+
+    The fixture stores the broadband curve at 1800 s / SNR 7 while publishing a
+    3600 s integration_time_for_target_snr_s and while the stage's own default
+    target would be 5. Inheriting both is what keeps the ratio meaningful.
+    """
+
+    assert float(payload["comparison_time_s"]) == pytest.approx(
+        _CONTRAST_CURVE_TIME_S
+    )
+    assert float(payload["comparison_target_snr"]) == pytest.approx(
+        _BROADBAND_TARGET_SNR
+    )
     assert float(payload["integration_time_s"]) == pytest.approx(
-        _INTEGRATION_TIME_S
+        _CONTRAST_CURVE_TIME_S
     )
-    assert "integration_time_for_target_snr_s" in str(
-        payload["integration_time_source"]
+    assert float(payload["target_snr"]) == pytest.approx(_BROADBAND_TARGET_SNR)
+    assert "contrast_curve_reference_time_s" in str(payload["comparison_model"])
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"integration_time_s": 3600.0}, "contrast_curve_reference_time_s"),
+        ({"target_snr": 5.0}, "target_snr"),
+    ],
+)
+def test_mismatched_override_is_refused(
+    tmp_path: Path, override: dict[str, object], message: str
+) -> None:
+    stage = _stage(_context(tmp_path), **override)
+    with pytest.raises(ValueError, match=message):
+        stage.apply(_state())
+
+
+def test_matching_override_is_accepted(tmp_path: Path) -> None:
+    result = _stage(
+        _context(tmp_path),
+        integration_time_s=_CONTRAST_CURVE_TIME_S,
+        target_snr=_BROADBAND_TARGET_SNR,
+    ).apply(_state())
+    payload = result.results.components["performance.hdc"]
+    assert float(payload["comparison_time_s"]) == pytest.approx(
+        _CONTRAST_CURVE_TIME_S
     )
+
 
 
 def test_refine_contrast_corrects_a_shortfall_and_reports_it() -> None:
@@ -450,9 +505,9 @@ def test_refine_contrast_corrects_a_shortfall_and_reports_it() -> None:
     }
     target = 5.0
 
-    def refine(start: float) -> tuple[float, float, bool]:
+    def refine(solution: object) -> tuple[float, float, float, bool]:
         return _refine_contrast(
-            start,
+            solution,
             planet_unit_rate_hz=planet_unit,
             channels=channels,
             leak=leak,
@@ -462,24 +517,230 @@ def test_refine_contrast_corrects_a_shortfall_and_reports_it() -> None:
             solver_kwargs=solver_kwargs,
         )
 
-    # Find a contrast that lands on target, then start from half of it.
+    # A solution that lands on target, then an optimistic one at half of it.
+    from dataclasses import replace as dc_replace
+
     from nullsim.physics.hdc import ccf_contrast_at_target_snr
 
-    solved = ccf_contrast_at_target_snr(
+    solution = ccf_contrast_at_target_snr(
         planet_unit,
         leak,
         np.zeros(n),
         np.zeros(n),
         target_snr=target,
         **{k: v for k, v in solver_kwargs.items()},
-    ).contrast_at_target_snr
+    )
+    optimistic = dc_replace(
+        solution,
+        contrast_at_target_snr=0.5 * solution.contrast_at_target_snr,
+    )
 
-    value, snr, corrected = refine(0.5 * solved)
+    value, snr, first_snr, corrected = refine(optimistic)
     assert corrected is True
-    assert value > 0.5 * solved
+    assert value > optimistic.contrast_at_target_snr
     assert snr == pytest.approx(target, rel=0.02)
+    # The reported optimism is the PRE-correction evaluation.
+    assert first_snr == pytest.approx(0.5 * target, rel=0.05)
 
-    # Starting on target, nothing is corrected.
-    value, snr, corrected = refine(solved)
+    # Starting on target, nothing is corrected and the two agree.
+    value, snr, first_snr, corrected = refine(solution)
     assert corrected is False
     assert snr == pytest.approx(target, rel=0.02)
+    assert first_snr == snr
+
+
+def test_chromatic_residual_structures_the_leak_spectrum(tmp_path: Path) -> None:
+    """A chromatic null must reach the leak's channel spectrum, not be greyed."""
+
+    wl_um = np.linspace(_WL_MIN_UM, _WL_MAX_UM, 12)
+    # A strong ramp with a notch: unmistakable structure.
+    row = 1.0 + 4.0 * (wl_um - _WL_MIN_UM) / (_WL_MAX_UM - _WL_MIN_UM)
+    row[5:7] *= 0.1
+    surface = np.tile(row, (_N_ANCHORS, 1))
+
+    sensitivity = _sensitivity_payload()
+    sensitivity["residual_starlight_contrast_by_wavelength"] = surface
+    sensitivity["residual_starlight_wavelengths_um"] = tuple(
+        float(w) for w in wl_um
+    )
+
+    base = _state()
+    chromatic = replace(
+        base,
+        results=base.results.add_component(
+            "sensitivity.detection_curve.chromatic", sensitivity
+        ),
+    )
+    # Point the performance link at the chromatic sensitivity component.
+    performance = dict(
+        chromatic.results.components["performance.standard"]
+    )
+    performance["upstream_sensitivity_component"] = (
+        "sensitivity.detection_curve.chromatic"
+    )
+    comps = dict(chromatic.results.components)
+    comps["performance.standard"] = performance
+    from nullsim.pipeline.state import Results
+
+    chromatic = replace(chromatic, results=Results(components=comps))
+
+    grey_payload = _stage(_context(tmp_path)).apply(base).results.components[
+        "performance.hdc"
+    ]
+    chromatic_payload = _stage(_context(tmp_path)).apply(
+        chromatic
+    ).results.components["performance.hdc"]
+
+    assert "GREY" in str(grey_payload["leak_shape_model"])
+    assert "CHROMATIC" in str(chromatic_payload["leak_shape_model"])
+
+    grey_leak = np.asarray(grey_payload["ccf_leak_rate_hz_per_channel"][0])
+    chromatic_leak = np.asarray(
+        chromatic_payload["ccf_leak_rate_hz_per_channel"][0]
+    )
+    # Same band total (the shape is band-mean normalized)...
+    assert float(np.sum(chromatic_leak)) == pytest.approx(
+        float(np.sum(grey_leak)), rel=0.02
+    )
+    # ...but a genuinely different spectrum: the ramp must show up as a rising
+    # red/blue ratio that the grey leak does not have.
+    half = chromatic_leak.size // 2
+    grey_ratio = float(np.sum(grey_leak[half:]) / np.sum(grey_leak[:half]))
+    chromatic_ratio = float(
+        np.sum(chromatic_leak[half:]) / np.sum(chromatic_leak[:half])
+    )
+    assert chromatic_ratio > 1.5 * grey_ratio
+
+
+def test_sky_carries_the_awg_throughput(tmp_path: Path) -> None:
+    full = _stage(_context(tmp_path), awg_throughput=1.0).apply(_state())
+    lossy = _stage(_context(tmp_path), awg_throughput=0.5).apply(_state())
+
+    full_sky = np.asarray(
+        full.results.components["performance.hdc"]["sky_rate_hz_per_anchor"]
+    )
+    lossy_sky = np.asarray(
+        lossy.results.components["performance.hdc"]["sky_rate_hz_per_anchor"]
+    )
+    assert np.allclose(lossy_sky, 0.5 * full_sky)
+
+
+def test_zero_scalar_sky_does_not_zero_a_positive_per_anchor_sky(
+    tmp_path: Path,
+) -> None:
+    """The reachable bug: a unit sky reference must not collapse to zero."""
+
+    state = _state()
+    performance = dict(state.results.components["performance.standard"])
+    performance["sky_rate_hz_per_port"] = 0.0
+    performance["contrast_curve_sky_rate_hz_per_port"] = tuple(
+        2.0e-3 for _ in _SEPARATIONS_MAS
+    )
+    from nullsim.pipeline.state import Results
+
+    comps = dict(state.results.components)
+    comps["performance.standard"] = performance
+    state = replace(state, results=Results(components=comps))
+
+    payload = _stage(_context(tmp_path)).apply(state).results.components[
+        "performance.hdc"
+    ]
+    sky = np.asarray(payload["sky_rate_hz_per_anchor"], dtype=np.float64)
+    assert np.all(sky > 0.0)
+    assert np.all(np.isfinite(payload["ccf_contrast_5sigma"]))
+
+
+def test_per_anchor_curves_interpolate_by_coordinate_not_by_index(
+    tmp_path: Path,
+) -> None:
+    """Equal-length grids with different coordinates must not misalign."""
+
+    state = _state()
+    performance = dict(state.results.components["performance.standard"])
+    # Same length as the anchors, deliberately different coordinates.
+    other_grid = tuple(s * 2.0 for s in _SEPARATIONS_MAS)
+    leak_curve = tuple(
+        _LEAKAGE_RATE_HZ * (1.0 + 0.5 * index) for index in range(_N_ANCHORS)
+    )
+    performance["contrast_curve_mas"] = other_grid
+    performance["contrast_curve_leakage_rate_hz"] = leak_curve
+    from nullsim.pipeline.state import Results
+
+    comps = dict(state.results.components)
+    comps["performance.standard"] = performance
+    state = replace(state, results=Results(components=comps))
+
+    payload = _stage(_context(tmp_path)).apply(state).results.components[
+        "performance.hdc"
+    ]
+    used = np.asarray(payload["leak_rate_hz_per_anchor"], dtype=np.float64)
+    expected = np.interp(
+        np.asarray(_SEPARATIONS_MAS), np.asarray(other_grid), np.asarray(leak_curve)
+    ) * float(payload["awg_throughput_used"])
+
+    assert np.allclose(used, expected)
+    # The index-matched reading would have been the raw curve; reject it.
+    index_matched = np.asarray(leak_curve) * float(payload["awg_throughput_used"])
+    assert not np.allclose(used, index_matched)
+
+
+def test_sensitivity_resolved_through_the_performance_link(
+    tmp_path: Path,
+) -> None:
+    """The link wins over recency so the budgets describe one solution."""
+
+    state = _state()
+    later = _sensitivity_payload(throughputs=tuple(0.9 for _ in _THROUGHPUTS))
+    state = replace(
+        state,
+        results=state.results.add_component(
+            "sensitivity.detection_curve.later", later
+        ),
+    )
+
+    payload = _stage(_context(tmp_path)).apply(state).results.components[
+        "performance.hdc"
+    ]
+    # performance.standard names the first one; recency would have taken the
+    # later one.
+    assert (
+        payload["upstream_sensitivity_component"] == "sensitivity.detection_curve"
+    )
+    assert "link" in str(payload["upstream_sensitivity_link_source"])
+
+
+def test_missing_linked_sensitivity_component_raises(tmp_path: Path) -> None:
+    state = _state()
+    performance = dict(state.results.components["performance.standard"])
+    performance["upstream_sensitivity_component"] = "sensitivity.gone"
+    from nullsim.pipeline.state import Results
+
+    comps = dict(state.results.components)
+    comps["performance.standard"] = performance
+    state = replace(state, results=Results(components=comps))
+
+    with pytest.raises(ValueError, match="is not present on state.results"):
+        _stage(_context(tmp_path)).apply(state)
+
+
+def test_refinement_side_error_is_caught_per_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ValueError raised during refinement must not abort the curve."""
+
+    import nullsim.stages.performance.hdc as module
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("synthetic refinement failure")
+
+    monkeypatch.setattr(module, "matched_filter_ccf", boom)
+
+    payload = _stage(_context(tmp_path)).apply(_state()).results.components[
+        "performance.hdc"
+    ]
+    assert int(payload["n_non_detections"]) == _N_ANCHORS
+    assert np.all(np.isnan(np.asarray(payload["ccf_contrast_5sigma"])))
+    assert all(
+        "synthetic refinement failure" in str(reason)
+        for reason in payload["non_detection_reasons"]
+    )

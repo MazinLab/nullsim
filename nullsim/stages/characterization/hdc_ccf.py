@@ -1130,6 +1130,20 @@ class _ChannelBuilder:
             ),
         )
 
+    def channelize_density(
+        self,
+        density: NDArray[np.float64],
+        resolving_power: float,
+    ) -> NDArray[np.float64]:
+        """Public entry point to `_channelize` for out-of-module callers.
+
+        ``performance.hdc`` rechannelizes a per-anchor leak density through the
+        same line-spread function and channel grid; exposing it keeps that from
+        reaching into a private method or restating the logic.
+        """
+
+        return self._channelize(density, self.edges(resolving_power), resolving_power)
+
     def _channelize(
         self,
         density: NDArray[np.float64],

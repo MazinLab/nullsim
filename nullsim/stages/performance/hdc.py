@@ -80,6 +80,7 @@ from nullsim.stages.characterization.hdc_ccf import (
     _resolve_fringe_tracking,
     _resolve_template_path,
     _template_sha256,
+    _weighted_mean,
     _R_SCAN_MAX,
 )
 from nullsim.physics.spectra import constant_r_grid, packaged_spectrum_path
@@ -107,6 +108,7 @@ _REQUIRED_SENSITIVITY_KEYS = frozenset(
 
 # One matched-filter refinement is enough when the correction is this small.
 _REFINEMENT_TOLERANCE = 0.02
+_DEFAULT_TARGET_SNR = 5.0
 
 
 @register_stage
@@ -136,8 +138,12 @@ class HdcPerformanceStage(BaseStage):
         telluric_mask_threshold: float = PydanticField(default=0.8, ge=0.0, le=1.0)
         grid_oversampling: float = PydanticField(default=3.0, gt=1.0)
         continuum_filter_width_res_elements: int = PydanticField(default=30, ge=0)
+        # Both default to None so the stage can INHERIT the broadband curve's
+        # own settings and keep the gain comparison apples to apples. An
+        # explicit value that disagrees with the broadband metadata is an
+        # error, not something to silently rescale around.
         integration_time_s: float | None = PydanticField(default=None, gt=0.0)
-        target_snr: float = PydanticField(default=5.0, gt=0.0)
+        target_snr: float | None = PydanticField(default=None, gt=0.0)
         # Explicit upstream selection; None takes the most recently added
         # compatible component, which is the one immediately upstream.
         upstream_performance: str | None = None
@@ -153,11 +159,27 @@ class HdcPerformanceStage(BaseStage):
             requested=params.upstream_performance,
             param_name="upstream_performance",
         )
+        # performance.standard records which sensitivity component it used.
+        # Following that link is what keeps the throughputs, the null curve,
+        # and the leakage rate describing the same solution; falling back to
+        # recency could pair this stage's throughputs with a different run's
+        # leak.
+        sensitivity_request = params.upstream_sensitivity
+        linked_source = "performance.hdc upstream_sensitivity param"
+        if sensitivity_request is None:
+            linked = performance.get("upstream_sensitivity_component")
+            if isinstance(linked, str) and linked:
+                sensitivity_request = linked
+                linked_source = (
+                    f"{performance_name} upstream_sensitivity_component link"
+                )
+        if sensitivity_request is None:
+            linked_source = "most recently added compatible component"
         sensitivity_name, sensitivity = _find_component(
             state,
             prefix=_SENSITIVITY_PREFIX,
             required=_REQUIRED_SENSITIVITY_KEYS,
-            requested=params.upstream_sensitivity,
+            requested=sensitivity_request,
             param_name="upstream_sensitivity",
         )
 
@@ -179,9 +201,15 @@ class HdcPerformanceStage(BaseStage):
                 "separations_mas."
             )
 
-        integration_time_s, integration_time_source = _resolve_integration_time_s(
-            performance, params.integration_time_s
+        broadband = _broadband_contrast(performance, separations_mas)
+        basis = _resolve_comparison_basis(
+            performance,
+            integration_time_override=params.integration_time_s,
+            target_snr_override=params.target_snr,
+            has_broadband_curve=bool(np.any(np.isfinite(broadband))),
         )
+        integration_time_s = basis.integration_time_s
+        target_snr = basis.target_snr
         eps_systematic = float(performance["eps_systematic_used"])
         servo_bw_hz = float(performance["servo_bw_hz"])
         with_fringe_tracking, systematic_branch_source = _resolve_fringe_tracking(
@@ -230,12 +258,16 @@ class HdcPerformanceStage(BaseStage):
         # rate at unit planet throughput; the leak reference is unity. Both the
         # throughput and the null are grey, so per anchor these scale by a pure
         # number and the channelization below is done exactly once.
+        # Reference amplitudes: planet at unit contrast and unit throughput,
+        # leak and sky at unit band total. Everything downstream scales these
+        # by a pure number per anchor, so the sky reference is deliberately
+        # UNITY rather than the actual rate -- scaling a zero scalar sky by a
+        # per-anchor ratio would zero every anchor even when the per-anchor
+        # curve is positive.
         reference_budget = _DetectionBudget(
             planet_rate_hz=stellar_rate_hz_total * float(params.awg_throughput),
             leak_rate_hz=1.0,
-            sky_rate_hz=(
-                float(performance["sky_rate_hz_per_port"]) * n_dark_ports
-            ),
+            sky_rate_hz=1.0,
             dark_rate_hz_per_channel=_dark_rate_hz_per_channel(
                 performance, params.dark_count_hz_per_channel, n_dark_ports
             ),
@@ -271,12 +303,21 @@ class HdcPerformanceStage(BaseStage):
             performance, separations_mas, float(params.awg_throughput)
         )
         sky_per_anchor = _sky_rate_hz_per_anchor(
-            performance, separations_mas, n_dark_ports
+            performance,
+            separations_mas,
+            n_dark_ports,
+            float(params.awg_throughput),
+        )
+        leak_shape_factor, leak_shape_model = _chromatic_leak_factors(
+            sensitivity=sensitivity,
+            separations_mas=separations_mas,
+            grid_um=grid_um,
+            leak_density=densities.leak_density,
         )
 
         solver_kwargs: dict[str, Any] = {
             "integration_time_s": integration_time_s,
-            "target_snr": float(params.target_snr),
+            "target_snr": float(target_snr),
             "eps_systematic": eps_systematic,
             "servo_bw_hz": servo_bw_hz,
             "with_fringe_tracking": with_fringe_tracking,
@@ -291,26 +332,49 @@ class HdcPerformanceStage(BaseStage):
         contrast = np.full(n_anchors, np.nan, dtype=np.float64)
         refined_snr = np.full(n_anchors, np.nan, dtype=np.float64)
         optimism = np.full(n_anchors, np.nan, dtype=np.float64)
+        residual = np.full(n_anchors, np.nan, dtype=np.float64)
         n_effective_lines = np.full(n_anchors, np.nan, dtype=np.float64)
         systematic_var = np.full(n_anchors, np.nan, dtype=np.float64)
         photon_var_zero = np.full(n_anchors, np.nan, dtype=np.float64)
         reasons: list[str | None] = [None] * n_anchors
+        leak_channels = np.zeros((n_anchors, n_channels), dtype=np.float64)
         corrected = 0
 
         for index in range(n_anchors):
             planet_unit = reference_channels.planet_rate_hz * float(
                 throughputs[index]
             )
-            leak = reference_channels.leak_rate_hz * float(leak_per_anchor[index])
-            sky = reference_channels.sky_rate_hz * (
-                float(sky_per_anchor[index]) / reference_budget.sky_rate_hz
-                if reference_budget.sky_rate_hz > 0.0
-                else 0.0
-            )
+            if leak_shape_factor is None:
+                leak = reference_channels.leak_rate_hz * float(
+                    leak_per_anchor[index]
+                )
+            else:
+                # A chromatic residual makes the leak SHAPE anchor dependent,
+                # so this anchor's leak has to be rechannelized rather than
+                # scaled off the grey reference.
+                leak = channel_builder.channelize_density(
+                    densities.leak_density * leak_shape_factor[index],
+                    resolving_power,
+                ) * float(leak_per_anchor[index])
+            leak_channels[index] = leak
+            sky = reference_channels.sky_rate_hz * float(sky_per_anchor[index])
             dark = reference_channels.dark_rate_hz
+            # The whole solve-and-refine sits inside the catch: the refinement
+            # calls matched_filter_ccf, which validates its own inputs and can
+            # raise ValueError too, and one bad anchor must not abort the curve.
             try:
                 solution = ccf_contrast_at_target_snr(
                     planet_unit, leak, sky, dark, **solver_kwargs
+                )
+                value, snr, first_snr, did_correct = _refine_contrast(
+                    solution,
+                    planet_unit_rate_hz=planet_unit,
+                    channels=reference_channels,
+                    leak=leak,
+                    sky=sky,
+                    dark=dark,
+                    target_snr=float(target_snr),
+                    solver_kwargs=solver_kwargs,
                 )
             except ValueError as error:
                 # Reachable in ordinary sweeps: a low-throughput anchor whose
@@ -320,20 +384,17 @@ class HdcPerformanceStage(BaseStage):
                 reasons[index] = str(error)
                 continue
 
-            value, snr, did_correct = _refine_contrast(
-                solution.contrast_at_target_snr,
-                planet_unit_rate_hz=planet_unit,
-                channels=reference_channels,
-                leak=leak,
-                sky=sky,
-                dark=dark,
-                target_snr=float(params.target_snr),
-                solver_kwargs=solver_kwargs,
-            )
             contrast[index] = value
             refined_snr[index] = snr
+            # The ORIGINAL solver bias, measured at the first evaluation and
+            # before any correction: that is what diagnoses the closed form.
             optimism[index] = (
-                float(params.target_snr) / snr - 1.0 if snr > 0.0 else np.nan
+                float(target_snr) / first_snr - 1.0
+                if first_snr > 0.0
+                else np.nan
+            )
+            residual[index] = (
+                snr / float(target_snr) - 1.0 if snr > 0.0 else np.nan
             )
             corrected += int(did_correct)
             systematic_var[index] = float(solution.systematic_var_counts)
@@ -342,7 +403,6 @@ class HdcPerformanceStage(BaseStage):
                 solution.template_weights
             )
 
-        broadband = _broadband_contrast(performance, separations_mas)
         with np.errstate(divide="ignore", invalid="ignore"):
             gain = broadband / contrast
 
@@ -356,9 +416,12 @@ class HdcPerformanceStage(BaseStage):
             "ccf_contrast_5sigma": contrast.astype(np.float64, copy=True),
             "broadband_contrast_5sigma": broadband.astype(np.float64, copy=True),
             "ccf_contrast_gain": np.asarray(gain, dtype=np.float64),
-            "target_snr": float(params.target_snr),
+            "target_snr": float(target_snr),
             "integration_time_s": float(integration_time_s),
-            "integration_time_source": integration_time_source,
+            "integration_time_source": basis.source,
+            "comparison_time_s": float(basis.integration_time_s),
+            "comparison_target_snr": float(basis.target_snr),
+            "comparison_model": basis.model,
             "resolving_power_used": float(resolving_power),
             "awg_throughput_used": float(params.awg_throughput),
             "n_channels": int(n_channels),
@@ -380,10 +443,22 @@ class HdcPerformanceStage(BaseStage):
             ),
             "refined_snr_per_anchor": refined_snr.astype(np.float64, copy=True),
             "solver_optimism_per_anchor": optimism.astype(np.float64, copy=True),
+            "post_correction_residual_per_anchor": residual.astype(
+                np.float64, copy=True
+            ),
             "corrected_anchor_count": int(corrected),
             "non_detection_reasons": tuple(reasons),
             "n_non_detections": int(sum(1 for r in reasons if r is not None)),
             "leak_rate_hz_per_anchor": leak_per_anchor.astype(
+                np.float64, copy=True
+            ),
+            "sky_rate_hz_per_anchor": sky_per_anchor.astype(
+                np.float64, copy=True
+            ),
+            "ccf_planet_rate_hz_per_channel_unit_contrast": (
+                reference_channels.planet_rate_hz.astype(np.float64, copy=True)
+            ),
+            "ccf_leak_rate_hz_per_channel": leak_channels.astype(
                 np.float64, copy=True
             ),
             "planet_throughputs": throughputs.astype(np.float64, copy=True),
@@ -412,7 +487,8 @@ class HdcPerformanceStage(BaseStage):
             "detection_budget_model": _detection_budget_model(
                 params, performance, n_dark_ports
             ),
-            "leak_shape_model": _LEAK_SHAPE_MODEL,
+            "leak_shape_model": leak_shape_model,
+            "upstream_sensitivity_link_source": linked_source,
             "source_model": (
                 "nullsim performance.hdc: "
                 "nullsim.physics.hdc.ccf_contrast_at_target_snr inverted at "
@@ -487,28 +563,47 @@ _CCF_MODEL = (
     "share of the variance is non-negligible (see the solver docstring's "
     "eta_sys expansion). Every anchor is therefore refined: one "
     "matched_filter_ccf evaluation at the returned contrast gives the achieved "
-    "SNR (refined_snr_per_anchor) and the optimism "
-    "(solver_optimism_per_anchor = target/refined - 1, positive when the "
-    "solver was optimistic); if the achieved SNR is off target by more than "
-    "2%, the contrast is corrected by a log-log secant on SNR(c) and "
-    "re-evaluated, and the published contrast and refined SNR are the "
-    "post-correction values. The correction is not a fixed power of "
-    "target/refined: SNR(c) is linear in c while the leak dominates the "
-    "variance -- where a contrast curve lives -- and only becomes sqrt(c) once "
-    "the planet's own shot noise takes over, so a fixed square exponent "
-    "overshoots in the linear regime. corrected_anchor_count records how many "
-    "anchors needed the step."
+    "SNR and the solver's own bias (solver_optimism_per_anchor = "
+    "target/first_evaluation - 1, positive when the solver was optimistic, "
+    "always measured BEFORE any correction). The sequence is hard bounded: "
+    "solve, evaluate once, and if the achieved SNR is off target by more than "
+    "2%, apply exactly ONE correction and evaluate once more -- never further. "
+    "The correction is a Newton step in log-log space using the analytic slope "
+    "d ln SNR / d ln c = 1 - (1/2)(c t C2)/(t B2 + c t C2 + V_sys), whose "
+    "coefficients the solver already returns, so it costs no extra evaluation. "
+    "It is not a fixed power of target/refined: SNR(c) is linear in c while "
+    "the leak dominates the variance -- where a contrast curve lives -- and "
+    "only becomes sqrt(c) once the planet's own shot noise takes over, so a "
+    "fixed square exponent overshoots in the linear regime. "
+    "refined_snr_per_anchor and post_correction_residual_per_anchor report "
+    "where it landed; corrected_anchor_count records how many anchors needed "
+    "the step. In the fixtures exercised so far that count is zero -- the "
+    "leak projection HDC suppresses leaves the solver almost unbiased -- but "
+    "that is fixture-supported observation, not a general guarantee."
 )
 
-_LEAK_SHAPE_MODEL = (
-    "Leaked starlight is distributed with the stellar x telluric line shape "
-    "and a GREY null: performance.standard publishes one band-integrated "
-    "leakage rate, not a per-wavelength null depth, so the leak spectrum here "
-    "is the stellar spectrum scaled to that total (per anchor, using "
+_GREY_LEAK_SHAPE_MODEL = (
+    "GREY null. Leaked starlight is distributed with the stellar x telluric "
+    "line shape only: the upstream sensitivity component published no "
+    "residual_starlight_contrast_by_wavelength surface, so there is no "
+    "chromatic null structure to fold in, and performance.standard publishes "
+    "only a band-integrated leakage rate. Per-anchor amplitude comes from "
     "contrast_curve_leakage_rate_hz when the upstream stage published a "
-    "per-separation curve, otherwise the scalar leakage_rate_hz). A "
-    "chromatic null would change the leak's spectral structure and hence the "
-    "template projection; this model cannot represent that."
+    "per-separation curve, otherwise the scalar leakage_rate_hz. A chromatic "
+    "null would change the leak's spectral structure and hence its projection "
+    "onto the planet template; this fallback cannot represent that."
+)
+
+_CHROMATIC_LEAK_SHAPE_MODEL = (
+    "CHROMATIC null. Leaked starlight is distributed with the stellar x "
+    "telluric line shape TIMES the per-anchor row of the upstream "
+    "sensitivity.detection_curve residual_starlight_contrast_by_wavelength "
+    "surface, interpolated onto the analysis grid and normalized to unit band "
+    "mean under the grey leak density, so the wavelength structure enters "
+    "while the published band total is preserved. Per-anchor amplitude comes "
+    "from contrast_curve_leakage_rate_hz when available, otherwise the scalar "
+    "leakage_rate_hz. Because the leak shape is anchor dependent here, each "
+    "anchor is rechannelized rather than scaled off a grey reference."
 )
 
 
@@ -608,29 +703,163 @@ def _band_from_upstream(
     )
 
 
-def _resolve_integration_time_s(
+class _ComparisonBasis:
+    """The integration time and target SNR the gain comparison is made at.
+
+    ``ccf_contrast_gain`` divides two contrast curves, so they have to describe
+    the same observation. They easily do not: ``performance.standard`` stores
+    its broadband curve at ``contrast_curve_reference_time_s`` -- which is its
+    own param, defaulting to the detector integration time, NOT the
+    ``integration_time_for_target_snr_s`` it also publishes -- and at its own
+    ``target_snr``. Taking the target-SNR time here (the obvious reading) and
+    an independent target would divide curves computed at different exposures
+    against different thresholds, and the ratio would look like a physical gain.
+
+    So both are INHERITED from the broadband curve's published metadata by
+    default. An explicit override that disagrees is refused rather than
+    reconciled: rescaling the stored broadband curve would mean recomputing it,
+    which is the upstream stage's job, not this one's.
+    """
+
+    __slots__ = ("integration_time_s", "target_snr", "source", "model")
+
+    def __init__(
+        self,
+        *,
+        integration_time_s: float,
+        target_snr: float,
+        source: str,
+        model: str,
+    ) -> None:
+        self.integration_time_s = integration_time_s
+        self.target_snr = target_snr
+        self.source = source
+        self.model = model
+
+
+def _resolve_comparison_basis(
+    performance: dict[str, Any],
+    *,
+    integration_time_override: float | None,
+    target_snr_override: float | None,
+    has_broadband_curve: bool,
+) -> _ComparisonBasis:
+    broadband_time = _positive_finite(
+        performance.get("contrast_curve_reference_time_s")
+    )
+    broadband_target = _positive_finite(performance.get("target_snr"))
+
+    if has_broadband_curve and broadband_time is not None:
+        _refuse_mismatch(
+            "integration_time_s",
+            integration_time_override,
+            broadband_time,
+            "contrast_curve_reference_time_s",
+        )
+        integration_time_s = broadband_time
+        time_source = "performance.standard contrast_curve_reference_time_s"
+    else:
+        integration_time_s, time_source = _fallback_integration_time_s(
+            performance, integration_time_override
+        )
+
+    if has_broadband_curve and broadband_target is not None:
+        _refuse_mismatch(
+            "target_snr", target_snr_override, broadband_target, "target_snr"
+        )
+        target_snr = broadband_target
+        target_source = "performance.standard target_snr"
+    elif target_snr_override is not None:
+        target_snr = float(target_snr_override)
+        target_source = "performance.hdc target_snr param"
+    elif broadband_target is not None:
+        target_snr = broadband_target
+        target_source = "performance.standard target_snr"
+    else:
+        target_snr = _DEFAULT_TARGET_SNR
+        target_source = f"performance.hdc default ({_DEFAULT_TARGET_SNR})"
+
+    if has_broadband_curve:
+        model = (
+            "ccf_contrast_gain = broadband_contrast_5sigma / "
+            "ccf_contrast_5sigma, and both curves are guaranteed to describe "
+            f"the SAME observation: integration time {integration_time_s:.6g} s "
+            f"and target SNR {target_snr:.6g}, inherited from the broadband "
+            f"curve's own metadata ({time_source}; {target_source}). The "
+            "broadband curve is stored at contrast_curve_reference_time_s, "
+            "which is NOT the same as the integration_time_for_target_snr_s "
+            "the same payload publishes, so inheriting is what makes the ratio "
+            "meaningful. An explicit integration_time_s or target_snr that "
+            "disagrees with the broadband metadata is refused rather than "
+            "reconciled."
+        )
+    else:
+        model = (
+            "No broadband curve was published upstream (empty "
+            "contrast_curve_mas), so broadband_contrast_5sigma and "
+            "ccf_contrast_gain are NaN and there is nothing to match. The CCF "
+            f"curve stands alone at integration time {integration_time_s:.6g} s "
+            f"and target SNR {target_snr:.6g} ({time_source}; {target_source})."
+        )
+    return _ComparisonBasis(
+        integration_time_s=integration_time_s,
+        target_snr=target_snr,
+        source=f"{time_source}; {target_source}",
+        model=model,
+    )
+
+
+def _refuse_mismatch(
+    param_name: str,
+    override: float | None,
+    broadband_value: float,
+    broadband_key: str,
+) -> None:
+    if override is None:
+        return
+    if math.isclose(float(override), broadband_value, rel_tol=1.0e-9, abs_tol=0.0):
+        return
+    raise ValueError(
+        f"performance.hdc {param_name}={float(override)!r} disagrees with the "
+        f"broadband curve's {broadband_key}={broadband_value!r}. "
+        "ccf_contrast_gain divides the two curves, so they must describe the "
+        "same observation. Either drop the override so this stage inherits the "
+        f"broadband setting, or set performance.standard's {broadband_key} to "
+        "match. This stage will not rescale or recompute the stored broadband "
+        "curve."
+    )
+
+
+def _positive_finite(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        candidate = float(value)
+    except (TypeError, ValueError):
+        return None
+    return candidate if math.isfinite(candidate) and candidate > 0.0 else None
+
+
+def _fallback_integration_time_s(
     performance: dict[str, Any], override: float | None
 ) -> tuple[float, str]:
+    """Integration time when there is no broadband curve to match."""
+
     if override is not None:
         return float(override), "performance.hdc integration_time_s param"
-    for key in ("integration_time_for_target_snr_s", "integration_time_s"):
-        value = performance.get(key)
-        if value is None:
-            continue
-        candidate = float(value)
-        if math.isfinite(candidate) and candidate > 0.0:
-            source = f"performance.standard {key}"
-            if key != "integration_time_for_target_snr_s":
-                source += (
-                    " (integration_time_for_target_snr_s was not finite and "
-                    "positive: the broadband target is unreachable there)"
-                )
-            return candidate, source
+    for key in (
+        "contrast_curve_reference_time_s",
+        "integration_time_for_target_snr_s",
+        "integration_time_s",
+    ):
+        candidate = _positive_finite(performance.get(key))
+        if candidate is not None:
+            return candidate, f"performance.standard {key}"
     raise ValueError(
         "performance.hdc could not resolve an integration time: the upstream "
-        "performance.standard payload has neither a finite positive "
-        "integration_time_for_target_snr_s nor integration_time_s. Set the "
-        "stage's integration_time_s param explicitly."
+        "performance.standard payload has no finite positive "
+        "contrast_curve_reference_time_s, integration_time_for_target_snr_s, "
+        "or integration_time_s. Set the stage's integration_time_s param."
     )
 
 
@@ -675,6 +904,37 @@ def _detection_budget_model(
     )
 
 
+def _performance_curve_on_anchors(
+    performance: dict[str, Any],
+    key: str,
+    separations_mas: NDArray[np.float64],
+) -> NDArray[np.float64] | None:
+    """Resample a performance per-separation array onto the anchor grid.
+
+    ``performance.standard`` publishes its per-separation curves on its OWN
+    ``contrast_curve_mas`` grid. Accepting them by array length instead would
+    misassign by index whenever the two grids have the same number of points
+    but different coordinates -- which is exactly what happens when the
+    performance stage and this stage read different sensitivity components.
+    """
+
+    values = performance.get(key)
+    if values is None:
+        return None
+    curve = np.asarray(values, dtype=np.float64)
+    coordinates = np.asarray(
+        performance.get("contrast_curve_mas", ()), dtype=np.float64
+    )
+    if curve.ndim != 1 or curve.size == 0:
+        return None
+    if coordinates.shape != curve.shape:
+        return None
+    order = np.argsort(coordinates)
+    return np.interp(
+        separations_mas, coordinates[order], curve[order]
+    ).astype(np.float64, copy=False)
+
+
 def _leak_rate_hz_per_anchor(
     performance: dict[str, Any],
     separations_mas: NDArray[np.float64],
@@ -684,15 +944,16 @@ def _leak_rate_hz_per_anchor(
 
     ``performance.standard`` publishes ``contrast_curve_leakage_rate_hz`` when
     it had a per-separation null curve to work from; that is strictly better
-    than the single scalar, so use it when the grid lines up.
+    than the single scalar, so use it, resampled onto the anchor grid by its
+    own separation coordinates.
     """
 
-    scalar = max(float(performance["leakage_rate_hz"]), 0.0)
-    per_sep = performance.get("contrast_curve_leakage_rate_hz")
+    per_sep = _performance_curve_on_anchors(
+        performance, "contrast_curve_leakage_rate_hz", separations_mas
+    )
     if per_sep is not None:
-        values = np.asarray(per_sep, dtype=np.float64)
-        if values.shape == separations_mas.shape:
-            return np.clip(values, 0.0, None) * awg_throughput
+        return np.clip(per_sep, 0.0, None) * awg_throughput
+    scalar = max(float(performance["leakage_rate_hz"]), 0.0)
     return np.full(separations_mas.size, scalar * awg_throughput, dtype=np.float64)
 
 
@@ -700,14 +961,77 @@ def _sky_rate_hz_per_anchor(
     performance: dict[str, Any],
     separations_mas: NDArray[np.float64],
     n_dark_ports: int,
+    awg_throughput: float,
 ) -> NDArray[np.float64]:
-    scalar = max(float(performance["sky_rate_hz_per_port"]), 0.0) * n_dark_ports
-    per_sep = performance.get("contrast_curve_sky_rate_hz_per_port")
+    """Detected dark-port sky per anchor.
+
+    ``awg_throughput`` applies to sky exactly as it does to the planet and the
+    leak: ``awg_spectrum`` multiplies every optical rate by the disperser
+    throughput before binning, and sky is an optical rate.
+    """
+
+    per_sep = _performance_curve_on_anchors(
+        performance, "contrast_curve_sky_rate_hz_per_port", separations_mas
+    )
     if per_sep is not None:
-        values = np.asarray(per_sep, dtype=np.float64)
-        if values.shape == separations_mas.shape:
-            return np.clip(values, 0.0, None) * n_dark_ports
-    return np.full(separations_mas.size, scalar, dtype=np.float64)
+        return np.clip(per_sep, 0.0, None) * n_dark_ports * awg_throughput
+    scalar = max(float(performance["sky_rate_hz_per_port"]), 0.0) * n_dark_ports
+    return np.full(
+        separations_mas.size, scalar * awg_throughput, dtype=np.float64
+    )
+
+
+def _chromatic_leak_factors(
+    *,
+    sensitivity: dict[str, Any],
+    separations_mas: NDArray[np.float64],
+    grid_um: NDArray[np.float64],
+    leak_density: NDArray[np.float64],
+) -> tuple[NDArray[np.float64] | None, str]:
+    """Per-anchor multiplicative leak shape from a chromatic residual surface.
+
+    ``sensitivity.detection_curve`` publishes
+    ``residual_starlight_contrast_by_wavelength`` -- an ``(n_sep, n_wl)``
+    surface -- whenever the config supplied a chromatic residual-contrast
+    table (``examples/hwo_space.toml`` does). Where it exists, the null is not
+    grey and the leak carries that wavelength structure, which changes the
+    leak's projection onto the planet template and therefore the whole
+    systematic term.
+
+    Each anchor's row is interpolated onto the analysis grid and normalized to
+    unit band mean *under the grey leak density as weight*, so multiplying it
+    in adds the structure while leaving the published band total untouched.
+
+    Returns ``(factors_or_None, leak_shape_model)``; ``None`` means grey.
+    """
+
+    surface = sensitivity.get("residual_starlight_contrast_by_wavelength")
+    wavelengths_um = sensitivity.get("residual_starlight_wavelengths_um")
+    if surface is None or wavelengths_um is None:
+        return None, _GREY_LEAK_SHAPE_MODEL
+    values = np.asarray(surface, dtype=np.float64)
+    axis_um = np.asarray(wavelengths_um, dtype=np.float64)
+    if (
+        values.ndim != 2
+        or values.shape[0] != separations_mas.size
+        or values.shape[1] != axis_um.size
+        or axis_um.size < 2
+        or not np.all(np.isfinite(values))
+        or np.all(values <= 0.0)
+    ):
+        return None, _GREY_LEAK_SHAPE_MODEL
+
+    order = np.argsort(axis_um)
+    axis_um = axis_um[order]
+    values = values[:, order]
+
+    factors = np.empty((separations_mas.size, grid_um.size), dtype=np.float64)
+    for index in range(separations_mas.size):
+        row = np.clip(values[index], 0.0, None)
+        shape = np.interp(grid_um, axis_um, row)
+        mean = _weighted_mean(shape, leak_density, grid_um)
+        factors[index] = shape / mean
+    return factors, _CHROMATIC_LEAK_SHAPE_MODEL
 
 
 def _broadband_contrast(
@@ -741,7 +1065,7 @@ def _participation_ratio(weights: NDArray[np.float64]) -> float:
 
 
 def _refine_contrast(
-    contrast: float,
+    solution: Any,
     *,
     planet_unit_rate_hz: NDArray[np.float64],
     channels: ChannelSpectra,
@@ -750,28 +1074,35 @@ def _refine_contrast(
     dark: NDArray[np.float64],
     target_snr: float,
     solver_kwargs: dict[str, Any],
-) -> tuple[float, float, bool]:
-    """Evaluate the achieved SNR at ``contrast`` and correct it onto target.
+) -> tuple[float, float, float, bool]:
+    """Check the solved contrast against the true statistic and correct once.
 
-    The closed-form solver freezes its weights at zero contrast, which is
-    generically first-order optimistic once systematics are active. One
-    `matched_filter_ccf` evaluation at the returned contrast says how far off
-    it landed; if the shortfall exceeds `_REFINEMENT_TOLERANCE` the contrast is
-    corrected and re-evaluated.
+    The closed-form solver freezes its matched-filter weights at zero contrast,
+    which is generically first-order optimistic once systematics are active.
+    The contract here is a hard-bounded three-step sequence, never more:
 
-    The correction is a log-log secant rather than a fixed power of
-    ``target/refined``. ``SNR(c) = c A t / sqrt(t B2 + c t C2 + V_sys)`` has a
-    local log-log slope that runs between 1 and 1/2: it is **linear in c**
-    while the leak dominates the variance -- which is where a contrast curve
-    actually lives -- and only becomes ``sqrt(c)`` once the planet's own shot
-    noise takes over. Assuming the ``sqrt`` regime unconditionally, i.e.
-    scaling by ``(target/refined)**2``, overshoots badly in the linear one:
-    starting from half the solved contrast on a leak-dominated probe it lands
-    at SNR 9.97 against a target of 5. So the first step uses the linear guess,
-    and if that misses, the measured slope from the two evaluations gives the
-    third. At most three evaluations, and it converges in either regime.
+    1. one `matched_filter_ccf` evaluation at the solved contrast;
+    2. if the achieved SNR is off target by more than
+       `_REFINEMENT_TOLERANCE`, ONE correction;
+    3. one final evaluation.
 
-    Returns ``(contrast, refined_snr, corrected)``.
+    The correction is a Newton step in log-log space. ``SNR(c) = c A t /
+    sqrt(t B2 + c t C2 + V_sys)`` has the analytic local slope
+
+    ``d ln SNR / d ln c = 1 - (1/2) (c t C2) / (t B2 + c t C2 + V_sys)``,
+
+    which runs from 1 while the leak dominates the variance -- where a contrast
+    curve actually lives -- to 1/2 once the planet's own shot noise takes over.
+    All four coefficients come back from the solver, so the slope costs no
+    extra evaluation. Correcting with a *fixed* exponent instead is what fails:
+    assuming the ``sqrt`` regime unconditionally, i.e. scaling by
+    ``(target/refined)**2``, overshoots badly in the linear one -- starting
+    from half the solved contrast on a leak-dominated probe it lands at SNR
+    9.97 against a target of 5.
+
+    Returns ``(contrast, refined_snr, first_snr, corrected)``. ``first_snr`` is
+    the pre-correction evaluation, which is what diagnoses the solver's own
+    bias.
     """
 
     def achieved(value: float) -> float:
@@ -798,35 +1129,43 @@ def _refine_contrast(
         )
         return float(budget.ccf_snr)
 
-    def usable(value: float) -> bool:
-        return math.isfinite(value) and value > 0.0
+    contrast = float(solution.contrast_at_target_snr)
+    first_snr = achieved(contrast)
+    if not (math.isfinite(first_snr) and first_snr > 0.0):
+        return contrast, first_snr, first_snr, False
+    if abs(first_snr / target_snr - 1.0) <= _REFINEMENT_TOLERANCE:
+        return contrast, first_snr, first_snr, False
 
-    snr = achieved(contrast)
-    if not usable(snr):
-        return contrast, snr, False
-    if abs(snr / target_snr - 1.0) <= _REFINEMENT_TOLERANCE:
-        return contrast, snr, False
+    slope = _log_log_slope(solution, solver_kwargs["integration_time_s"], contrast)
+    corrected_contrast = contrast * (target_snr / first_snr) ** (1.0 / slope)
+    if not (math.isfinite(corrected_contrast) and corrected_contrast > 0.0):
+        return contrast, first_snr, first_snr, False
+    corrected_snr = achieved(corrected_contrast)
+    if not (math.isfinite(corrected_snr) and corrected_snr > 0.0):
+        return contrast, first_snr, first_snr, False
+    # Only keep the step if it actually improved on the starting point.
+    if abs(corrected_snr - target_snr) >= abs(first_snr - target_snr):
+        return contrast, first_snr, first_snr, False
+    return corrected_contrast, corrected_snr, first_snr, True
 
-    # Step 1: the leak-dominated (linear) guess.
-    next_contrast = contrast * (target_snr / snr)
-    next_snr = achieved(next_contrast)
-    if not usable(next_snr):
-        return contrast, snr, False
-    if abs(next_snr / target_snr - 1.0) <= _REFINEMENT_TOLERANCE:
-        return next_contrast, next_snr, True
 
-    # Step 2: the measured log-log slope closes the remaining gap.
-    log_contrast_step = math.log(next_contrast / contrast)
-    log_snr_step = math.log(next_snr / snr)
-    if abs(log_contrast_step) > 0.0 and abs(log_snr_step) > 0.0:
-        slope = log_snr_step / log_contrast_step
-        if math.isfinite(slope) and slope > 0.0:
-            final_contrast = next_contrast * (target_snr / next_snr) ** (
-                1.0 / slope
-            )
-            final_snr = achieved(final_contrast)
-            if usable(final_snr) and abs(final_snr - target_snr) < abs(
-                next_snr - target_snr
-            ):
-                return final_contrast, final_snr, True
-    return next_contrast, next_snr, True
+def _log_log_slope(solution: Any, integration_time_s: float, contrast: float) -> float:
+    """``d ln SNR / d ln c`` from the solver's own coefficients.
+
+    Clamped to ``[0.5, 1]``, the analytic range of the expression: outside it
+    the inputs are degenerate and a wilder exponent would only make the single
+    correction step worse.
+    """
+
+    photon = float(solution.photon_var_zero_contrast) * integration_time_s
+    planet = (
+        float(solution.planet_selfnoise_coefficient) * integration_time_s * contrast
+    )
+    systematic = float(solution.systematic_var_counts)
+    total = photon + planet + systematic
+    if not math.isfinite(total) or total <= 0.0:
+        return 1.0
+    slope = 1.0 - 0.5 * (planet / total)
+    if not math.isfinite(slope):
+        return 1.0
+    return min(max(slope, 0.5), 1.0)
