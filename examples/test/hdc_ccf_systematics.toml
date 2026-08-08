@@ -40,7 +40,7 @@
 #   ccf_systematic_var / ccf_photon_var = 1.757e4 / 4969 = 3.54
 #   ccf_systematic_rejection = 0.026
 #
-# Read that rejection factor as an illustrative best case, not a bound. It is
+# Read that rejection factor as one illustrative realization. It is
 # |sum w L~| / (sum |w| L) for ONE coherent scalar eps multiplying ONE smooth
 # leak spectrum: the continuum filter keeps 2.6% of what the band SNR
 # swallows whole. There is no chromatic-speckle covariance model behind it. A
