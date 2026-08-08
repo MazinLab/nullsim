@@ -252,7 +252,7 @@ pinning rationale live in `tests/physics/notes/*.md`.
 | `spectroscopy.py` | Spectro-port SNR, max resolving power, AWG spectrograph model. |
 | `mkid.py` | MKID resolving power and energy-response matrix primitives. |
 | `spectra.py` | Template spectrum loading, constant-R grids, Doppler shift, resolving-power convolution, flux-conserving resampling. |
-| `hdc.py` | High dispersion coronagraphy matched-filter CCF budget: channelization, template weights, self-subtraction, RV scan. |
+| `hdc.py` | High dispersion coronagraphy matched-filter CCF budget: channelization, template weights, self-subtraction, RV scan, and the inverse solve `ccf_contrast_at_target_snr` (faintest contrast reaching a target SNR). |
 | `pdi.py` | Polarimetric differential imaging SNR primitives. |
 | `characterization.py` | Known-position chip optimization for spectro mode. |
 | `characterization_torch.py` | Torch autograd-Jacobian helper for characterization optimization. |
@@ -283,7 +283,7 @@ Registered plots:
 | Name | File | Purpose |
 |---|---|---|
 | `contrast_curve` | `outputs/plots/__init__.py` | Basic contrast curve plot. |
-| `detection_space` | `outputs/plots/detection_space.py` | Exoplanet population overlay with contrast curves. |
+| `detection_space` | `outputs/plots/detection_space.py` | Exoplanet population overlay with contrast curves; overlays `performance.hdc` CCF curves as dash-dot lines of the matching colour, labelled with each record's J/time/R identity. |
 | `subaperture_layout` | `outputs/plots/subaperture_layout.py` | Pupil/sub-aperture layout panels. |
 | `uv_coverage_grid` | `outputs/plots/uv_coverage_grid.py` | KILO-style UV coverage grid. |
 | `chip_diagnostics` | `outputs/plots/chip_diagnostics.py` | Detection-chip power, matrix, DAC, and spectrum diagnostics. |
@@ -358,7 +358,17 @@ Regression and smoke-test configs under `examples/test/`:
 - `mkid_native_spectro.toml` — MKID-native spectroscopy smoke config.
 - `hdc_ccf_smoke.toml` — HDC cross-correlation smoke config: four modes, M2V
   host, AWG spectro port at R = 5000, `characterization.hdc_ccf` + `hdc_ccf`
-  plot. Runs in seconds.
+  plot. Runs in seconds. Photon limited, so the CCF loses to the broadband
+  band SNR — correctly, there being no systematic to reject.
+- `hdc_ccf_systematics.toml` — the same chain with a quasi-static leak
+  instability (`residual_speckle_stability_factor = 1e-3`,
+  `with_fringe_tracking = false`), the regime where characterization-mode HDC
+  wins. Companion to `hdc_ccf_smoke.toml`; the config header carries the
+  budget and the caveats on the asserted correlation time.
+- `hdc_detection_smoke.toml` — detection-mode HDC: same systematics knobs on
+  `performance.standard`, `performance.hdc` over seven separation anchors, and
+  the `detection_space` overlay. `ccf_contrast_gain` 7.5 with the knobs, 0.16
+  without.
 - `kilo_vs_hwo_study.toml` — cross-config comparison study.
 - `kilo_keck_quadrature_mesh.toml` — KILO Keck with a 48-mode
   duplicated-input Clements mesh and cophasing diagnostics.

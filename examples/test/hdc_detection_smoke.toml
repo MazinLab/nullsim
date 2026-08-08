@@ -1,0 +1,257 @@
+# Detection-mode HDC: `performance.hdc` turning the matched filter around to
+# ask how faint a planet the dark ports would still detect, and overlaying the
+# answer on the broadband contrast curve in `detection_space`.
+#
+# The detection-mode counterpart of `hdc_ccf_smoke.toml`, and derived from the
+# same four-mode chain. Two structural differences:
+#
+#   * The `characterization.spectro` + `characterization.hdc_ccf` pair is gone.
+#     Detection mode reads `performance.standard` and
+#     `sensitivity.detection_curve` instead, so the characterization branch is
+#     dead weight here -- dropping it also keeps the run to a couple of
+#     seconds.
+#   * The two systematics knobs from `hdc_ccf_systematics.toml`
+#     (`residual_speckle_stability_factor = 1e-3`, `with_fringe_tracking =
+#     false`) are set on `performance.standard`. That is a deliberate choice,
+#     and it is what makes this config worth shipping: in a purely photon
+#     limited regime the CCF LOSES to the broadband curve (gain < 1), because
+#     the matched filter throws away most of the planet's photons to isolate
+#     the lines. Nothing is wrong when that happens -- there is no systematic
+#     to reject -- but an example whose whole point is the overlay should show
+#     an overlay worth looking at. With the quasi-static leak instability in
+#     place the CCF wins at every anchor.
+#
+# `with_fringe_tracking = false` selects the quasi-static branch of the
+# null-instability variance, (eps * leak_counts)^2, rather than the averaging
+# branch eps^2 * leak_rate^2 * t / (2 f_servo). It is not a claim that the
+# fringe tracker is off -- `fringe_tracking.closed_loop` still runs. It asserts
+# that the 1e-3 leak fluctuation stays coherent across the whole 3600 s
+# exposure. Nothing upstream derives that correlation time; it is asserted
+# here, exactly as in `hdc_ccf_systematics.toml`, and the same caveats apply.
+#
+# `performance.hdc` deliberately sets neither `integration_time_s` nor
+# `target_snr`. Both are inherited from the broadband curve's own metadata
+# (`contrast_curve_reference_time_s` and `target_snr` on
+# `performance.standard`), which is what guarantees `ccf_contrast_gain`
+# compares two curves describing the same observation. An explicit value that
+# disagreed would be refused rather than reconciled.
+#
+# Achieved (run 20260807-192153, ~3.6 s wall clock), at every anchor:
+#
+#   ccf_contrast_gain      7.538   with the two knobs below
+#   ccf_contrast_gain      0.163   with them removed (photon limited)
+#
+# The switch costs the broadband curve a factor 87 at 10 mas (2.43e-6 ->
+# 1.52e-4) and the CCF curve only a factor 1.35 (1.49e-5 -> 2.01e-5). That
+# asymmetry is the entire result.
+#
+# The gain is the SAME at every anchor, and that is structural rather than a
+# coincidence: this instrument's planet throughput and its null are both grey
+# across the band, so the two curves scale with separation identically and the
+# overlay is two parallel lines. A chromatic null would break the degeneracy.
+#
+# The injected planet contrast of 1e-4 is far brighter than a real
+# reflected-light Earth analogue (~1e-9) and only sets the scene; the contrast
+# CURVE is what this config is about, and it does not depend on the injected
+# planet.
+
+[run]
+name = "hdc_detection_smoke"
+description = "Four-mode detection-mode HDC contrast curve around an M2V host."
+seed = 1
+
+[grid]
+wavelength_center_um = 1.25
+wavelength_bandwidth_um = 0.15
+n_wavelength_bins = 5
+
+[scene.star]
+jmag = 5.0
+spectral_type = "M2V"
+angular_diameter_mas = 0.8
+distance_pc = 5.0
+
+[scene.planet]
+contrast = 1.0e-4
+separation_mas = 30.0
+position_angle_deg = 0.0
+radial_velocity_kms = 30.0
+
+[scene.exozodi]
+level_zodi = 1.0
+
+[observation]
+hour_angle_h = 0.0
+integration_time_s = 3600.0
+
+[[pipeline.stages]]
+id = "scene"
+type = "scene.point_source"
+altitude_deg = 80.0
+azimuth_deg = 180.0
+
+[[pipeline.stages]]
+id = "array"
+type = "telescope.fixed_aperture"
+diameter_m = 10.0
+n_apertures = 4
+array_layout = "y_array"
+spacing_m = 40.0
+mirror_transmission = 0.80
+
+[[pipeline.stages]]
+id = "pupil_modes"
+type = "telescope.pupil_modes"
+n_modes = 4
+layout = "packed_circular"
+span_fraction = 1.0
+preserve_collecting_area = true
+
+[[pipeline.stages]]
+id = "atmosphere"
+type = "atmosphere.kolmogorov"
+r0_500nm_m = 0.15
+L0_m = 25.0
+wind_speed_m_s = 10.0
+atmospheric_transmission = 0.93
+
+[[pipeline.stages]]
+id = "ao"
+type = "ao.pyramid_wfs"
+n_actuators = 3025
+loop_frequency_hz = 2000.0
+pupil_template = "full_pupil"
+n_subap_across = 50
+derive_r_mag_from_scene_jmag = true
+excess_noise_sq = 1.0
+readout_noise_e_rms = 0.0
+central_obstruction = 0.24
+tau0_500nm_s = 2.83e-3
+theta0_500nm_arcsec = 1.19
+v_wind_m_s = 10.0
+
+[[pipeline.stages]]
+id = "injection_seed"
+type = "injection.ideal"
+n_modes = 4
+apply_strehl_coupling = false
+
+[[pipeline.stages]]
+id = "injection"
+type = "injection.single_mode_fiber"
+central_obscuration_ratio = 0.24
+
+[[pipeline.stages]]
+id = "smf28"
+type = "transport.smf28"
+length_m = 10.0
+phi_rms_rad = 0.01
+
+[[pipeline.stages]]
+id = "delay_lines"
+type = "delay_lines.geometric"
+max_delay_m = 90.0
+
+[[pipeline.stages]]
+id = "chip_opt"
+type = "chip_optimization.scipy"
+n_modes = 4
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+wl_design_um = 1.25
+target_null_depth = 1.0e-5
+max_iter = 30
+seed = 0
+
+[[pipeline.stages]]
+id = "chip"
+type = "chip.kernel_mzi_mesh"
+n_modes = 4
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+wl_design_um = 1.25
+optimization_source = "auto"
+
+[[pipeline.stages]]
+id = "detector"
+type = "detector.mkid"
+qe = 0.7
+mkid_max_count_rate_hz = 5.0e4
+n_pixels_bright = 5000
+n_pixels_dark = 500
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+n_modes = 4
+integration_time_s = 3600.0
+band = "J"
+
+[[pipeline.stages]]
+id = "fringe_tracking"
+type = "fringe_tracking.closed_loop"
+servo_bw_hz = 2000.0
+fringe_visibility = 0.9
+n_spectral_channels = 10
+n_spectral_eff = 2.5
+predictive_lag_reduction = 0.05
+wind_speed_m_s = 10.0
+
+[[pipeline.stages]]
+id = "calibration"
+type = "calibration.floor_lookup"
+default_floor_log10 = -6.0
+band = "J"
+
+[[pipeline.stages]]
+id = "sensitivity"
+type = "sensitivity.detection_curve"
+n_bright_ports = 2
+n_dark_ports = 1
+n_spectro_ports = 1
+# Seven anchors instead of the three `hdc_ccf_smoke.toml` uses, chosen to stay
+# inside the y-array's usable field: the planet throughput peaks near 20 mas
+# and has collapsed to 8e-8 by 100 mas, where the 5-sigma contrast comes out
+# above 1 and `detection_space` drops the point as unphysical. Everything out
+# to 50 mas is a real anchor.
+separations_mas = [5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0]
+n_pa_samples = 12
+include_angular_coupling = true
+n_azimuths = 1
+n_realizations_per_azimuth = 0
+n_mc_realizations = 0
+mc_seed = 0
+
+[[pipeline.stages]]
+id = "performance"
+type = "performance.standard"
+target_snr = 5.0
+# Quasi-static leak instability: the regime HDC exists to beat. See the header.
+residual_speckle_stability_factor = 1.0e-3
+with_fringe_tracking = false
+
+[[pipeline.stages]]
+id = "hdc_detection"
+type = "performance.hdc"
+planet_template = "earth"
+telluric_template = "maunakea"
+# Dark-port disperser. Detection mode has no upstream AWG payload to inherit
+# from, unlike characterization mode, so the disperser is configured here.
+awg_resolving_power = 3000.0
+awg_throughput = 0.8
+# integration_time_s and target_snr are deliberately unset: both are inherited
+# from the broadband curve so the gain ratio compares like with like.
+
+[output]
+dir = "results/{run.name}/{timestamp}"
+plots = ["detection_space"]
+tables = ["performance_summary"]
+
+[output.formats]
+tables = ["json"]
+
+[cache]
+enabled = true
+dir = ".nullsim_cache"
+version = 1
