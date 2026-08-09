@@ -1,4 +1,6 @@
-"""Tests for nullsim.physics.hdc (matched-filter CCF budget)."""
+"""Tests for nullsim.physics.hdc (photon-weighted CCF budget)."""
+import math
+
 import numpy as np
 import pytest
 
@@ -1016,3 +1018,103 @@ def test_monte_carlo_photon_variance_matches_the_propagated_prediction():
     # The empirical SNR of the reported signal against the drawn noise.
     empirical_snr = budget.signal_counts / np.sqrt(empirical_var)
     assert empirical_snr == pytest.approx(budget.ccf_snr, rel=0.02)
+
+
+def _shifted_into(template, shift, n_channels):
+    """`template` slid by `shift` channels, zero-filled where it slides in."""
+    out = np.zeros(n_channels)
+    if shift >= 0:
+        out[shift:] = template[: n_channels - shift]
+    else:
+        out[: n_channels + shift] = template[-shift:]
+    return out
+
+
+def test_ccf_vs_rv_peak_survives_a_zero_filled_shifted_template():
+    # Regression for the review counterexample. Pairing diag(v)^-1 Ttilde
+    # weights with the C_y denominator is not a cosine under any single inner
+    # product, and a template slid eight channels (zero-filled behind it) beat
+    # the truth 3.591 to 3.383. The whitened statistic restores the
+    # Cauchy-Schwarz guarantee.
+    planet = np.array(
+        [
+            0.532967, 1.263326, 1.007460, 1.088272, 3.241559,
+            2.635570, 1.414478, 9.568137, 0.156691, 66.788444,
+        ]
+    )
+    n = planet.size
+    leak = np.full(n, 100.0)
+    data = _channels(planet, leak)
+    shifts = np.arange(-9.0, 10.0)
+
+    scores = ccf_vs_rv(
+        lambda rv: _channels(_shifted_into(planet, int(rv), n), leak),
+        shifts,
+        data_channels=data,
+        continuum_filter_width_channels=3,
+        integration_time_s=1.0,
+    )
+    assert shifts[int(np.argmax(scores))] == 0.0
+    others = np.delete(scores, np.where(shifts == 0.0))
+    assert scores[shifts == 0.0][0] > others.max()
+
+
+def test_ccf_vs_rv_matches_the_dense_pseudoinverse_statistic():
+    # The O(n) closed form must equal the literal C_y^+ statistic. H = I - S
+    # with S row-stochastic and irreducible, so null(H) = span{1} exactly and
+    # the pseudoinverse optimum over range(H^T) = 1-perp is the inverse-variance
+    # weighting with a variance-weighted mean removed.
+    rng = np.random.default_rng(4)
+    n, width = 24, 5
+    planet = rng.uniform(0.0, 10.0, n)
+    leak = rng.uniform(5.0, 200.0, n)
+    data = _channels(planet, leak)
+    template = rng.uniform(0.0, 10.0, n)
+
+    (got,) = ccf_vs_rv(
+        lambda _rv: _channels(template, leak),
+        [0.0],
+        data_channels=data,
+        continuum_filter_width_channels=width,
+        integration_time_s=1.0,
+    )
+
+    basis = np.eye(n)
+    h_matrix = np.stack([continuum_filter(basis[i], width) for i in range(n)]).T
+    variance = data.total_rate_hz()
+    covariance = h_matrix @ np.diag(variance) @ h_matrix.T
+    pseudo = np.linalg.pinv(covariance, rcond=1e-12)
+    filtered_template = h_matrix @ template
+    filtered_data = h_matrix @ (planet + leak)
+    expected = (filtered_template @ pseudo @ filtered_data) / np.sqrt(
+        filtered_template @ pseudo @ filtered_template
+    )
+    assert got == pytest.approx(expected, rel=1e-8)
+
+
+def test_ccf_contrast_solver_survives_large_b2_over_small_signal():
+    # Regression: the overflow hardening formed sqrt(B2/A), which overflows now
+    # that the covariance fix broke the A = B2 identity (B2 ~ 1e126 against
+    # A ~ 1e-191 here). The root itself is perfectly representable.
+    solution = ccf_contrast_at_target_snr(
+        np.array([1e-100, 0.0, 0.0]),
+        np.array([1e-10, 1e-10, 1e308]),
+        np.zeros(3),
+        np.zeros(3),
+        **_solver_kwargs(
+            integration_time_s=1.0,
+            target_snr=5.0,
+            eps_systematic=0.0,
+            continuum_filter_width_channels=3,
+        ),
+    )
+    contrast = solution.contrast_at_target_snr
+    assert np.isfinite(contrast)
+    assert contrast == pytest.approx(1.538462e254, rel=1e-6)
+    # Photon-limited with negligible self-noise: c = n sqrt(B2) / (A t).
+    expected = (
+        5.0
+        * math.sqrt(solution.photon_var_zero_contrast)
+        / solution.signal_coefficient
+    )
+    assert contrast == pytest.approx(expected, rel=1e-9)

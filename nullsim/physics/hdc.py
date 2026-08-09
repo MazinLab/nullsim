@@ -716,28 +716,63 @@ def ccf_vs_rv(
     integration_time_s: float = 1.0,
     **_ignored: object,
 ) -> NDArray[np.float64]:
-    """Cross-correlation of a fixed observed spectrum against shifted templates.
+    """Whitened cross-correlation of a fixed observation against shifted templates.
 
     ``data_channels`` is the observation: planet at its true radial velocity plus
     leaked starlight, sky, and dark. ``channels_at_trial_rv_fn(rv)`` supplies the
     template at each trial radial velocity through its ``planet_rate_hz`` field;
     it must return channels on the *same* wavelength grid as ``data_channels``.
-    The returned statistic at trial velocity ``rv`` is the template-normalized
-    matched-filter score
 
-    ``CCF(rv) = sqrt(t) * sum_i w_i(rv) Dtilde_i / sqrt(sum_i w_i(rv)^2 v_i)``,
-    ``w_i(rv) = m_i Ttilde_i(rv) / v_i``,
+    The statistic is the generalized (whitened) matched filter for the filtered
+    data ``y = H N``, whose covariance is ``C_y = t H diag(v) H^T``:
 
-    with ``Dtilde`` the continuum-filtered observed dark-port rate
-    (planet + leak) and ``v_i`` the observed per-channel variance rate.
+    ```text
+    CCF(rv) = <Ttilde(rv), y>_{C_y^+} / sqrt(<Ttilde(rv), Ttilde(rv)>_{C_y^+}).
+    ```
 
-    The normalization is not cosmetic. The raw numerator ``T^T V^-1 D`` grows
-    with the template norm, so a trial velocity that happens to park a strong
-    template line on a weak data line can outscore the true velocity whenever the
-    template's own strong lines have been removed by the telluric mask or pushed
-    past a band edge. Dividing by ``sqrt(T^T V^-1 T)`` makes the statistic a
-    Cauchy-Schwarz cosine in the ``V^-1`` metric, which is maximized only when
-    the template matches the data, so the peak sits at the true radial velocity.
+    Both ``Ttilde = H T`` and ``y`` lie in ``range(H) = range(C_y)``, so the
+    pseudoinverse is well defined on them, and the score is a genuine cosine
+    under one inner product. Cauchy-Schwarz then bounds it by
+    ``sqrt(<y, y>_{C_y^+})`` with equality only when ``Ttilde(rv) ∝ y``, which
+    puts the peak at the true radial velocity.
+
+    **The pseudoinverse has a closed form here, so this stays O(n) per trial.**
+    ``H = I - S`` with ``S`` row-stochastic and irreducible, so by
+    Perron-Frobenius its unit eigenvalue is simple and ``null(H) = span{1}``
+    exactly. Hence ``range(H^T) = 1-perp``, and maximizing
+    ``(a.P)^2 / (t a^T diag(v) a)`` over ``a = H^T w`` in that subspace gives
+
+    ```text
+    a_i = m_i (T_i - lambda) / v_i,   lambda = sum_i m_i T_i/v_i / sum_i m_i/v_i,
+    CCF(rv) = sqrt(t) * (a . R_obs) / sqrt(a^T diag(v) a),
+    ```
+
+    with ``R_obs`` the observed planet-plus-leak rate. No eigendecomposition and
+    no dense matrix: ``a`` is the raw template inverse-variance weighted with a
+    variance-weighted mean removed, which is precisely "blind to the constant
+    mode and nothing else". A test pins this against the dense ``C_y^+`` form.
+
+    **What changed and why.** This previously paired ``w = diag(v)^-1 Ttilde``
+    weights with the ``C_y`` denominator ``sqrt(w^T H diag(v) H^T w)``. Those
+    belong to different inner products, so the ratio was not a cosine and the
+    Cauchy-Schwarz argument did not hold: on a ten-channel probe with a flat
+    leak, a template shifted by eight channels scored 3.591 against 3.383 for
+    the truth. Either half alone is self-consistent -- the old diagonal
+    denominator was a valid cosine under ``diag(v)^-1`` -- but that normalizer
+    is not the statistic's actual noise, and reporting a sigma-like score
+    against a variance the data does not have is the same defect the covariance
+    fix removed from `matched_filter_ccf`.
+
+    **Caveat, and it is a real one.** Whitening by the filtered covariance
+    necessarily undoes whatever suppression ``H`` applied, because the filter
+    attenuated signal and noise together and the ratio is restored. The optimum
+    is blind only to the constant mode, so unlike `matched_filter_ccf` -- which
+    keeps its fixed-template weights on purpose, and with them the boxcar's
+    suppression of smooth leak structure -- this scan is not protected against a
+    non-constant leak continuum. That is the price of a peak guarantee, and it
+    is why the two statistics differ: this one *locates* the radial velocity,
+    `matched_filter_ccf` *scores* the detection. Do not read this score as the
+    detection SNR.
 
     Unrecognized keyword arguments are ignored so that the same ``mf_kwargs``
     mapping can be forwarded to both this function and `matched_filter_ccf`.
@@ -756,27 +791,29 @@ def ccf_vs_rv(
         n_ch, telluric_transmission_per_channel, telluric_mask_threshold
     )
     variance_rate = data_channels.total_rate_hz()
+    usable = keep & (variance_rate > 0.0)
     observed = data_channels.planet_rate_hz + data_channels.leak_rate_hz
-    observed_filtered = _filtered(observed, continuum_filter_width_channels)
+    inverse_variance = _masked_ratio(np.ones(n_ch), variance_rate, usable)
+    inverse_variance_total = float(inverse_variance.sum())
     sqrt_time = math.sqrt(integration_time_s)
 
-    values = np.empty(rv_array.size, dtype=np.float64)
+    values = np.zeros(rv_array.size, dtype=np.float64)
+    if inverse_variance_total <= 0.0:
+        return values
+
     for index, rv in enumerate(rv_array):
         trial = channels_at_trial_rv_fn(float(rv))
         _require_same_grid(trial, data_channels, rv)
-        template = _filtered(trial.planet_rate_hz, continuum_filter_width_channels)
-        weights, _ = _weights(template, variance_rate, keep)
-        # Normalize by the H-propagated noise of the trial template, not the
-        # raw diagonal: the filter correlates channels, so sqrt(w^T H D H^T w).
-        noise_weights = _filtered_adjoint(weights, continuum_filter_width_channels)
-        template_norm = math.sqrt(
-            float(np.sum(noise_weights * noise_weights * variance_rate))
-        )
-        if template_norm <= 0.0:
-            values[index] = 0.0
+        template = trial.planet_rate_hz
+        # Variance-weighted mean: the one direction H cannot see.
+        offset = float(np.sum(inverse_variance * template)) / inverse_variance_total
+        filter_vector = inverse_variance * (template - offset)
+        filter_vector[~usable] = 0.0
+        norm = math.sqrt(float(np.sum(filter_vector**2 * variance_rate)))
+        if norm <= 0.0:
             continue
         values[index] = (
-            sqrt_time * float(np.sum(weights * observed_filtered)) / template_norm
+            sqrt_time * float(np.sum(filter_vector * observed)) / norm
         )
     return values
 
@@ -1056,13 +1093,18 @@ def ccf_contrast_at_target_snr(
     # sqrt(q) = hypot(sqrt(B2/A), sqrt(V_sys/(A t))), with the systematic term
     # grouped as sqrt(V_sys)/(sqrt(A) sqrt(t)): V_sys/A alone overflows for a
     # large systematic against a small signal coefficient.
+    # sqrt(B2)/sqrt(A), never sqrt(B2/A): the covariance fix broke the A = B2
+    # identity, so the ratio itself can overflow on inputs whose root is
+    # perfectly representable (B2 ~ 1e126 against A ~ 1e-191).
     sqrt_reduced_constant = math.hypot(
-        math.sqrt(photon_var_zero_contrast / signal_coefficient),
+        math.sqrt(photon_var_zero_contrast) / sqrt_signal,
         (math.sqrt(systematic_var_counts) / sqrt_signal) / sqrt_time,
     )
-    # hypot(p, 2 sqrt(q)) is sqrt(p^2 + 4q) without squaring either argument.
-    reduced_root = 0.5 * (
-        reduced_linear + math.hypot(reduced_linear, 2.0 * sqrt_reduced_constant)
+    # 0.5 (p + sqrt(p^2 + 4q)) == 0.5 p + hypot(p/2, sqrt(q)). Written this way
+    # nothing is squared and 2*sqrt(q) is never formed, either of which would
+    # overflow before the root does.
+    reduced_root = 0.5 * reduced_linear + math.hypot(
+        0.5 * reduced_linear, sqrt_reduced_constant
     )
     contrast = contrast_scale * reduced_root
     if not math.isfinite(contrast) or contrast <= 0.0:

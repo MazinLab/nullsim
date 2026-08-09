@@ -793,15 +793,26 @@ def test_hdc_ccf_reads_with_fringe_tracking_from_the_payload(
     assert "fallback inference" in str(inferred_payload["systematic_branch_source"])
 
 
-def test_hdc_ccf_rv_statistic_matches_photon_limited_snr_at_true_rv(
+def test_hdc_ccf_rv_statistic_peaks_at_the_true_radial_velocity(
     payload: dict[str, object],
 ) -> None:
-    """The RV statistic is a matched-filter score, not a bounded cosine."""
+    """The RV scan localizes the planet, and dominates the fixed-template SNR.
+
+    Re-pinned when the RV statistic became the whitened (C_y-pseudoinverse)
+    matched filter. It used to equal ``ccf_snr_photon_limited`` at the true RV,
+    because it shared that statistic's fixed-template weights; it no longer
+    does, and must not. Whitening by the filtered covariance recovers the
+    signal the continuum filter attenuated, so the localization score sits
+    strictly above the detection SNR -- Cauchy-Schwarz, since the optimum over
+    the subspace dominates any fixed filter in it.
+    """
 
     rv_kms = np.asarray(payload["snr_vs_rv_kms"], dtype=np.float64)
     ccf = np.asarray(payload["snr_vs_rv"], dtype=np.float64)
     at_true_rv = float(ccf[int(np.argmin(np.abs(rv_kms - _PLANET_RV_KMS)))])
-    assert at_true_rv == pytest.approx(
-        float(payload["ccf_snr_photon_limited"]), rel=1e-6
-    )
-    assert "matched-filter score" in str(payload["snr_vs_rv_model"])
+
+    assert rv_kms[int(np.argmax(ccf))] == pytest.approx(_PLANET_RV_KMS, abs=1.0)
+    assert at_true_rv == pytest.approx(float(np.max(ccf)), rel=1e-9)
+    assert at_true_rv > float(payload["ccf_snr_photon_limited"])
+    assert "whitened cross-correlation score" in str(payload["snr_vs_rv_model"])
+    assert "LOCALIZATION" in str(payload["snr_vs_rv_model"])
