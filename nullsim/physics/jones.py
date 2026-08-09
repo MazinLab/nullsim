@@ -748,11 +748,9 @@ __all__ = [
     "hwp_retardance",
     "identity_jones",
     "jones_hwp",
-    "jones_identity",
     "jones_linear_retarder",
     "jones_pbs_arm",
     "jones_pm_fiber",
-    "jones_random_birefringence",
     "jones_to_stokes",
     "linear_polarizer",
     "pdi_imperfection_factor",
@@ -765,6 +763,4 @@ __all__ = [
     "waveplate",
 ]
 
-jones_identity = identity_jones
-jones_random_birefringence = random_birefringence
 jones_pbs_arm = polarizing_beam_splitter_arm

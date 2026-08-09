@@ -251,60 +251,6 @@ def _canonicalize_basis_phases(
     ).astype(np.complex128, copy=False)
 
 
-def _complete_orthonormal_basis(
-    primary_basis: NDArray[np.complex128],
-    *,
-    n_modes: int,
-    atol: float,
-) -> NDArray[np.complex128]:
-    """Extend a stellar basis with a deterministic orthonormal complement."""
-
-    columns: list[NDArray[np.complex128]] = []
-    for raw_column in np.asarray(primary_basis, dtype=np.complex128).T:
-        candidate = _orthogonalize_against(raw_column, columns)
-        norm = float(np.linalg.norm(candidate))
-        if norm <= float(atol):
-            raise ValueError(
-                "chip_optimization.ideal_kernel SVD returned a degenerate "
-                "stellar basis vector."
-            )
-        columns.append(_canonicalize_vector_phase(candidate / norm))
-
-    for mode_index in range(int(n_modes)):
-        candidate = np.zeros(int(n_modes), dtype=np.complex128)
-        candidate[mode_index] = 1.0
-        # Two passes reduce modified Gram-Schmidt roundoff for nearly-aligned
-        # canonical vectors.
-        candidate = _orthogonalize_against(candidate, columns)
-        candidate = _orthogonalize_against(candidate, columns)
-        norm = float(np.linalg.norm(candidate))
-        if norm > float(atol):
-            columns.append(_canonicalize_vector_phase(candidate / norm))
-            if len(columns) == int(n_modes):
-                break
-
-    if len(columns) != int(n_modes):
-        raise ValueError(
-            "chip_optimization.ideal_kernel could not construct a complete "
-            f"basis ({len(columns)} / {int(n_modes)} columns)."
-        )
-    basis = np.column_stack(columns).astype(np.complex128, copy=False)
-    identity = np.eye(int(n_modes), dtype=np.complex128)
-    if not np.allclose(basis.conj().T @ basis, identity, atol=1.0e-10, rtol=0.0):
-        raise ValueError("chip_optimization.ideal_kernel basis is not unitary.")
-    return basis
-
-
-def _orthogonalize_against(
-    vector: NDArray[np.complex128],
-    columns: list[NDArray[np.complex128]],
-) -> NDArray[np.complex128]:
-    candidate = np.asarray(vector, dtype=np.complex128).copy()
-    for column in columns:
-        candidate -= column * np.vdot(column, candidate)
-    return candidate
-
-
 def _canonicalize_vector_phase(
     vector: NDArray[np.complex128],
 ) -> NDArray[np.complex128]:

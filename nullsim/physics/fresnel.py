@@ -115,28 +115,6 @@ def angular_spectrum_propagate(
     return np.asarray(propagated, dtype=np.complex128)
 
 
-def propagate_angular_spectrum(
-    field: np.ndarray,
-    *,
-    wavelength_m: float,
-    dx_m: float,
-    z_m: float,
-    suppress_evanescent: bool = True,
-) -> NDArray[np.complex128]:
-    """Compatibility wrapper for the WP5 pinning-test API.
-
-    New code should call :func:`angular_spectrum_propagate`, whose public
-    parameters use explicit micrometer suffixes for wavelength and pixel pitch.
-    """
-    return angular_spectrum_propagate(
-        field,
-        distance_m=z_m,
-        wavelength_um=wavelength_m * 1.0e6,
-        pixel_pitch_um=dx_m * 1.0e6,
-        suppress_evanescent=suppress_evanescent,
-    )
-
-
 def _as_valid_field(field: np.ndarray) -> NDArray[np.complex128]:
     """Validate and coerce a scalar propagation field."""
     try:

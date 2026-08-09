@@ -125,7 +125,6 @@ def test_amp_servo_rate_uses_physical_pickoff_mode_count() -> None:
     base_params = SimpleNamespace(
         auto_amp_servo_photon_rate_per_sub_hz=None,
         amp_wfs_pickoff_fraction=0.30,
-        amp_wfs_n_modes_override=None,
         simultaneous_science_bands=(),
         simultaneous_science_band_transmissions=(),
         n_bright_ports=12,
@@ -179,7 +178,6 @@ def test_amp_servo_rate_excludes_detector_qe_and_includes_pre_pickoff_field_loss
     params = SimpleNamespace(
         auto_amp_servo_photon_rate_per_sub_hz=None,
         amp_wfs_pickoff_fraction=0.30,
-        amp_wfs_n_modes_override=None,
         simultaneous_science_bands=(),
         simultaneous_science_band_transmissions=(),
         n_bright_ports=12,

@@ -2246,9 +2246,6 @@ def _resolve_amp_servo_n_modes(
 ) -> int:
     """Pick the mode count that divides chip-input rate per amp WFS sub."""
 
-    explicit = getattr(params, "amp_wfs_n_modes_override", None)
-    if explicit is not None and int(explicit) > 0:
-        return int(explicit)
     if pickoff_payload is not None:
         n_input_modes = pickoff_payload.get("n_input_modes")
         if n_input_modes is not None and int(n_input_modes) > 0:
@@ -3185,10 +3182,6 @@ class DetectionCurve(BaseStage):
         # this scalar remains the fallback for configs that do not carry an
         # explicit field debit.
         amp_wfs_pickoff_fraction: float = PydanticField(default=1.0, gt=0.0, le=1.0)
-        # Optional override for the n_modes denominator when the chip
-        # unitary's n_modes isn't published upstream. Defaults to
-        # n_bright_ports + n_dark_ports.
-        amp_wfs_n_modes_override: int | None = PydanticField(default=None, ge=1)
         # Instruments such as NAYRA can sense amplitude jitter with the
         # simultaneous science-band photon stream, even though this run's
         # science grid covers one primary band. When set, the amp-servo
