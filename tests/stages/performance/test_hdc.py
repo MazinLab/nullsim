@@ -98,6 +98,14 @@ def _performance_payload(
     return payload
 
 
+# Keys ``_performance_payload`` itself accepts; anything else in
+# ``performance_overrides`` is merged straight into the built payload, so a
+# test can override a published field without a new helper argument.
+_PERFORMANCE_PAYLOAD_KWARGS = frozenset(
+    {"eps_systematic", "leakage_rate_hz", "with_fringe_tracking"}
+)
+
+
 def _sensitivity_payload(
     *, throughputs: tuple[float, ...] = _THROUGHPUTS
 ) -> dict[str, object]:
@@ -115,6 +123,9 @@ def _state(
     with_sensitivity: bool = True,
     performance_overrides: dict[str, object] | None = None,
     sensitivity_overrides: dict[str, object] | None = None,
+    uncapped_stellar_rate_hz: float | None = None,
+    detector_saturated: bool | None = None,
+    awg_pixels_per_resolution_element: int | None = None,
 ) -> SimulationState:
     wl_um = tuple(
         float(w) for w in np.linspace(_WL_MIN_UM, _WL_MAX_UM, _N_WAVELENGTHS)
@@ -135,11 +146,30 @@ def _state(
             "sensitivity.detection_curve",
             _sensitivity_payload(**(sensitivity_overrides or {})),  # type: ignore[arg-type]
         )
-    if with_performance:
+    if awg_pixels_per_resolution_element is not None:
         results = results.add_component(
-            "performance.standard",
-            _performance_payload(**(performance_overrides or {})),  # type: ignore[arg-type]
+            "characterization.spectro",
+            {
+                "awg": {
+                    "pixels_per_resolution_element": (
+                        awg_pixels_per_resolution_element
+                    )
+                }
+            },
         )
+    if with_performance:
+        overrides = dict(performance_overrides or {})
+        extra: dict[str, object] = {}
+        for key, value in tuple(overrides.items()):
+            if key not in _PERFORMANCE_PAYLOAD_KWARGS:
+                extra[key] = overrides.pop(key)
+        payload = _performance_payload(**overrides)  # type: ignore[arg-type]
+        payload.update(extra)
+        if uncapped_stellar_rate_hz is not None:
+            payload["stellar_rate_hz_total_uncapped"] = uncapped_stellar_rate_hz
+        if detector_saturated is not None:
+            payload["detector_saturated"] = detector_saturated
+        results = results.add_component("performance.standard", payload)
     return replace(state, results=results)
 
 
@@ -934,3 +964,234 @@ def test_non_converged_refinement_is_a_non_detection(tmp_path: Path) -> None:
         for reason in payload["non_detection_reasons"]
     )
     assert any("vs target" in str(reason) for reason in payload["non_detection_reasons"])
+
+
+def test_planet_reference_uses_the_uncapped_stellar_total(tmp_path: Path) -> None:
+    """Detector saturation must not shrink the star the planet is scaled to.
+
+    A planet at contrast ``c`` delivers ``c`` times the photons the star
+    actually sends, whatever the bright-port pixels can count. Publishing the
+    reference against the saturation-clipped readout total inflates every
+    contrast on the curve by the saturation ratio.
+
+    Both runs share one capped total, so the only difference is whether the
+    uncapped one is available. Contrast is inversely proportional to the
+    reference planet rate while the leak dominates the variance, so a 4x
+    larger star buys a 4x fainter curve; the loose tolerance covers the
+    planet's own shot-noise contribution, which does not scale that way.
+    """
+
+    capped = _stage(_context(tmp_path)).apply(_state()).results.components[
+        "performance.hdc"
+    ]
+    uncapped = _stage(_context(tmp_path)).apply(
+        _state(
+            performance_overrides={},
+            uncapped_stellar_rate_hz=4.0 * _STELLAR_RATE_HZ,
+        )
+    ).results.components["performance.hdc"]
+
+    assert float(uncapped["stellar_rate_hz_total"]) == pytest.approx(
+        4.0 * _STELLAR_RATE_HZ
+    )
+    assert "uncapped" in str(uncapped["stellar_rate_hz_total_source"])
+    ratio = np.asarray(capped["ccf_contrast_at_target"]) / np.asarray(
+        uncapped["ccf_contrast_at_target"]
+    )
+    assert np.all(np.isfinite(ratio))
+    assert ratio == pytest.approx(np.full(_N_ANCHORS, 4.0), rel=0.05)
+
+
+def test_saturated_detector_without_an_uncapped_total_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Silently normalizing against a clipped star is the failure to prevent."""
+
+    with pytest.raises(ValueError, match="stellar_rate_hz_total_uncapped"):
+        _stage(_context(tmp_path)).apply(_state(detector_saturated=True))
+
+
+def test_unsaturated_detector_keeps_the_published_total(tmp_path: Path) -> None:
+    """With nothing clipped the capped total IS the physical one; no error."""
+
+    payload = _stage(_context(tmp_path)).apply(
+        _state(detector_saturated=False)
+    ).results.components["performance.hdc"]
+
+    assert float(payload["stellar_rate_hz_total"]) == pytest.approx(
+        _STELLAR_RATE_HZ
+    )
+    assert "detector_saturated=False" in str(
+        payload["stellar_rate_hz_total_source"]
+    )
+
+
+def test_dark_is_charged_per_pixel_of_a_resolution_element(
+    tmp_path: Path,
+) -> None:
+    """One channel spans several detector pixels, and dark is per pixel.
+
+    Charging one pixel per channel discounted detection-mode dark by exactly
+    ``pixels_per_resolution_element`` relative to characterization mode, which
+    takes the same factor from the AWG metadata. With a dark-dominated budget
+    the discount is visible directly: more dark per channel means a brighter
+    (worse) detectable contrast.
+    """
+
+    heavy_dark = {"dark_rate_hz_per_port": 5.0e3}
+    one = _stage(
+        _context(tmp_path), pixels_per_resolution_element=1
+    ).apply(_state(performance_overrides=heavy_dark)).results.components[
+        "performance.hdc"
+    ]
+    four = _stage(
+        _context(tmp_path), pixels_per_resolution_element=4
+    ).apply(_state(performance_overrides=heavy_dark)).results.components[
+        "performance.hdc"
+    ]
+
+    assert int(one["pixels_per_resolution_element_used"]) == 1
+    assert int(four["pixels_per_resolution_element_used"]) == 4
+    # Dark-dominated: variance scales with the pixel count, so the contrast
+    # that still reaches the target scales like its square root.
+    ratio = np.asarray(four["ccf_contrast_at_target"]) / np.asarray(
+        one["ccf_contrast_at_target"]
+    )
+    assert np.all(np.isfinite(ratio))
+    assert ratio == pytest.approx(np.full(_N_ANCHORS, 2.0), rel=0.1)
+
+
+def test_pixels_per_resolution_element_is_inherited_from_the_awg(
+    tmp_path: Path,
+) -> None:
+    """Two modes in one run must not model different spectrograph sampling."""
+
+    payload = _stage(_context(tmp_path)).apply(
+        _state(awg_pixels_per_resolution_element=3)
+    ).results.components["performance.hdc"]
+
+    assert int(payload["pixels_per_resolution_element_used"]) == 3
+    assert "characterization.spectro" in str(
+        payload["pixels_per_resolution_element_source"]
+    )
+
+
+def test_pixels_per_resolution_element_defaults_to_nyquist(
+    payload: dict[str, object],
+) -> None:
+    """No AWG payload to inherit from: the Nyquist AWG convention, not one."""
+
+    assert int(payload["pixels_per_resolution_element_used"]) == 2
+
+
+def test_refinement_lifts_a_short_anchor_onto_the_threshold() -> None:
+    """A shortfall inside the old +/-2% band must be corrected, not accepted.
+
+    Pre-fix the band was two sided, so a first evaluation at 0.99 x target was
+    published as if it reached the target. It does not: that anchor's contrast
+    is a 4.95-sigma limit on a curve labelled 5 sigma.
+    """
+
+    from dataclasses import replace as dc_replace
+
+    from nullsim.physics.hdc import ChannelSpectra, ccf_contrast_at_target_snr
+    from nullsim.stages.performance.hdc import _refine_contrast
+
+    rng = np.random.default_rng(11)
+    n = 64
+    edges = np.linspace(1.15, 1.35, n + 1)
+    planet_unit = rng.uniform(0.5, 1.5, n)
+    leak = rng.uniform(80.0, 120.0, n)
+    zeros = np.zeros(n)
+    channels = ChannelSpectra(
+        channel_centers_um=0.5 * (edges[:-1] + edges[1:]),
+        channel_edges_um=edges,
+        planet_rate_hz=planet_unit,
+        leak_rate_hz=leak,
+        sky_rate_hz=zeros,
+        dark_rate_hz=zeros,
+    )
+    solver_kwargs = {
+        "integration_time_s": 3600.0,
+        "eps_systematic": 0.0,
+        "servo_bw_hz": 100.0,
+        "with_fringe_tracking": True,
+        "continuum_filter_width_channels": 30,
+        "telluric_transmission_per_channel": None,
+        "telluric_mask_threshold": 0.8,
+    }
+    target = 5.0
+    solution = ccf_contrast_at_target_snr(
+        planet_unit, leak, zeros, zeros, target_snr=target, **solver_kwargs
+    )
+    # Leak dominated, so SNR is linear in contrast: 0.99 x contrast lands at
+    # 0.99 x target -- inside the old two-sided band, outside the new one.
+    short = dc_replace(
+        solution, contrast_at_target_snr=0.99 * solution.contrast_at_target_snr
+    )
+
+    value, snr, first_snr, corrected = _refine_contrast(
+        short,
+        planet_unit_rate_hz=planet_unit,
+        channels=channels,
+        leak=leak,
+        sky=zeros,
+        dark=zeros,
+        target_snr=target,
+        solver_kwargs=solver_kwargs,
+    )
+
+    assert first_snr == pytest.approx(0.99 * target, rel=1.0e-3)
+    assert corrected is True
+    assert snr >= target
+    assert value > short.contrast_at_target_snr
+
+
+def test_chromatic_leak_floor_is_read_in_the_effective_convention(
+    tmp_path: Path,
+) -> None:
+    """The floor and the null profile have to be in the same convention.
+
+    ``null_depth_residual`` and ``calibration_floor`` are raw KILO
+    ``mean(dark)/mean(bright)`` nulls; the reconstructed null profile is an
+    effective dark/total power fraction. Applying the raw number as a floor
+    over the effective profile flattens a genuinely chromatic leak whenever
+    the raw value is the larger of the two, which on the KILO layout it is by
+    construction. Here the raw floor is 1e-3 and the effective floor 1e-12:
+    reading the raw one would grey the leak completely.
+    """
+
+    wavelengths_um = np.linspace(_WL_MIN_UM, _WL_MAX_UM, 5)
+    surface = np.outer(
+        np.ones(_N_ANCHORS), np.linspace(1.0e-7, 1.0e-5, wavelengths_um.size)
+    )
+    state = _chromatic_state(
+        surface=surface,
+        wavelengths_um=wavelengths_um,
+        combine_mode="max",
+        grey_base=0.0,
+    )
+    from nullsim.pipeline.state import Results
+
+    comps = dict(state.results.components)
+    performance = dict(comps["performance.standard"])
+    performance["null_depth_residual"] = 1.0e-3
+    performance["calibration_floor"] = 1.0e-3
+    performance["null_depth_residual_effective_fraction"] = 1.0e-12
+    performance["calibration_floor_effective_fraction"] = 1.0e-12
+    comps["performance.standard"] = performance
+    state = replace(state, results=Results(components=comps))
+
+    payload = _stage(_context(tmp_path)).apply(state).results.components[
+        "performance.hdc"
+    ]
+
+    assert "CHROMATIC" in str(payload["leak_shape_model"])
+    assert "effective dark/total power fraction" in str(
+        payload["leak_shape_model"]
+    )
+    leak = np.asarray(payload["ccf_leak_rate_hz_per_channel"], dtype=np.float64)
+    # The published surface rises by 100x across the band, so a leak that kept
+    # its chromatic structure cannot be flat.
+    row = leak[0]
+    assert row[-1] > 10.0 * row[0]

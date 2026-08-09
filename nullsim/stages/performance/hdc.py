@@ -46,6 +46,7 @@ Deterministic: the stage draws no random numbers.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -112,8 +113,25 @@ _REQUIRED_SENSITIVITY_KEYS = frozenset(
 )
 
 # One matched-filter refinement is enough when the correction is this small.
+# The tolerance is now ONE SIDED: bounded overshoot is fine, undershoot is not
+# (see `_refine_contrast`).
 _REFINEMENT_TOLERANCE = 0.02
+# Slack below the target that only absorbs numerical noise in the Newton step,
+# never a real shortfall. The step converges to the target to within roughly
+# this much, and 1e-6 of 5 sigma is 5e-6 sigma -- four orders of magnitude
+# below the overshoot band and physically indistinguishable from the target.
+_REFINEMENT_UNDERSHOOT_SLACK = 1.0e-6
+# The single correction step aims marginally ABOVE the threshold. A Newton step
+# on a nonlinear function does not land exactly, and only one direction of miss
+# is publishable, so the step is biased into the safe half of the acceptance
+# band instead of at its edge. Half the overshoot budget leaves the other half
+# for the step's own residual error.
+_REFINEMENT_AIM_MARGIN = 0.5 * _REFINEMENT_TOLERANCE
 _DEFAULT_TARGET_SNR = 5.0
+# Nyquist-sampled AWG default, matching characterization.spectro's
+# awg_pixels_per_resolution_element.
+_DEFAULT_PIXELS_PER_RESOLUTION_ELEMENT = 2
+_SPECTRO_PREFIX = "characterization.spectro"
 
 
 @register_stage
@@ -139,6 +157,15 @@ class HdcPerformanceStage(BaseStage):
         awg_throughput: float = PydanticField(default=0.8, ge=0.0, le=1.0)
         dark_count_hz_per_channel: float | None = PydanticField(
             default=None, ge=0.0
+        )
+        # Detector pixels behind one spectrograph resolution element. Dark is
+        # charged per pixel, so this multiplies the per-channel dark rate.
+        # None inherits from an upstream characterization.spectro AWG payload
+        # when there is one, and otherwise takes the Nyquist AWG default of 2 --
+        # the convention characterization mode uses. Assuming 1 was a silent
+        # factor-of-two dark discount relative to characterization mode.
+        pixels_per_resolution_element: int | None = PydanticField(
+            default=None, ge=1
         )
         telluric_mask_threshold: float = PydanticField(default=0.8, ge=0.0, le=1.0)
         grid_oversampling: float = PydanticField(default=3.0, gt=1.0)
@@ -252,13 +279,21 @@ class HdcPerformanceStage(BaseStage):
             integration_time_s=integration_time_s,
         )
 
-        stellar_rate_hz_total = float(performance["stellar_rate_hz_total"])
-        if not (stellar_rate_hz_total > 0.0):
-            raise ValueError(
-                "performance.hdc requires a positive stellar_rate_hz_total from "
-                f"{performance_name!r}; got {stellar_rate_hz_total!r}."
-            )
+        stellar_rate_hz_total, stellar_rate_source = _resolve_stellar_rate_hz_total(
+            performance, performance_name
+        )
+        saturation_note = _stellar_normalization_note(
+            performance, stellar_rate_hz_total
+        )
+        if saturation_note is not None:
+            warnings.warn(saturation_note, RuntimeWarning, stacklevel=2)
         n_dark_ports = max(int(performance["n_dark_ports"]), 1)
+        (
+            pixels_per_resolution_element,
+            pixels_per_resolution_element_source,
+        ) = _resolve_pixels_per_resolution_element(
+            state, params.pixels_per_resolution_element
+        )
 
         band = _band_from_upstream(sensitivity, stellar_rate_hz_total)
         resolving_power = float(params.awg_resolving_power)
@@ -302,7 +337,10 @@ class HdcPerformanceStage(BaseStage):
             leak_rate_hz=1.0,
             sky_rate_hz=1.0,
             dark_rate_hz_per_channel=_dark_rate_hz_per_channel(
-                performance, params.dark_count_hz_per_channel, n_dark_ports
+                performance,
+                params.dark_count_hz_per_channel,
+                n_dark_ports,
+                pixels_per_resolution_element,
             ),
             observed_band_um=None,
             source="performance.hdc reference amplitudes",
@@ -511,6 +549,14 @@ class HdcPerformanceStage(BaseStage):
             ),
             "planet_throughputs": throughputs.astype(np.float64, copy=True),
             "stellar_rate_hz_total": stellar_rate_hz_total,
+            "stellar_rate_hz_total_source": stellar_rate_source,
+            "stellar_normalization_mismatch_note": saturation_note,
+            "pixels_per_resolution_element_used": int(
+                pixels_per_resolution_element
+            ),
+            "pixels_per_resolution_element_source": (
+                pixels_per_resolution_element_source
+            ),
             "eps_systematic_used": eps_systematic,
             "servo_bw_hz_used": servo_bw_hz,
             "with_fringe_tracking_used": bool(with_fringe_tracking),
@@ -533,7 +579,13 @@ class HdcPerformanceStage(BaseStage):
             "upstream_sensitivity_component": sensitivity_name,
             "ccf_model": _CCF_MODEL,
             "detection_budget_model": _detection_budget_model(
-                params, performance, n_dark_ports
+                params,
+                performance,
+                n_dark_ports,
+                stellar_rate_hz_total,
+                stellar_rate_source,
+                pixels_per_resolution_element,
+                pixels_per_resolution_element_source,
             ),
             "leak_shape_model": leak_shape_model,
             "leak_shape_fallback_reasons": leak_shape_notes,
@@ -631,8 +683,15 @@ _CCF_MODEL = (
     "(solver_optimism_per_anchor = target/first_evaluation - 1, positive when "
     "the solver was optimistic and negative when it was pessimistic, always "
     "measured BEFORE any correction). The sequence is hard bounded: solve, "
-    "evaluate once, and if the achieved SNR is off target by more than 2%, "
+    "evaluate once, and if the achieved SNR is outside the acceptance band, "
     "apply exactly ONE correction and evaluate once more -- never further. The "
+    "acceptance band is ONE SIDED: [target, target x 1.02]. An anchor whose "
+    "matched filter delivers less than the target is not a detection at that "
+    "threshold no matter how close it came, so it is never published as one; "
+    "overshoot is the conservative direction and is tolerated up to 2%. The "
+    "correction therefore aims at 1% above the target rather than at it, so "
+    "the step's own residual error lands inside the band instead of "
+    "straddling its lower edge. The "
     "correction is a Newton step in log-log space using the analytic slope "
     "d ln SNR / d ln c = 1 - (1/2)(c t C2)/(t B2 + c t C2 + V_sys), whose "
     "coefficients the solver already returns, so it costs no extra evaluation. "
@@ -640,7 +699,7 @@ _CCF_MODEL = (
     "the leak dominates the variance -- where a contrast curve lives -- and "
     "only becomes sqrt(c) once the planet's own shot noise takes over, so a "
     "fixed square exponent overshoots in the linear regime. If the final "
-    "evaluation is STILL off target by more than 2%, the anchor is published "
+    "evaluation is STILL outside the acceptance band, the anchor is published "
     "as a NON-DETECTION rather than as a contrast: a curve point that does not "
     "actually reach the stated threshold is worse than a missing one. "
     "refined_snr_per_anchor and post_correction_residual_per_anchor report "
@@ -950,30 +1009,186 @@ def _dark_rate_hz_per_channel(
     performance: dict[str, Any],
     override: float | None,
     n_dark_ports: int,
+    pixels_per_resolution_element: int,
 ) -> float:
+    """Dark charged to one spectrograph channel across all dark ports.
+
+    One channel is one resolution element, which is
+    ``pixels_per_resolution_element`` detector pixels wide, and dark is a
+    per-pixel rate -- so the resolution element carries that many pixel darks.
+    This is the same accounting ``characterization.hdc_ccf`` takes from the AWG
+    metadata (``dark_rate_hz_per_bin_total x
+    pixels_per_resolution_element``); charging one pixel per channel here
+    discounted detection-mode dark by exactly that factor relative to
+    characterization mode.
+    """
+
     if override is not None:
         return float(override)
-    return max(float(performance["dark_rate_hz_per_port"]), 0.0) * n_dark_ports
+    return (
+        max(float(performance["dark_rate_hz_per_port"]), 0.0)
+        * n_dark_ports
+        * int(pixels_per_resolution_element)
+    )
+
+
+def _resolve_stellar_rate_hz_total(
+    performance: dict[str, Any], performance_name: str
+) -> tuple[float, str]:
+    """The stellar band total the unit-contrast planet is normalized against.
+
+    ``stellar_rate_hz_total`` is the sum of the detector's port rates AFTER
+    per-pixel saturation clipping. Saturation is a readout limit; it says
+    nothing about how many photons the star delivers, and a planet at contrast
+    ``c`` produces ``c`` times the *physical* stellar rate regardless of what
+    the bright-port pixels can count. Normalizing the reference planet against
+    the clipped total therefore understates the planet by the saturation ratio
+    and inflates every contrast on the curve by the same factor -- 3.8x on the
+    shipped KILO example at J = 4.
+
+    So the uncapped total wins whenever ``performance.standard`` published one.
+    When it did not and the detector is known to have saturated, this raises
+    rather than falling back: a wrong contrast curve that looks right is worse
+    than a run that stops.
+    """
+
+    uncapped = _positive_finite(performance.get("stellar_rate_hz_total_uncapped"))
+    if uncapped is not None:
+        return uncapped, "performance.standard stellar_rate_hz_total_uncapped"
+
+    capped = _positive_finite(performance.get("stellar_rate_hz_total"))
+    saturated = performance.get("detector_saturated")
+    if saturated is not None and bool(saturated):
+        raise ValueError(
+            "performance.hdc cannot normalize the unit-contrast planet: "
+            f"{performance_name!r} reports detector_saturated=True but "
+            "publishes no usable stellar_rate_hz_total_uncapped. Its "
+            "stellar_rate_hz_total is the post-saturation readout total, which "
+            "understates the star by the saturation ratio and would inflate "
+            "every contrast on the CCF curve by that factor. Re-run with a "
+            "detector stage that publishes uncapped_port_rates (detector.mkid "
+            "and detector.snspd both do), or raise the detector's count-rate "
+            "cap so nothing saturates."
+        )
+    if capped is None:
+        raise ValueError(
+            "performance.hdc requires a positive stellar_rate_hz_total from "
+            f"{performance_name!r}; got "
+            f"{performance.get('stellar_rate_hz_total')!r}."
+        )
+    if saturated is None:
+        return capped, (
+            "performance.standard stellar_rate_hz_total (post-saturation; the "
+            "payload publishes neither stellar_rate_hz_total_uncapped nor a "
+            "detector_saturated verdict, so saturation could not be ruled out)"
+        )
+    return capped, (
+        "performance.standard stellar_rate_hz_total (detector_saturated=False, "
+        "so the capped and uncapped totals are the same)"
+    )
+
+
+def _stellar_normalization_note(
+    performance: dict[str, Any], stellar_rate_hz_total: float
+) -> str | None:
+    """Flag a CCF/broadband comparison made against two different star rates.
+
+    This stage now normalizes its planet reference against the PHYSICAL
+    stellar rate, but ``performance.standard`` built its broadband curve --
+    and its leak rate -- from the saturation-capped readout total. When the
+    detector saturates the two are not the same number, so the absolute CCF
+    curve is right while the broadband curve it is divided by is still
+    inflated by the saturation ratio, and ``ccf_contrast_gain`` carries that
+    ratio. Fixing the broadband side means changing what
+    ``performance.standard`` publishes for every config in the repo, so it is
+    a separate decision; what this stage can do is refuse to let the mismatch
+    be silent.
+    """
+
+    capped = _positive_finite(performance.get("stellar_rate_hz_total"))
+    if capped is None or capped <= 0.0:
+        return None
+    ratio = stellar_rate_hz_total / capped
+    if abs(ratio - 1.0) <= 1.0e-9:
+        return None
+    return (
+        "performance.hdc normalized its unit-contrast planet against the "
+        f"uncapped stellar total {stellar_rate_hz_total:.6g} Hz, which is "
+        f"{ratio:.4g}x the saturation-capped {capped:.6g} Hz that "
+        "performance.standard built its broadband contrast curve and leakage "
+        "rate from. ccf_contrast_at_target is therefore on the physical "
+        "normalization while broadband_contrast_at_target is not, and "
+        f"ccf_contrast_gain carries that {ratio:.4g}x factor. Raise the "
+        "detector count-rate cap so nothing saturates if you need the two "
+        "curves on the same normalization."
+    )
+
+
+def _resolve_pixels_per_resolution_element(
+    state: SimulationState, override: int | None
+) -> tuple[int, str]:
+    """Detector pixels behind one resolution element of the dark-port disperser.
+
+    Detection mode configures its own disperser, so unlike characterization
+    mode there is no AWG payload it is bound to. When a
+    ``characterization.spectro`` AWG payload happens to be on the state, its
+    sampling is the honest default -- the two modes should not silently model
+    different spectrographs in the same run.
+    """
+
+    if override is not None:
+        return int(override), "performance.hdc pixels_per_resolution_element param"
+    for name, payload in reversed(list(state.results.components.items())):
+        if not name.startswith(_SPECTRO_PREFIX) or not isinstance(payload, dict):
+            continue
+        awg = payload.get("awg")
+        if not isinstance(awg, dict):
+            continue
+        value = awg.get("pixels_per_resolution_element")
+        if value is None:
+            continue
+        try:
+            pixels = int(value)
+        except (TypeError, ValueError):
+            continue
+        if pixels >= 1:
+            return pixels, (
+                f"{name} awg.pixels_per_resolution_element"
+            )
+    return _DEFAULT_PIXELS_PER_RESOLUTION_ELEMENT, (
+        "performance.hdc default "
+        f"({_DEFAULT_PIXELS_PER_RESOLUTION_ELEMENT}, Nyquist-sampled AWG; no "
+        "upstream characterization.spectro AWG payload to inherit from)"
+    )
 
 
 def _detection_budget_model(
     params: HdcPerformanceStage.Params,
     performance: dict[str, Any],
     n_dark_ports: int,
+    stellar_rate_hz_total: float,
+    stellar_rate_source: str,
+    pixels_per_resolution_element: int,
+    pixels_per_resolution_element_source: str,
 ) -> str:
     if params.dark_count_hz_per_channel is not None:
         dark = (
             "dark = the configured dark_count_hz_per_channel, charged per "
-            "channel"
+            "channel (pixels_per_resolution_element does not apply to an "
+            "explicit per-channel rate)"
         )
     else:
         dark = (
-            f"dark = dark_rate_hz_per_port x {n_dark_ports} dark ports, charged "
-            "PER CHANNEL. The assumption is one detector pixel set per "
-            "spectrograph channel, so dark does not disperse and the band "
-            "total grows with the channel count -- the same convention "
-            "characterization.hdc_ccf takes from the AWG per-bin metadata. Set "
-            "dark_count_hz_per_channel to override it"
+            f"dark = dark_rate_hz_per_port x {n_dark_ports} dark ports x "
+            f"{pixels_per_resolution_element} detector pixels per resolution "
+            f"element ({pixels_per_resolution_element_source}), charged PER "
+            "CHANNEL. Dark does not disperse -- it is fixed per pixel -- so the "
+            "band total grows with the channel count, and one channel is one "
+            "resolution element spanning that many pixels. This is the same "
+            "accounting characterization.hdc_ccf takes from the AWG per-bin "
+            "metadata (dark_rate_hz_per_bin_total x "
+            "pixels_per_resolution_element). Set dark_count_hz_per_channel to "
+            "override it"
         )
     return (
         "Dark-port AWG budget: every optical rate (planet, leak, sky) is "
@@ -982,8 +1197,13 @@ def _detection_budget_model(
         "sky = sky_rate_hz_per_port x "
         f"{n_dark_ports} dark ports, spread as a flat density and channelized "
         "like the sources so it forfeits the same uncovered-band share; "
-        f"{dark}. Stellar band total "
-        f"{float(performance['stellar_rate_hz_total']):.6g} Hz."
+        f"{dark}. Stellar band total {stellar_rate_hz_total:.6g} Hz "
+        f"({stellar_rate_source}); this is the PHYSICAL stellar rate, not the "
+        "saturation-clipped readout total, because a planet at contrast c "
+        "delivers c times the photons the star actually sends. The leak and "
+        "sky rates below are the ones performance.standard published, which "
+        "are built from its capped total; when the detector saturates they are "
+        "correspondingly conservative."
     )
 
 
@@ -1148,7 +1368,7 @@ def _chromatic_leak_factors(
     order = np.argsort(axis_um)
     axis_um = axis_um[order]
     values = values[:, order]
-    floor = _grey_null_floor(performance)
+    floor, floor_convention = _grey_null_floor(performance)
     base = 0.0 if grey_base is None else float(grey_base)
 
     factors = np.ones((separations_mas.size, grid_um.size), dtype=np.float64)
@@ -1182,25 +1402,68 @@ def _chromatic_leak_factors(
             "null profile was degenerate, so grey is used throughout.",
             tuple(notes),
         )
-    return factors, _chromatic_leak_shape_model(combine_mode, base, floor), tuple(
-        notes
+    return (
+        factors,
+        _chromatic_leak_shape_model(combine_mode, base, floor, floor_convention),
+        tuple(notes),
     )
 
 
-def _grey_null_floor(performance: dict[str, Any]) -> float:
+_EFFECTIVE_FLOOR_KEYS = (
+    "null_depth_residual_effective_fraction",
+    "calibration_floor_effective_fraction",
+)
+_RAW_FLOOR_KEYS = ("null_depth_residual", "calibration_floor")
+
+
+def _grey_null_floor(performance: dict[str, Any]) -> tuple[float, str]:
     """The grey floors performance.standard raises over the null curve.
 
     Mirrors ``_contrast_curve_leakage_rates_from_null_curve``: the null curve
-    is maxed against ``null_depth_residual`` and ``calibration_floor`` before
+    is maxed against the residual null depth and the calibration floor before
     becoming a leakage rate. Both are grey, so they flatten the profile.
+
+    CONVENTION, and this is the whole point of the function. Two different null
+    conventions are in play. ``null_depth_residual`` and ``calibration_floor``
+    are raw KILO nulls, ``mean(dark) / mean(bright)``. The profile this floor
+    bounds -- the sensitivity stage's residual-starlight surface combined with
+    ``effective_null_before_residual_starlight`` -- is an effective dark/total
+    POWER FRACTION. The two differ by ``n_dark x mean_bright / total``, a
+    factor of 2.01 on the shipped KILO Keck layout, and
+    ``_contrast_curve_leakage_rates_from_null_curve`` is itself passed the
+    converted values. So the effective fractions are what belongs here;
+    ``performance.standard`` publishes both under the ``*_effective_fraction``
+    keys.
+
+    Returns ``(floor, convention_note)``. A payload predating those keys falls
+    back to the raw pair, and the note says so rather than pretending the
+    number is in the right convention.
     """
 
+    if any(key in performance for key in _EFFECTIVE_FLOOR_KEYS):
+        floor = 0.0
+        for key in _EFFECTIVE_FLOOR_KEYS:
+            value = _positive_finite(performance.get(key))
+            if value is not None:
+                floor = max(floor, value)
+        return floor, (
+            "effective dark/total power fraction, from performance.standard's "
+            f"{' and '.join(_EFFECTIVE_FLOOR_KEYS)} -- the same convention as "
+            "the null profile it bounds"
+        )
+
     floor = 0.0
-    for key in ("null_depth_residual", "calibration_floor"):
+    for key in _RAW_FLOOR_KEYS:
         value = _positive_finite(performance.get(key))
         if value is not None:
             floor = max(floor, value)
-    return floor
+    return floor, (
+        "RAW KILO mean(dark)/mean(bright) convention: the upstream payload "
+        f"predates {_EFFECTIVE_FLOOR_KEYS[0]} / {_EFFECTIVE_FLOOR_KEYS[1]}, so "
+        "the floor could not be converted to the effective dark/total fraction "
+        "the null profile is in. The two differ by n_dark x mean_bright/total, "
+        "so this floor may be applied at the wrong scale"
+    )
 
 
 def _safe_weighted_mean(
@@ -1217,19 +1480,22 @@ def _safe_weighted_mean(
 
 
 def _chromatic_leak_shape_model(
-    combine_mode: str, grey_base: float, floor: float
+    combine_mode: str, grey_base: float, floor: float, floor_convention: str
 ) -> str:
     return (
         "CHROMATIC null. The per-wavelength null profile is reconstructed the "
         "way the upstream stages built it, not taken raw from the residual "
         f"surface: combine_mode={combine_mode!r} applied to a grey base of "
         f"{grey_base:.6g} (sensitivity effective_null_before_residual_starlight, "
-        "the scalar that stage actually passed to the combine) and the "
+        "the scalar that stage actually passed to the combine, an effective "
+        "dark/total power fraction) and the "
         "per-anchor row of residual_starlight_contrast_by_wavelength, then "
-        f"raised over a grey floor of {floor:.6g} "
-        "(max of performance.standard's null_depth_residual and "
-        "calibration_floor, mirroring "
-        "_contrast_curve_leakage_rates_from_null_curve). That combined "
+        f"raised over a grey floor of {floor:.6g} in the "
+        f"{floor_convention} "
+        "(max of performance.standard's residual null depth and calibration "
+        "floor, mirroring "
+        "_contrast_curve_leakage_rates_from_null_curve, which is passed the "
+        "converted values). That combined "
         "profile is normalized to unit band mean under the grey leak density, "
         "so the wavelength structure enters while the published band total is "
         "preserved. When the base dominates the residual the profile comes out "
@@ -1296,9 +1562,16 @@ def _refine_contrast(
     The contract here is a hard-bounded three-step sequence, never more:
 
     1. one `matched_filter_ccf` evaluation at the solved contrast;
-    2. if the achieved SNR is off target by more than
-       `_REFINEMENT_TOLERANCE`, ONE correction;
+    2. if the achieved SNR fails `_reaches_target` -- below the target at all,
+       or above it by more than `_REFINEMENT_TOLERANCE` -- ONE correction;
     3. one final evaluation.
+
+    The acceptance band is deliberately one sided: bounded overshoot is
+    conservative, undershoot is an overstated instrument. See
+    `_reaches_target`. The step therefore aims at
+    ``target x (1 + _REFINEMENT_AIM_MARGIN)`` rather than at the target
+    itself, so its own residual error lands inside the band rather than
+    straddling its lower edge.
 
     The correction is a Newton step in log-log space. ``SNR(c) = c A t /
     sqrt(t B2 + c t C2 + V_sys)`` has the analytic local slope
@@ -1350,19 +1623,23 @@ def _refine_contrast(
             "refinement did not converge (the matched filter returned SNR "
             f"{first_snr!r} at the solved contrast {contrast!r})"
         )
-    if abs(first_snr / target_snr - 1.0) <= _REFINEMENT_TOLERANCE:
+    if _reaches_target(first_snr, target_snr):
         return contrast, first_snr, first_snr, False
 
     # Off target: exactly one correction step is allowed.
     best_contrast, best_snr, corrected = contrast, first_snr, False
     slope = _log_log_slope(solution, solver_kwargs["integration_time_s"], contrast)
-    corrected_contrast = contrast * (target_snr / first_snr) ** (1.0 / slope)
+    aim_snr = target_snr * (1.0 + _REFINEMENT_AIM_MARGIN)
+    corrected_contrast = contrast * (aim_snr / first_snr) ** (1.0 / slope)
     if math.isfinite(corrected_contrast) and corrected_contrast > 0.0:
         corrected_snr = achieved(corrected_contrast)
         if (
             math.isfinite(corrected_snr)
             and corrected_snr > 0.0
-            and abs(corrected_snr - target_snr) < abs(first_snr - target_snr)
+            and (
+                _reaches_target(corrected_snr, target_snr)
+                or abs(corrected_snr - target_snr) < abs(first_snr - target_snr)
+            )
         ):
             best_contrast, best_snr, corrected = (
                 corrected_contrast,
@@ -1372,18 +1649,39 @@ def _refine_contrast(
 
     # Whatever the step achieved, the published point has to actually reach the
     # threshold. Merely improving on a bad start is not enough.
-    if abs(best_snr - target_snr) / target_snr > _REFINEMENT_TOLERANCE:
+    if not _reaches_target(best_snr, target_snr):
         stage = (
             "after one correction step"
             if corrected
             else "and the single correction step did not help"
         )
+        direction = "short of" if best_snr < target_snr else "over"
         raise ValueError(
             f"refinement did not converge (SNR {best_snr:.6g} vs target "
-            f"{target_snr:.6g}, {abs(best_snr / target_snr - 1.0):.1%} off, "
-            f"{stage})"
+            f"{target_snr:.6g}, {abs(best_snr / target_snr - 1.0):.1%} "
+            f"{direction} target, {stage})"
         )
     return best_contrast, best_snr, first_snr, corrected
+
+
+def _reaches_target(snr: float, target_snr: float) -> bool:
+    """Whether a refined anchor may be published at ``target_snr``.
+
+    ONE SIDED on purpose. A contrast whose matched filter delivers SNR 4.90
+    against a target of 5 is not a 5-sigma detection limit, and publishing it
+    on a curve labelled 5 sigma overstates the instrument by however far short
+    it fell. Overshoot is the benign direction -- the published contrast is
+    then merely conservative -- so it is tolerated up to
+    ``_REFINEMENT_TOLERANCE``, beyond which the anchor is too far off the
+    stated threshold to describe it. The slack below the target absorbs
+    floating-point noise in the Newton step, nothing more.
+    """
+
+    if not (math.isfinite(snr) and snr > 0.0):
+        return False
+    if snr < target_snr * (1.0 - _REFINEMENT_UNDERSHOOT_SLACK):
+        return False
+    return snr <= target_snr * (1.0 + _REFINEMENT_TOLERANCE)
 
 
 def _log_log_slope(solution: Any, integration_time_s: float, contrast: float) -> float:

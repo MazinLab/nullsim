@@ -102,6 +102,10 @@ from nullsim.pipeline import (
     register_stage,
 )
 from nullsim.stages._utils import unique_component_name
+from nullsim.stages.characterization.acceptance import (
+    SpectroAcceptance,
+    spectro_solution_acceptance,
+)
 
 __all__ = ["HdcCcfStage"]
 
@@ -171,6 +175,24 @@ class HdcCcfStage(BaseStage):
             state, params.upstream_spectro
         )
         _reject_unsupported_spectrograph(spectro, spectro_name)
+
+        # A spectro solution the pipeline rejected must not produce a
+        # plausible-looking CCF. Every number below is built from that
+        # solution's throughput, leak, and photon budgets, so a finite ccf_snr
+        # would describe a retune nothing downstream accepted -- and unlike the
+        # table and the plot, which mask and skip, the stage payload is what a
+        # scripted consumer reads first. Publish NaN and say why.
+        acceptance = spectro_solution_acceptance(spectro)
+        if not acceptance.accepted:
+            component_name = unique_component_name(
+                self.type_name,
+                state.results.components,
+                self.context.instance_id,
+            )
+            results = state.results.add_component(
+                component_name, _rejected_payload(spectro_name, acceptance)
+            )
+            return replace(state, results=results)
 
         resolving_power, resolving_power_source = _resolve_resolving_power(
             spectro, params.resolving_power
@@ -373,6 +395,9 @@ class HdcCcfStage(BaseStage):
                 channel_builder.band_coverage_fraction(resolving_power)
             ),
             "upstream_spectro_component": spectro_name,
+            "spectro_solution_accepted": True,
+            "invalidity_reason": None,
+            "invalidity_detail": None,
             "planet_template_provenance": templates.planet.provenance,
             "star_template_provenance": templates.star.provenance,
             "telluric_template_provenance": (
@@ -539,6 +564,87 @@ _CCF_MODEL = (
     "the raw dark-port leak rate: that earlier definition scaled with the "
     "weight normalization and could go negative."
 )
+
+
+_REJECTED_NAN_KEYS: tuple[str, ...] = (
+    "ccf_snr",
+    "ccf_snr_photon_limited",
+    "ccf_signal_counts",
+    "ccf_photon_var_counts",
+    "ccf_systematic_var_counts",
+    "systematic_ccf_leakage",
+    "ccf_systematic_rejection",
+    "self_subtraction_factor",
+    "n_effective_channels",
+    "n_effective_lines",
+    "telluric_masked_fraction",
+    "integration_time_for_target_snr_s",
+    "resolving_power_used",
+    "detected_planet_rate_hz",
+    "detected_leak_rate_hz",
+    "sky_rate_hz_total",
+    "dark_rate_hz_per_channel",
+    "leak_normalization",
+    "planet_normalization",
+    "channel_band_coverage_fraction",
+)
+
+_REJECTED_EMPTY_ARRAY_KEYS: tuple[str, ...] = (
+    "ccf_channel_centers_um",
+    "ccf_channel_edges_um",
+    "ccf_planet_rate_hz_per_channel",
+    "ccf_leak_rate_hz_per_channel",
+    "ccf_sky_rate_hz_per_channel",
+    "ccf_variance_rate_hz_per_channel",
+    "template_weights_per_channel",
+    "snr_vs_resolving_power",
+    "snr_vs_resolving_power_photon_limited",
+    "snr_vs_resolving_power_r",
+    "snr_vs_rv",
+    "snr_vs_rv_kms",
+)
+
+
+def _rejected_payload(
+    spectro_name: str, acceptance: SpectroAcceptance
+) -> dict[str, Any]:
+    """The payload published when the upstream spectro solution is unusable.
+
+    Every metric is NaN and every spectrum is empty, so a consumer that plots
+    or tabulates the payload without checking ``spectro_solution_accepted``
+    gets a visible hole rather than a number. ``invalidity_reason`` is one of
+    the machine-readable codes in
+    ``nullsim.stages.characterization.acceptance``.
+    """
+
+    payload: dict[str, Any] = {
+        key: float("nan") for key in _REJECTED_NAN_KEYS
+    }
+    payload.update(
+        {key: np.empty(0, dtype=np.float64) for key in _REJECTED_EMPTY_ARRAY_KEYS}
+    )
+    payload.update(
+        {
+            "n_channels": 0,
+            "n_channels_used": 0,
+            "upstream_spectro_component": spectro_name,
+            "spectro_solution_accepted": False,
+            "invalidity_reason": acceptance.reason,
+            "invalidity_detail": acceptance.detail,
+            "source_model": (
+                "nullsim characterization.hdc_ccf: NOT EVALUATED. The upstream "
+                f"characterization.spectro component {spectro_name!r} was "
+                "rejected by the shared acceptance predicate "
+                "(nullsim.stages.characterization.acceptance) because "
+                f"{acceptance.detail}. Every CCF quantity here is NaN on "
+                "purpose: the cross-correlation is built entirely from that "
+                "solution's throughput, leakage, and photon budgets, so any "
+                "finite value would describe a retune the pipeline never "
+                "accepted. See invalidity_reason for the machine-readable code."
+            ),
+        }
+    )
+    return payload
 
 
 class _CoarseBand:

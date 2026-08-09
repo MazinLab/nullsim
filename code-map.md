@@ -304,6 +304,7 @@ Registered tables:
 |---|---|---|
 | `performance_summary` | `outputs/tables/__init__.py` | One row per run with headline scalar metrics. |
 | `characterization_summary` | `outputs/tables/__init__.py` | One row per `characterization.spectro` result component. |
+| `hdc_detection` | `outputs/tables/__init__.py` | Long-form detection-mode HDC curve: one row per `performance.hdc` separation anchor (both contrasts, gain, target SNR, time, R). |
 
 Tests: `tests/outputs/test_outputs.py`, `test_end_to_end.py`, `test_paper.py`,
 `tests/outputs/plots/test_*.py`.

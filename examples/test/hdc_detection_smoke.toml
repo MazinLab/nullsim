@@ -36,14 +36,26 @@
 # compares two curves describing the same observation. An explicit value that
 # disagreed would be refused rather than reconciled.
 #
-# Achieved (run 20260809-125855, ~3.6 s wall clock), at every anchor:
+# Achieved (run 20260809-134320, ~3.6 s wall clock), at every anchor:
 #
-#   ccf_contrast_gain      7.483   with the two knobs below
-#   ccf_contrast_gain      0.163   with them removed (photon limited)
+#   ccf_contrast_gain     28.183   with the two knobs below
+#   ccf_contrast_gain      0.618   with them removed (photon limited)
 #
 # The switch costs the broadband curve a factor 62.5 at 10 mas (2.43e-6 ->
-# 1.52e-4) and the CCF curve only a factor 1.36 (1.49e-5 -> 2.03e-5). That
+# 1.52e-4) and the CCF curve only a factor 1.37 (3.92e-6 -> 5.38e-6). That
 # asymmetry is the entire result.
+#
+# Both gains moved by 3.8x in the wave C stage-accounting pass (7.483 ->
+# 28.183 and 0.163 -> 0.618): `performance.hdc` now normalizes its
+# unit-contrast planet against the PHYSICAL stellar rate rather than the
+# MKID-saturation-capped readout total, and at J = 5 this four-mode chain
+# saturates the bright ports by 3.804x. The CCF contrasts here are therefore
+# the corrected ones. `performance.standard`'s broadband curve is still built
+# from the capped total -- changing that would move every contrast curve in
+# the repository -- so the RATIO carries the saturation factor and the stage
+# emits a RuntimeWarning saying so. Read the CCF curve as physical and the
+# gain as a comparison between two normalizations until the broadband side is
+# reconciled.
 #
 # The gain is the SAME at every anchor, and that is structural rather than a
 # coincidence -- but it is a property of `performance.hdc`'s inputs, not of the
@@ -254,7 +266,7 @@ awg_throughput = 0.8
 [output]
 dir = "results/{run.name}/{timestamp}"
 plots = ["detection_space"]
-tables = ["performance_summary"]
+tables = ["performance_summary", "hdc_detection"]
 
 [output.formats]
 tables = ["json"]

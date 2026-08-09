@@ -28,13 +28,13 @@ from nullsim.outputs.styles import _ensure_headless_backend  # noqa: F401  # sid
 from matplotlib import pyplot as plt
 
 from nullsim.outputs import RunCollection, RunRecord
-
-# Same convergence contract the characterization_summary table applies to its
-# HDC columns. Imported rather than restated so the two cannot drift: a CCF
-# figure and a CCF table row must never disagree about whether the upstream
-# retune was accepted.
-from nullsim.outputs.tables import _characterization_payload_converged
 from nullsim.pipeline import register_plot
+
+# The one acceptance predicate, shared with the characterization_summary table
+# and with characterization.hdc_ccf itself. Imported rather than restated so
+# the three cannot drift: a CCF figure, a CCF table row, and the CCF payload
+# must never disagree about whether the upstream retune was accepted.
+from nullsim.stages.characterization.acceptance import spectro_solution_accepted
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -143,13 +143,18 @@ def _upstream_converged(record: RunRecord, payload: dict[str, Any]) -> bool:
     figure we cannot prove is invalid would silently drop legitimate output.
     """
 
+    # The stage now stamps its own verdict; trust it when present, because it
+    # was taken against the payload as the stage actually saw it.
+    accepted = payload.get("spectro_solution_accepted")
+    if accepted is not None:
+        return bool(accepted)
     upstream = payload.get("upstream_spectro_component")
     if not isinstance(upstream, str):
         return True
     spectro = record.result.state.results.components.get(upstream)
     if not isinstance(spectro, dict):
         return True
-    return _characterization_payload_converged(spectro)
+    return spectro_solution_accepted(spectro)
 
 
 def _plot_channel_spectra(ax: plt.Axes, payload: dict[str, Any]) -> None:

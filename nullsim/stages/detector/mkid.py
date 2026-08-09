@@ -248,6 +248,19 @@ class MKIDDetector(BaseStage):
             "uncapped_port_rate_hz_per_wavelength": (
                 detector_port_rate_hz_per_wavelength.astype(np.float64, copy=True)
             ),
+            # Per-port totals BEFORE the per-pixel saturation cap, the exact
+            # pre-cap counterpart of ``port_rates``. Saturation is a readout
+            # limit, not a statement about how many photons the star sends:
+            # anything normalizing a physical quantity against the stellar flux
+            # (the detection-mode HDC planet reference, for one) needs the
+            # uncapped rate, and silently using the capped one understates the
+            # star by the saturation ratio.
+            "uncapped_port_rates": (
+                detector_port_rate_hz_per_wavelength.sum(axis=1).astype(
+                    np.float64, copy=True
+                )
+            ),
+            "detector_saturated": bool(np.any(saturated_per_port)),
             "pre_energy_response_port_rate_hz_per_wavelength": (
                 port_rate_hz_per_wavelength.astype(np.float64, copy=True)
             ),

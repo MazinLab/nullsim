@@ -581,3 +581,86 @@ def test_band_avg_throughput_means_finite_per_wavelength() -> None:
     assert _band_avg_throughput(
         {"spectro_planet_throughput_per_wavelength": [float("nan"), 0.5]}
     ) == pytest.approx(0.5)
+
+
+def _hdc_detection_record(
+    tmp_path: Path, payload: dict[str, object]
+) -> RunRecord:
+    """A record carrying one ``performance.hdc`` component."""
+
+    record = _record(tmp_path)
+    state = record.result.state
+    results = state.results.add_component("performance.hdc", payload)
+    return RunRecord(
+        config=record.config,
+        result=RunResult(
+            state=replace(state, results=results),
+            diagnostics=record.result.diagnostics,
+            timings=record.result.timings,
+            cache_hit_count=record.result.cache_hit_count,
+            config_hash=record.result.config_hash,
+        ),
+        run_dir=record.run_dir,
+        coord_tuple=record.coord_tuple,
+    )
+
+
+def test_hdc_detection_table_is_one_row_per_anchor(tmp_path: Path) -> None:
+    """The detection-mode CCF curve has to survive outside the figure.
+
+    Long format: the gain is a curve, so a table with one row per component
+    could not carry it. Every column is checked against the payload it came
+    from, including the anchor whose refinement did not reach the threshold --
+    that row exists, and carries NaN contrasts plus the stage's reason.
+    """
+    from nullsim.outputs.tables import hdc_detection
+
+    separations = (10.0, 25.0, 60.0)
+    payload = {
+        "separations_mas": np.asarray(separations),
+        "ccf_contrast_at_target": np.asarray([1.0e-7, 4.0e-8, np.nan]),
+        "broadband_contrast_at_target": np.asarray([8.0e-7, 2.0e-7, 5.0e-7]),
+        "ccf_contrast_gain": np.asarray([8.0, 5.0, np.nan]),
+        "comparison_target_snr": 5.0,
+        "comparison_time_s": 1800.0,
+        "resolving_power_used": 3000.0,
+        "non_detection_reasons": (None, None, "refinement did not converge"),
+    }
+    collection = RunCollection(
+        config=_resolved_stub(),
+        records=(_hdc_detection_record(tmp_path, payload),),
+        output_dir=tmp_path,
+    )
+
+    path = hdc_detection(collection, tmp_path, ("json",))[0]
+    rows = json.loads(path.read_text(encoding="utf-8"))
+
+    assert [row["separation_mas"] for row in rows] == list(separations)
+    assert all(row["component"] == "performance.hdc" for row in rows)
+    assert all(row["target_snr"] == 5.0 for row in rows)
+    assert all(row["integration_time_s"] == 1800.0 for row in rows)
+    assert all(row["resolving_power"] == 3000.0 for row in rows)
+    # Gain is the published ratio of the two curves, so the table has to carry
+    # a consistent triple on every detected row.
+    for row in rows[:2]:
+        assert row["ccf_contrast_gain"] == pytest.approx(
+            row["broadband_contrast"] / row["ccf_contrast"]
+        )
+        assert row["non_detection_reason"] is None
+    assert math.isnan(rows[2]["ccf_contrast"])
+    assert math.isnan(rows[2]["ccf_contrast_gain"])
+    assert "did not converge" in rows[2]["non_detection_reason"]
+    # The broadband curve is still known at a non-detection anchor.
+    assert rows[2]["broadband_contrast"] == pytest.approx(5.0e-7)
+
+
+def test_hdc_detection_table_is_empty_without_the_stage(tmp_path: Path) -> None:
+    """No performance.hdc component, no rows -- and no crash."""
+    from nullsim.outputs.tables import hdc_detection
+
+    collection = RunCollection(
+        config=_resolved_stub(), records=(_record(tmp_path),), output_dir=tmp_path
+    )
+
+    path = hdc_detection(collection, tmp_path, ("json",))[0]
+    assert json.loads(path.read_text(encoding="utf-8")) == []

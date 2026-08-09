@@ -52,11 +52,28 @@ def _spectro_payload(
     dark_rate_hz_per_bin: float = 0.0,
     planet_rate_scale: float = 1.0,
     with_fringe_tracking: bool | None = True,
+    wl_min_um: float = _WL_MIN_UM,
+    wl_max_um: float = _WL_MAX_UM,
+    stellar_rate_hz_per_bin: float = _STELLAR_RATE_HZ_PER_BIN,
+    optimization_success: bool | None = None,
+    enforce_null_constraint: bool | None = None,
+    optimization_constraint_margin: float | None = None,
 ) -> dict[str, object]:
-    """A synthetic ``characterization.spectro`` payload on a flat 8-bin band."""
+    """A synthetic ``characterization.spectro`` payload on a flat 8-bin band.
 
-    wl_um = np.linspace(_WL_MIN_UM, _WL_MAX_UM, _N_WAVELENGTHS)
-    stellar = np.full(_N_WAVELENGTHS, _STELLAR_RATE_HZ_PER_BIN)
+    ``wl_min_um`` / ``wl_max_um`` / ``stellar_rate_hz_per_bin`` exist so a test
+    can build the SAME spectral density over a narrower detector band, which is
+    what makes a partial free spectral range comparable to an explicitly
+    narrow band.
+    """
+
+    wl_um = np.linspace(wl_min_um, wl_max_um, _N_WAVELENGTHS)
+    bin_width_um = (wl_max_um - wl_min_um) / (_N_WAVELENGTHS - 1)
+    band_lo_um = wl_min_um - 0.5 * bin_width_um
+    band_hi_um = wl_max_um + 0.5 * bin_width_um
+    band_centre_um = 0.5 * (band_lo_um + band_hi_um)
+    band_width_um = band_hi_um - band_lo_um
+    stellar = np.full(_N_WAVELENGTHS, stellar_rate_hz_per_bin)
     throughput = np.full(_N_WAVELENGTHS, _THROUGHPUT)
     null = np.full(_N_WAVELENGTHS, _NULL_DEPTH)
     ratio = np.ones(_N_WAVELENGTHS)
@@ -109,9 +126,9 @@ def _spectro_payload(
             # band_bandwidth x free_spectral_range_fraction on the design
             # wavelength; mirror that so the stage can restrict channels to it.
             "bin_edges_m": np.linspace(
-                (_BAND_CENTRE_UM - 0.5 * _BAND_WIDTH_UM * free_spectral_range_fraction)
+                (band_centre_um - 0.5 * band_width_um * free_spectral_range_fraction)
                 * 1.0e-6,
-                (_BAND_CENTRE_UM + 0.5 * _BAND_WIDTH_UM * free_spectral_range_fraction)
+                (band_centre_um + 0.5 * band_width_um * free_spectral_range_fraction)
                 * 1.0e-6,
                 201,
             ),
@@ -119,6 +136,12 @@ def _spectro_payload(
     }
     if with_fringe_tracking is not None:
         payload["with_fringe_tracking"] = with_fringe_tracking
+    if optimization_success is not None:
+        payload["optimization_success"] = optimization_success
+    if enforce_null_constraint is not None:
+        payload["enforce_null_constraint"] = enforce_null_constraint
+    if optimization_constraint_margin is not None:
+        payload["optimization_constraint_margin"] = optimization_constraint_margin
     return payload
 
 
@@ -816,3 +839,116 @@ def test_hdc_ccf_rv_statistic_peaks_at_the_true_radial_velocity(
     assert at_true_rv > float(payload["ccf_snr_photon_limited"])
     assert "whitened cross-correlation score" in str(payload["snr_vs_rv_model"])
     assert "LOCALIZATION" in str(payload["snr_vs_rv_model"])
+
+
+def test_partial_fsr_matches_an_explicit_narrow_band(tmp_path: Path) -> None:
+    """A partial free spectral range must charge the band fraction ONCE.
+
+    Two descriptions of the same instrument. Either the AWG disperses a
+    fraction ``f`` of a wide detector band, or the detector band simply IS that
+    dispersed span. Same photons per wavelength, same span, so the two must
+    give the same per-channel rates.
+
+    The construction makes them the same density by hand: with ``N`` grid
+    points the explicit band's bin width comes out ``f`` times the wide band's,
+    so scaling the per-bin stellar rate by ``f`` leaves the rate DENSITY
+    identical. Anything that applied ``f`` a second time -- once as the flat
+    band-fraction inside the AWG totals and again by restricting the analysis
+    band -- would show up as the partial-FSR channels sitting a factor ``f``
+    below the explicit-band ones over the same wavelengths.
+    """
+
+    fraction = 0.6
+    half_span_um = 0.5 * fraction * _BAND_WIDTH_UM
+    lo_um = _BAND_CENTRE_UM - half_span_um
+    hi_um = _BAND_CENTRE_UM + half_span_um
+    # Grid endpoints inset by half a bin so the explicit band's EDGES land on
+    # the dispersed span rather than its grid points.
+    inset_um = (hi_um - lo_um) / (2 * _N_WAVELENGTHS)
+
+    partial = _stage(_context(tmp_path), snr_vs_r_points=0, rv_scan_points=0).apply(
+        _state(free_spectral_range_fraction=fraction)
+    ).results.components["characterization.hdc_ccf"]
+    explicit = _stage(_context(tmp_path), snr_vs_r_points=0, rv_scan_points=0).apply(
+        _state(
+            wl_min_um=lo_um + inset_um,
+            wl_max_um=hi_um - inset_um,
+            stellar_rate_hz_per_bin=fraction * _STELLAR_RATE_HZ_PER_BIN,
+        )
+    ).results.components["characterization.hdc_ccf"]
+
+    assert explicit["observed_band_um"] == pytest.approx(
+        partial["observed_band_um"], rel=1.0e-9
+    )
+    assert int(explicit["n_channels"]) == int(partial["n_channels"])
+
+    partial_planet = np.asarray(
+        partial["ccf_planet_rate_hz_per_channel"], dtype=np.float64
+    )
+    explicit_planet = np.asarray(
+        explicit["ccf_planet_rate_hz_per_channel"], dtype=np.float64
+    )
+    assert partial_planet.sum() > 0.0
+    assert partial_planet == pytest.approx(explicit_planet, rel=1.0e-6)
+    partial_leak = np.asarray(
+        partial["ccf_leak_rate_hz_per_channel"], dtype=np.float64
+    )
+    explicit_leak = np.asarray(
+        explicit["ccf_leak_rate_hz_per_channel"], dtype=np.float64
+    )
+    assert partial_leak == pytest.approx(explicit_leak, rel=1.0e-6)
+
+
+def test_rejected_spectro_solution_publishes_nan_and_a_reason(
+    tmp_path: Path,
+) -> None:
+    """A retune the pipeline rejected must not yield a plausible CCF number."""
+
+    from nullsim.stages.characterization.acceptance import REASON_OPTIMIZER_FAILED
+
+    payload = _stage(_context(tmp_path)).apply(
+        _state(optimization_success=False)
+    ).results.components["characterization.hdc_ccf"]
+
+    assert payload["spectro_solution_accepted"] is False
+    assert payload["invalidity_reason"] == REASON_OPTIMIZER_FAILED
+    assert np.isnan(float(payload["ccf_snr"]))
+    assert np.isnan(float(payload["ccf_snr_photon_limited"]))
+    assert np.isnan(float(payload["n_effective_lines"]))
+    assert int(payload["n_channels"]) == 0
+    assert (
+        np.asarray(payload["ccf_planet_rate_hz_per_channel"], dtype=np.float64).size
+        == 0
+    )
+    assert payload["upstream_spectro_component"] == "characterization.spectro"
+
+
+def test_violated_null_constraint_is_rejected_with_its_own_code(
+    tmp_path: Path,
+) -> None:
+    """The two rejection routes are distinguishable without parsing prose."""
+
+    from nullsim.stages.characterization.acceptance import (
+        REASON_NULL_CONSTRAINT_VIOLATED,
+    )
+
+    payload = _stage(_context(tmp_path)).apply(
+        _state(
+            enforce_null_constraint=True,
+            optimization_constraint_margin=-1.0,
+        )
+    ).results.components["characterization.hdc_ccf"]
+
+    assert payload["spectro_solution_accepted"] is False
+    assert payload["invalidity_reason"] == REASON_NULL_CONSTRAINT_VIOLATED
+    assert np.isnan(float(payload["ccf_snr"]))
+
+
+def test_accepted_spectro_solution_is_marked_accepted(
+    payload: dict[str, object],
+) -> None:
+    """The acceptance verdict is stamped on every payload, not only failures."""
+
+    assert payload["spectro_solution_accepted"] is True
+    assert payload["invalidity_reason"] is None
+    assert float(payload["ccf_snr"]) > 0.0

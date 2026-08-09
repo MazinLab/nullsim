@@ -155,6 +155,13 @@ class StandardPerformance(BaseStage):
         total_stellar_rate_hz = (
             bright_rate_hz + leakage_rate_hz_total + spectro_rate_hz_total
         )
+        (
+            total_stellar_rate_hz_uncapped,
+            uncapped_source,
+            detector_saturated,
+        ) = _uncapped_stellar_rate_hz_total(
+            detector_component, port_labels, total_stellar_rate_hz
+        )
 
         null_depth_residual, null_source = _resolve_null_depth_residual(
             state, detector_component
@@ -497,6 +504,20 @@ class StandardPerformance(BaseStage):
             "leakage_rate_hz_total": float(leakage_rate_hz_total),
             "spectro_rate_hz_total": float(spectro_rate_hz_total),
             "stellar_rate_hz_total": float(total_stellar_rate_hz),
+            # The same total before detector saturation clipped it, plus where
+            # it came from and whether any port actually saturated. Everything
+            # else in this payload stays on the CAPPED rates -- they are what
+            # the detector reads out and what the SNR budget must use -- but a
+            # consumer normalizing a physical quantity against the stellar flux
+            # (detection-mode HDC's unit-contrast planet reference) needs the
+            # uncapped one, and there is no way to recover it downstream.
+            "stellar_rate_hz_total_uncapped": (
+                None
+                if total_stellar_rate_hz_uncapped is None
+                else float(total_stellar_rate_hz_uncapped)
+            ),
+            "stellar_rate_hz_total_uncapped_source": uncapped_source,
+            "detector_saturated": detector_saturated,
             "sky_rate_hz_per_port": float(sky_rate_hz_per_port),
             "sky_rate_source": sky_rate_source,
             "contrast_curve_sky_rate_source": contrast_sky_rate_source,
@@ -514,6 +535,17 @@ class StandardPerformance(BaseStage):
             "nsc_systematic_reduction": float(params.nsc_systematic_reduction),
             "calibration_floor": (
                 None if calibration_floor is None else float(calibration_floor)
+            ),
+            # Companion to null_depth_residual_effective_fraction: the same
+            # floor converted from the raw KILO mean(dark)/mean(bright)
+            # convention into the dark/total power fraction the leakage rates
+            # are actually built from. The raw and effective numbers differ by
+            # n_dark x mean_bright / total, so a consumer that compares a floor
+            # against an effective null has to use this one.
+            "calibration_floor_effective_fraction": (
+                None
+                if calibration_floor_effective is None
+                else float(calibration_floor_effective)
             ),
             "calibration_floor_source": calibration_floor_source,
             "calibration_floor_applied": bool(calibration_floor_applied),
@@ -696,6 +728,78 @@ def _resolve_null_depth_residual(
         if "null_depth_calibrated" in value:
             return float(value["null_depth_calibrated"]), name
     return float(detector_component["null_depth_raw"]), "detector.null_depth_raw"
+
+
+def _uncapped_stellar_rate_hz_total(
+    detector_component: Any,
+    port_labels: tuple[str, ...],
+    capped_total_hz: float,
+) -> tuple[float | None, str, bool | None]:
+    """Total stellar rate across all output ports before saturation clipping.
+
+    Detectors publish ``port_rates`` post-cap, which is what the readout sees
+    and what every noise term here has to use. They also publish
+    ``uncapped_port_rates``: the same per-port totals before the cap. Summing
+    the uncapped array over the same bright/dark/spectro ports recovers the
+    physical stellar rate.
+
+    Returns ``(total_or_None, source, saturated_or_None)``. ``None`` for the
+    total means the detector published no uncapped array; ``None`` for the
+    saturation flag means it published no verdict either way, which is not the
+    same as "did not saturate" and must not be read as one.
+    """
+
+    saturated: bool | None = None
+    declared = (
+        detector_component.get("detector_saturated")
+        if isinstance(detector_component, dict)
+        else None
+    )
+    if declared is not None:
+        saturated = bool(declared)
+    else:
+        flags = (
+            detector_component.get("saturated_per_port")
+            if isinstance(detector_component, dict)
+            else None
+        )
+        if flags is not None:
+            saturated = bool(np.any(np.asarray(flags, dtype=bool)))
+
+    values = (
+        detector_component.get("uncapped_port_rates")
+        if isinstance(detector_component, dict)
+        else None
+    )
+    if values is None:
+        return None, "unavailable (detector published no uncapped_port_rates)", saturated
+    rates = np.asarray(values, dtype=np.float64)
+    if rates.shape != (len(port_labels),):
+        return (
+            None,
+            "unavailable (detector uncapped_port_rates does not match "
+            f"port_labels: shape {rates.shape} vs {len(port_labels)} ports)",
+            saturated,
+        )
+    mask = np.array(
+        [
+            label.startswith(("bright", "dark", "spectro"))
+            for label in port_labels
+        ],
+        dtype=bool,
+    )
+    total = float(rates[mask].sum())
+    if not math.isfinite(total) or total < capped_total_hz * (1.0 - 1.0e-9):
+        # Below the capped total is arithmetically impossible for a cap that
+        # only ever scales rates down; treat it as an unusable array rather
+        # than publishing a number that would silently shrink the star.
+        return (
+            None,
+            "unavailable (detector uncapped_port_rates sums below the capped "
+            f"total: {total!r} < {capped_total_hz!r})",
+            saturated,
+        )
+    return total, "detector uncapped_port_rates", saturated
 
 
 def _kilo_null_to_dark_power_fraction(

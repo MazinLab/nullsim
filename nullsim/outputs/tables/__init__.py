@@ -12,6 +12,7 @@ import pandas as pd
 
 from nullsim.outputs import RunCollection, RunRecord
 from nullsim.pipeline import register_table
+from nullsim.stages.characterization.acceptance import spectro_solution_accepted
 
 
 @register_table
@@ -73,7 +74,7 @@ def _summary_row(record: RunRecord) -> dict[str, Any]:
     )
     if characterization is not None:
         _name, payload = characterization
-        converged = _characterization_payload_converged(payload)
+        converged = spectro_solution_accepted(payload)
         row.update(
             {
                 "char_converged": converged,
@@ -172,7 +173,7 @@ def characterization_summary(
                 continue
             if not isinstance(payload, dict):
                 continue
-            converged = _characterization_payload_converged(payload)
+            converged = spectro_solution_accepted(payload)
             row = record.coord_mapping
             row.update(
                 {
@@ -268,6 +269,136 @@ def characterization_summary(
     return tuple(written_paths)
 
 
+_HDC_DETECTION_PREFIX = "performance.hdc"
+
+
+@register_table
+def hdc_detection(
+    collection: RunCollection,
+    output_dir: Path,
+    formats: Iterable[str],
+) -> tuple[Path, ...]:
+    """Write one row per ``performance.hdc`` separation anchor.
+
+    Detection-mode HDC used to survive only as dash-dot lines inside the
+    ``detection_space`` figure, which means the numbers behind the headline
+    claim -- how much the cross-correlation buys over the broadband curve, at
+    which separation, at what threshold and exposure -- could not be read back
+    without re-running. Long format (one row per anchor) rather than one row
+    per component, because the gain is a curve, not a scalar.
+    """
+
+    table_dir = output_dir / "tables"
+    table_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    for record in collection.records:
+        for name, payload in record.result.state.results.components.items():
+            if not name.startswith(_HDC_DETECTION_PREFIX):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            rows.extend(_hdc_detection_rows(record, name, payload))
+    frame = pd.DataFrame(rows)
+
+    written_paths: list[Path] = []
+    for file_format in formats:
+        output_path = table_dir / f"hdc_detection.{file_format}"
+        match file_format:
+            case "csv":
+                frame.to_csv(output_path, index=False)
+            case "json":
+                output_path.write_text(
+                    json.dumps(rows, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+            case "parquet":
+                frame.to_parquet(output_path, index=False)
+            case _:
+                raise ValueError(
+                    f"hdc_detection does not support {file_format!r} output."
+                )
+        written_paths.append(output_path)
+    return tuple(written_paths)
+
+
+def _hdc_detection_rows(
+    record: RunRecord, name: str, payload: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Anchor rows for one ``performance.hdc`` payload.
+
+    Anchors the stage published as non-detections keep their row: the
+    separation was asked about and the answer was "no contrast reaches the
+    threshold", which is information. Their contrast columns are NaN and
+    ``non_detection_reason`` carries the stage's own explanation.
+    """
+
+    separations = _float_array(payload.get("separations_mas"))
+    if separations.size == 0:
+        return []
+    ccf = _aligned(payload.get("ccf_contrast_at_target"), separations.size)
+    broadband = _aligned(
+        payload.get("broadband_contrast_at_target"), separations.size
+    )
+    gain = _aligned(payload.get("ccf_contrast_gain"), separations.size)
+    reasons = payload.get("non_detection_reasons")
+    reason_list = list(reasons) if isinstance(reasons, (list, tuple)) else []
+
+    target_snr = _finite_or_nan(payload.get("comparison_target_snr"))
+    if not np.isfinite(target_snr):
+        target_snr = _finite_or_nan(payload.get("target_snr"))
+    integration_time_s = _finite_or_nan(payload.get("comparison_time_s"))
+    if not np.isfinite(integration_time_s):
+        integration_time_s = _finite_or_nan(payload.get("integration_time_s"))
+
+    rows: list[dict[str, Any]] = []
+    for index in range(separations.size):
+        row = record.coord_mapping
+        row.update(
+            {
+                "component": name,
+                "config_hash": record.config.config_hash,
+                "run_hash": record.config.run_hash,
+                "separation_mas": float(separations[index]),
+                "ccf_contrast": float(ccf[index]),
+                "broadband_contrast": float(broadband[index]),
+                "ccf_contrast_gain": float(gain[index]),
+                "target_snr": float(target_snr),
+                "integration_time_s": float(integration_time_s),
+                "resolving_power": _finite_or_nan(
+                    payload.get("resolving_power_used")
+                ),
+                "non_detection_reason": (
+                    reason_list[index] if index < len(reason_list) else None
+                ),
+            }
+        )
+        rows.append(row)
+    return rows
+
+
+def _float_array(values: Any) -> np.ndarray:
+    if values is None:
+        return np.empty(0, dtype=np.float64)
+    array = np.asarray(values, dtype=np.float64)
+    return array if array.ndim == 1 else np.empty(0, dtype=np.float64)
+
+
+def _aligned(values: Any, size: int) -> np.ndarray:
+    """``values`` as a float array of length ``size``, NaN-filled when absent."""
+
+    array = _float_array(values)
+    if array.size == size:
+        return array
+    return np.full(size, np.nan, dtype=np.float64)
+
+
+def _finite_or_nan(value: Any) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 _HDC_PREFIX = "characterization.hdc_ccf"
 
 # Table column -> hdc_ccf payload key.
@@ -332,31 +463,4 @@ def _payload_first(payload: dict[str, Any], *keys: str) -> Any:
     return None
 
 
-def _characterization_payload_converged(payload: dict[str, Any]) -> bool:
-    """Return whether the characterization optimizer converged.
-
-    Convergence means the optimizer reported success and, when a null
-    constraint is enforced, the constraint margin is within tolerance.
-    This is optimizer convergence, not measurement feasibility.
-    """
-    success = payload.get("optimization_success")
-    if success is not None and not bool(success):
-        return False
-    if not bool(payload.get("enforce_null_constraint", False)):
-        return True
-    margin = payload.get("optimization_constraint_margin")
-    if margin is None:
-        return True
-    try:
-        margin_value = float(margin)
-    except (TypeError, ValueError):
-        return True
-    null_floor = payload.get("null_floor")
-    try:
-        tolerance = 0.01 * float(null_floor) if null_floor is not None else 0.0
-    except (TypeError, ValueError):
-        tolerance = 0.0
-    return margin_value >= -tolerance
-
-
-__all__ = ["characterization_summary", "performance_summary"]
+__all__ = ["characterization_summary", "hdc_detection", "performance_summary"]

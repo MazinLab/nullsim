@@ -207,6 +207,15 @@ class SNSPDDetector(BaseStage):
                 "uncapped_port_rate_hz_per_wavelength": (
                     signal_rate_hz_per_wavelength.astype(np.float64, copy=True)
                 ),
+                # Per-port signal totals BEFORE the fixed cap, the exact
+                # pre-cap counterpart of ``port_rates``. Same reasoning as
+                # detector.mkid: saturation is a readout limit, so anything
+                # normalizing against the stellar flux has to use the uncapped
+                # rate rather than the clipped one.
+                "uncapped_port_rates": uncapped_signal_per_port.astype(
+                    np.float64, copy=True
+                ),
+                "detector_saturated": bool(np.any(saturated_per_port)),
                 "total_port_rates_with_dark": total_port_rates_hz.astype(
                     np.float64, copy=True,
                 ),
