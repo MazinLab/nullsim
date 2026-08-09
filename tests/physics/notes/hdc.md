@@ -372,6 +372,66 @@ upper bound is proven**. Do not clamp the value, range-validate it into
 reports above 1 that is a result to look at, not a value to squash. What is now
 retracted is the assertion that above-1 is expected for absorption templates.
 
+### Per island, because the global number hides the bad one
+
+`H` is block diagonal over islands, so the signal and the propagated variance
+are both island sums and each island's retention is a well-defined number on its
+own. `island_channel_counts` and `island_self_subtraction_factors` publish them,
+and the reason is that the global factor is a photon-weighted average that a
+long healthy island dominates. Measured on a 40-channel probe (a 30-channel comb
+against a flat 100 Hz leak, a 3-channel island, a 1-channel island, telluric
+gaps between them, width 15):
+
+| island | channels | retention |
+|---|---|---|
+| comb | 30 | 0.890 |
+| narrow | 3 | 0.632 |
+| singleton | 1 | 0.000 |
+| **global** | 34 | **0.801** |
+
+A one-channel island retains nothing, ever: its boxcar window holds one sample,
+so the estimated continuum *is* the datum and `H = 0`. Beyond that the spread is
+not monotone in island length, and it would be wrong to read it as "short is
+bad". What sets retention is how much of the template's power sits above the
+filter's passband on that island, and island length changes the passband: on an
+island shorter than the width the renormalized boxcar spans the whole block, so
+the filter removes only the island mean and a line survives nearly intact, while
+on a long island the running mean tracks local structure and takes more of the
+line with it. Both directions are real. In the probe above the 30-channel comb
+(all its power at the line scale, perfectly matched to a width-15 high-pass)
+beats the 3-channel island, whose mean absorbs a third of a `[1, 5, 1]` line —
+and the same 3 channels retain 0.823 for `[0, 5, 0]` and 0.379 for a ramp
+`[1, 2, 3]` the filter reads as continuum. In the shipped
+`hdc_ccf_systematics.toml` the ordering is the other way round: islands of
+382 / 196 / 17 channels retain 0.066 / 0.167 / 0.556 against a global 0.0784,
+because that planet template is smooth on the scale of 15 channels and only the
+short island is spared.
+
+The point of publishing per island is not a rule of thumb; it is that a single
+photon-weighted average over islands with a factor-of-8 spread in retention is
+not a description of anything, and a config whose signal lives on the island
+that retains 0.066 is in a different situation from one whose signal lives on
+the island that retains 0.556.
+
+### A filtered template that is only roundoff
+
+`H` annihilates a constant analytically and to a few ulp in floating point: the
+worst case measured over flat arrays (lengths 1 to 4096, widths 3 to 1001) is
+`max|H x| = 89 eps max|x|`. Since every quantity downstream is scale-free in the
+template — the weights are `Ptilde/v`, and the SNR is a ratio — that residue does
+not stay small. Three flat channels at 1.03 Hz against a 100 Hz leak reported
+`ccf_snr = 13.099` at `t = 3600 s`, and 100.1 Hz against 1000 Hz reported 6.222
+at `t = 1 s`: ordinary rates, ordinary exposures, a detection manufactured from
+rounding.
+
+Both entry points therefore zero any island whose filtered template is below
+`1024 eps` times that island's own raw template magnitude. The threshold is
+~11x the measured worst-case residue and ~3 orders below the filtered amplitude
+of a `1e-10` fractional line (`4e5 eps`), so nothing a spectrum could physically
+carry is at risk. Per island and relative, because a global absolute cut is
+wrong in both directions: it misses roundoff on a bright island and erases real
+structure on a faint one.
+
 ### `N_eff`
 
 The effective channel count is the participation ratio of the weights,
@@ -422,11 +482,15 @@ argument.
 
 ## Radial-Velocity Scan
 
-`ccf_vs_rv` correlates a fixed observed spectrum (planet at its true radial
-velocity plus leak, sky, dark) against templates rebuilt at trial velocities.
-Its one job is to *locate* the planet, so it has to be a statistic whose maximum
-is provably at the truth. That forces a different filter from the detection
-statistic, and the difference is worth understanding.
+`ccf_vs_rv` correlates a fixed observed spectrum against templates rebuilt at
+trial velocities. The observation it correlates against is `planet + leak` on
+the admitted channels -- the function subtracts nothing, and a caller that wants
+a leak-subtracted residual (as `characterization.hdc_ccf` does, folding the leak
+mean into the variance budget on the strength of bright-port monitoring) passes
+it in that way. Its job is to *say something about* the planet's velocity, which
+takes a different filter from the detection statistic; what it is not is a
+statistic whose maximum is provably at the truth, and the difference is worth
+understanding.
 
 The data is `y = H N` with covariance `C_y = t H diag(v) H^T`. The generalized
 matched filter under that covariance,
@@ -450,22 +514,68 @@ condition is a property of the instrument, not of the algebra.
 
 ### The pseudoinverse is closed form here
 
-`C_y` is singular, but only just: `H = I - S` with `S` row-stochastic (rows sum
-to 1 by the window-fraction normalization) and irreducible (the band connects
-every channel), so Perron-Frobenius makes its unit eigenvalue simple and
-`null(H) = span{1}` exactly. Hence `range(H^T) = 1-perp`, and maximizing
-`(a . P)^2 / (t a^T diag(v) a)` over `a = H^T w` in that subspace is a
-one-constraint Lagrange problem with solution
+`C_y` is singular, but only just. `H` is **block diagonal over the admitted
+islands**, and each block is `I - S_k` with `S_k` row-stochastic (rows sum to 1
+by the window-fraction normalization) and irreducible (the band connects every
+channel of the block), so Perron-Frobenius makes each block's unit eigenvalue
+simple. Hence
 
 ```text
-a_i = m_i (T_i - lambda) / v_i,   lambda = sum_i m_i T_i/v_i / sum_i m_i/v_i,
+null(H) = span{ 1_k : k an island },
+```
+
+the span of the island *indicator* vectors -- not `span{1}`. Earlier versions of
+this note asserted `null(H) = span{1}` and one global Lagrange multiplier, which
+was right only while the filter ran on a single compacted vector; the
+blockwise filter has one constraint per island, and the implementation has
+always done that. Maximizing `(a . P)^2 / (t a^T diag(v) a)` over
+`range(H^T) = null(H)-perp` is then one Lagrange problem per island:
+
+```text
+a_i = m_i (T_i - lambda_k) / v_i     for channel i in island k,
+lambda_k = sum_{i in k} m_i T_i/v_i / sum_{i in k} m_i/v_i,
 CCF(rv) = sqrt(t) * (a . R_obs) / sqrt(a^T diag(v) a),
 ```
 
-the raw template inverse-variance weighted with a variance-weighted mean
-removed. `sum_i a_i = 0` by construction of `lambda`. No eigendecomposition, no
-dense matrix, `O(n)` per trial. A test pins it against the literal
-`np.linalg.pinv` form at `rtol 1e-8`.
+the raw template inverse-variance weighted with a variance-weighted mean removed
+island by island. `sum_{i in k} a_i = 0` on each island by construction of
+`lambda_k`. No eigendecomposition, no dense matrix, `O(n)` per trial. A test
+pins it against the literal `np.linalg.pinv` form at `rtol 1e-8`.
+
+### Why the implementation uses pair differences
+
+Written as `T_i - lambda_k` the formula has two numerical failures, both of them
+reachable and both fixed by the algebraically identical
+
+```text
+a_i = u_i (T_i - T_ref) - (u_i / s_k) sum_{j in k} u_j (T_j - T_ref),
+u = 1/v,   s_k = sum_{j in k} u_j,   ref = the largest-u channel of island k.
+```
+
+*Flat islands.* Subtracting `lambda_k` from a template constant on the island
+leaves one ulp, not zero, and every downstream quantity is scale-free in `a`, so
+normalizing by that residue amplifies it into an O(1) score. Round 3 guarded it
+with an absolute `1e-12` on the globally normalized template residual, which is
+wrong in the other direction: a `1e12 Hz` island beside a `1 Hz` one pushes the
+faint island's *genuine* residual to `8e-13`, and the guard zeroed the whole
+trial (the correct score there is `sqrt(0.4) = 0.63246`, the faint island's own
+statistic). Pair differences need no guard at all: `T_i - T_ref` is exactly zero
+on a flat island whatever its magnitude, and exactly the real structure on a
+faint one.
+
+*Variance spans wider than float64.* `1/v` overflows on its own for a subnormal
+`v`, and `a` is built from products of a huge `u` with a tiny one, so no single
+normalization of `u` -- linear or logarithmic -- holds both ends. Each factor is
+therefore carried as a `(mantissa, exponent2)` pair through `math.frexp`, with
+the powers of two added as integers and materialized once against a global
+reference. For `v = [5e-324, 1e308]` the optimum is antisymmetric, `a = [-1, 1]`
+up to scale, and the score is the rate difference over the noisy channel's
+sigma, `1e154`; the linear form returned NaN.
+
+Base-two exponents rather than logarithms because the split is exact.
+`exp(sum(log x))` carries an absolute error in the log that becomes a relative
+error of `|log x| * eps` in the result -- `1.6e-13` at these magnitudes, ten
+times the tolerance the extreme-variance test pins at.
 
 ### What was wrong before
 
@@ -487,31 +597,38 @@ are individually defensible: before the covariance fix the denominator was
 valid cosine under `diag(v)^-1`. What broke it was swapping in the covariance
 denominator without also moving the weights.
 
-### The cost of the guarantee
+### What whitening costs
 
 Whitening by `C_y` necessarily undoes whatever `H` suppressed. The filter
 attenuated signal and noise together, and dividing by the true noise restores
-the ratio; the optimum is blind only to the constant mode, which is the sole
-direction `H` genuinely destroys. So this scan, unlike `matched_filter_ccf`, is
-*not* protected against smooth non-constant leak structure.
+the ratio; the optimum is blind only to the per-island constant modes, the only
+directions `H` genuinely destroys. So this scan, unlike `matched_filter_ccf`, is
+*not* protected against non-constant leak structure.
 
 That is a deliberate split, not an inconsistency. The detection statistic keeps
 its fixed-template weights and with them the boxcar's leak suppression, at the
-cost of not being optimal; the localization statistic takes the optimum and with
-it the peak guarantee, at the cost of the suppression. The consequence to watch
-in payloads is that the RV score now sits *above* `ccf_snr_photon_limited`
-(3.777 against 1.117 in the stage fixture) where it used to equal it.
+cost of not being optimal; the localization statistic takes the optimum for the
+covariance the data actually has, at the cost of the suppression. What it does
+not buy is a guarantee that the peak sits at the true velocity -- see above, and
+`-5.99` against `9.80`. The scan is a diagnostic to be read alongside
+`rv_leak_contamination`, which is `|a . L| / |a . P|` at the trial velocity: the
+term that can move the peak, in units of the term that should set it.
+`characterization.hdc_ccf` publishes it, grades it against the leak its
+bright-port subtraction is assumed to leave behind (`eps_systematic` times the
+leak, taken static), and the `hdc_ccf` plot annotates the RV panel when the
+grade is not `reliable`.
 
-That ordering is usual but **not a theorem**, and an earlier version of this
-note wrongly claimed Cauchy-Schwarz guaranteed it. The optimum dominating any
-fixed filter in its subspace would give `>=` only if both correlated against
-the same vector, and they do not: the scan correlates against the observed
-planet-plus-leak spectrum, while the detection signal is the planet alone. A
-leak that cancels the planet's structure inverts the ordering -- `P = [1, 2, 1]`
-under `L = [9, 8, 9]` is flat in total, so the scan correctly reports 0.0 for a
-featureless observation while detection reports 0.258 on the strength of
-knowing the leak. Do not read the RV score as a detection SNR, and do not
-assume either bounds the other.
+The two statistics are **not comparable in either direction**, and an earlier
+version of this note claimed both that the RV score sits above
+`ccf_snr_photon_limited` and that Cauchy-Schwarz put it there. Neither holds.
+The optimum dominating any fixed filter in its subspace would give `>=` only if
+both correlated against the same vector, and they do not: the scan correlates
+against the observed planet-plus-leak spectrum, while the detection signal is
+the planet alone. A leak that cancels the planet's structure inverts the
+ordering -- `P = [1, 2, 1]` under `L = [9, 8, 9]` is flat in total, so the scan
+reports `1e-15` for a featureless observation while detection reports `0.258` on
+the strength of knowing the leak. Do not read the RV score as a detection SNR,
+and do not assume either bounds the other.
 
 Two further requirements are enforced rather than assumed. The fixed data
 spectrum is a required input: a scan that shifts the template and rebuilds the
@@ -582,24 +699,29 @@ coefficients `A`, `B2` and `C2` over/underflow while they are being
 
 Four devices, each answering a specific failure:
 
-- **Weights in log space.** `w = ptilde/v0` is formed as
-  `sign(ptilde) exp(log|ptilde| - log v0 - max)`, so the exponent argument is
-  never positive and `|w| <= 1` no matter how far `v0` spans. Linear scaling
-  cannot do this: `5e-324` against `1e308` is a span of `1e631`, and a
-  geometric mean only halves the *exponent* span, leaving `1e315` — still
-  outside float64. Negligible channels underflow to zero, which is their
-  correct weight.
+- **Weights with the exponent kept beside the mantissa.** `w = ptilde/v0` is
+  formed by dividing the `math.frexp` mantissas and subtracting the exponents,
+  then materializing against the largest exponent, so `|w| <= 1` no matter how
+  far `v0` spans. Linear scaling cannot do this: `5e-324` against `1e308` is a
+  span of `1e631`, and a geometric mean only halves the *exponent* span,
+  leaving `1e315` — still outside float64. Negligible channels underflow to
+  zero, which is their correct weight. Base two rather than natural logs
+  because the split is exact: accumulating in logs costs `|log x| * eps`,
+  which is `1e-13` at these magnitudes.
 - **Scales carried analytically.** With `alpha = max|P1|`,
-  `beta = max v0` and `kappa = alpha exp(max log w)`,
+  `beta = max v0` and `kappa = alpha 2^G`, `G` the integer exponent above,
   `A = kappa alpha A''`, `B2 = kappa^2 beta B2''`, `C2 = kappa^2 alpha C2''`,
   `B_w = kappa beta B_w''`. `kappa` cancels out of the root entirely.
 - **The gain stays factored.** Both `P` and `sqrt(Q)` carry
   `g = n/(alpha A'')`, and `hypot` is homogeneous, so `g` factors out of the
   whole root. It is never formed on its own: it overflows for
   `alpha ~ 1e-308` and underflows for a subnormal target, on roots that are
-  representable either way. The multiply happens before the divide by `alpha`,
-  and the target multiplies the bracket before anything divides it, so a
-  subnormal `n` keeps its bits.
+  representable either way. No fixed multiplication order rescues both ends:
+  multiplying `n` into the bracket first saves a subnormal target from
+  `n/A''`, but `n = 1e-163` against a `3.2e-172` bracket underflows that
+  product to zero on a root of `3.2e-57`. The closing
+  `n * bracket / (A'' alpha)` is therefore assembled with the same exponent
+  bookkeeping as the weights and materialized once.
 - **The systematic enters as `sqrt(V_sys)/t`, never as `V_sys`.** The `t`
   cancels analytically -- `eps |B_w|` without fringe tracking,
   `eps |B_w| / sqrt(2 f t)` with -- so squaring `eps B_w t` only to take its
@@ -613,11 +735,17 @@ Plus two shape rules on the root itself: it is
 single product, since a `1e-200` target would flush `n^2` to zero and return a
 contrast of 0.
 
-Reported diagnostics (`A`, `B2`, `C2`, `V_sys`) are a separate matter: they are
-grouped so the cancelling factors meet first and use `*` rather than `**`,
-because float `*` saturates to `inf` while `**` raises. A diagnostic that
-saturates must never abort a root that is representable, so none of them feeds
-the root.
+Reported diagnostics (`A`, `B2`, `C2`, `V_sys`) are a separate matter, and none
+of them feeds the root — a diagnostic that saturates must never abort a root
+that is representable. Each is assembled by `_scaled_product`, which folds every
+factor's power of two into an integer and materializes once, so the weight scale
+`kappa` is never itself formed. It has to be that way: `P1 = 1e-300` against a
+`5e-324` leak puts `kappa` at `2^1074`, and multiplying it out turned the weight,
+`A`, `B2` and `C2` into `inf` and `V_sys` into `NaN` on a problem whose reported
+values are `2.024e23`, `2.024e-277`, `2.024e-277` and `4.097e-254`. Where a
+value genuinely is not representable the closing `ldexp` saturates to `inf` (or
+underflows to zero, as `A = 1e-497` does in the subnormal-target case) rather
+than raising.
 
 Pinned values, each independently verified: `25` exactly for the `1e-200`-leak
 case, `8.373669637337405e96` and `2.754554230312972e-99` for the two extreme
@@ -637,11 +765,15 @@ above.
 One step further out, `V_sys` itself stops being representable: it is
 `(eps B_w t)^2` without fringe tracking, so `eps B_w t > ~1.3e154` overflows.
 Python's `**` raises `OverflowError` there while the fringe-tracking branch's
-plain multiplications saturate silently to `inf`. The solver catches both and
-re-raises as the `ValueError` it documents, quoting `eps B_w t`, so callers
-sweeping anchors have one exception type. `matched_filter_ccf` is deliberately
-left alone — changing what it raises would be a behavior change to a function
-with its own consumers.
+plain multiplications saturate silently to `inf`. **This no longer raises**, and
+an earlier version of this note said it did. Since the root takes the systematic
+as `sqrt(V_sys)/t` computed per regime, an unrepresentable `V_sys` costs the
+root nothing: `P1 = 1e10, L = 1e170, eps = 1` at `t = 1e200` returns
+`c = 5e160` and reports `systematic_var_counts = inf`, which is the honest
+label for a diagnostic that does not fit in a float64. The `OverflowError` from
+`**` is caught and mapped to `inf` so the two regimes report the same way.
+`matched_filter_ccf` is deliberately left alone — changing what it raises would
+be a behavior change to a function with its own consumers.
 
 ### Two identities worth knowing
 
@@ -803,7 +935,9 @@ it needs exactly one exception type to catch.
 `A <= 0` raises `ValueError` rather than returning `inf`. `A` is
 `sum_i Ptilde1_i^2 / v0_i` over usable channels, so it is zero only when the
 filtered template vanishes everywhere it is allowed to count: a lineless planet
-spectrum, or one whose lines all land in telluric-masked channels. There is no
+spectrum, one whose lines all land in telluric-masked channels, or one that is
+constant on every island, where `H P1` is rounding residue and the same
+per-island roundoff guard the detection statistic uses zeroes it. There is no
 contrast at which such a template reaches the target, and an `inf` propagating
 into a contrast curve would be read as "no constraint" rather than "the input
 was unusable". The other guards (`t > 0`, `n > 0` finite, finite non-negative

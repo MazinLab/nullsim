@@ -252,7 +252,7 @@ pinning rationale live in `tests/physics/notes/*.md`.
 | `spectroscopy.py` | Spectro-port SNR, max resolving power, AWG spectrograph model. |
 | `mkid.py` | MKID resolving power and energy-response matrix primitives. |
 | `spectra.py` | Template spectrum loading, constant-R grids, Doppler shift, resolving-power convolution, flux-conserving resampling. |
-| `hdc.py` | High dispersion coronagraphy matched-filter CCF budget: channelization, template weights, self-subtraction, RV scan, and the inverse solve `ccf_contrast_at_target_snr` (faintest contrast reaching a target SNR). |
+| `hdc.py` | High dispersion coronagraphy matched-filter CCF budget: channelization, template weights, self-subtraction (global and per island), RV scan with its `rv_leak_contamination` validity diagnostic, and the inverse solve `ccf_contrast_at_target_snr` (faintest contrast reaching a target SNR). |
 | `pdi.py` | Polarimetric differential imaging SNR primitives. |
 | `characterization.py` | Known-position chip optimization for spectro mode. |
 | `characterization_torch.py` | Torch autograd-Jacobian helper for characterization optimization. |
@@ -378,8 +378,8 @@ Regression and smoke-test configs under `examples/test/`:
   budget and the caveats on the asserted correlation time.
 - `hdc_detection_smoke.toml` — detection-mode HDC: same systematics knobs on
   `performance.standard`, `performance.hdc` over seven separation anchors, and
-  the `detection_space` overlay. `ccf_contrast_gain` 7.5 with the knobs, 0.16
-  without.
+  the `detection_space` overlay. `ccf_contrast_gain` 28.199 with the knobs,
+  0.626 without.
 - `kilo_vs_hwo_study.toml` — cross-config comparison study.
 - `kilo_keck_quadrature_mesh.toml` — KILO Keck with a 48-mode
   duplicated-input Clements mesh and cophasing diagnostics.

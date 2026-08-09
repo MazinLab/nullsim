@@ -961,3 +961,83 @@ def test_accepted_spectro_solution_is_marked_accepted(
     assert payload["spectro_solution_accepted"] is True
     assert payload["invalidity_reason"] is None
     assert float(payload["ccf_snr"]) > 0.0
+
+
+def test_payload_array_schema_does_not_depend_on_acceptance(
+    payload: dict[str, object], tmp_path: Path
+) -> None:
+    """A rejected retune must publish the same keys, not a smaller payload.
+
+    A consumer decides what to read from the payload schema, and the schema
+    cannot depend on whether the optimizer happened to converge: two published
+    per-channel arrays existed only on the accepted path, so a plot iterating
+    them raised on rejection instead of drawing a hole.
+    """
+
+    rejected = _stage(_context(tmp_path)).apply(
+        _state(optimization_success=False)
+    ).results.components["characterization.hdc_ccf"]
+
+    accepted_arrays = {
+        key for key, value in payload.items() if isinstance(value, np.ndarray)
+    }
+    missing = sorted(accepted_arrays - set(rejected))
+    assert missing == []
+    for key in sorted(accepted_arrays):
+        empty = rejected[key]
+        assert isinstance(empty, np.ndarray)
+        assert empty.size == 0
+        assert empty.dtype.kind == np.asarray(payload[key]).dtype.kind, key
+
+    # Every scalar the accepted payload carries is there too, so a table writer
+    # gets a column either way.
+    for key in ("rv_leak_contamination", "rv_scan_localization_grade"):
+        assert key in rejected
+    assert np.isnan(float(rejected["rv_leak_contamination"]))
+    assert rejected["rv_scan_localization_valid"] is False
+
+
+def test_rv_scan_publishes_its_leak_contamination_and_a_verdict(
+    payload: dict[str, object],
+) -> None:
+    """The scan's argmax is only evidence when the leak term is small.
+
+    Nothing in the code stops a reader taking the peak as a radial-velocity
+    measurement, so the payload has to say when that reading is unsupported.
+    """
+
+    contamination = float(payload["rv_leak_contamination"])
+    effective = float(payload["rv_leak_contamination_effective"])
+    assert contamination >= 0.0
+    # The observation the scan sees has had the leak mean removed, so what can
+    # actually shift the peak is the eps_systematic fraction the null
+    # instability leaves behind -- not the whole leak.
+    assert effective == pytest.approx(
+        contamination * float(payload["eps_systematic_used"])
+    )
+    assert effective <= contamination
+    grade = payload["rv_scan_localization_grade"]
+    assert grade in ("reliable", "marginal", "unreliable")
+    # The verdict is exactly "the effective contamination cleared the stated
+    # cut", not an independent judgement.
+    assert payload["rv_scan_localization_valid"] is (effective < 0.1)
+    assert (grade == "reliable") is (effective < 0.1)
+    assert "CONVENTIONS" in str(payload["rv_leak_contamination_model"])
+
+
+def test_island_diagnostics_expose_what_the_global_factor_averages_over(
+    payload: dict[str, object],
+) -> None:
+    """Per-island retention, because one crippled island hides in the mean."""
+
+    counts = np.asarray(payload["ccf_island_channel_counts"], dtype=np.int64)
+    factors = np.asarray(
+        payload["ccf_island_self_subtraction_factors"], dtype=np.float64
+    )
+    assert counts.size == factors.size
+    assert counts.size >= 1
+    assert int(counts.sum()) == int(payload["n_channels_used"])
+    assert np.all(counts >= 1)
+    assert np.all(factors >= 0.0)
+    # A one-channel island cannot separate line from continuum, ever.
+    assert np.all(factors[counts == 1] == 0.0)

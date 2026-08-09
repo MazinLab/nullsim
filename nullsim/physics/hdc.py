@@ -145,6 +145,7 @@ __all__ = [
     "continuum_filter",
     "continuum_filter_adjoint",
     "matched_filter_ccf",
+    "rv_leak_contamination",
     "snr_vs_resolving_power",
 ]
 
@@ -283,7 +284,8 @@ class CcfBudget:
         Number of **admitted** channels: unmasked with ``v_i > 0``. Not the
         number with a non-zero weight -- an admitted channel can carry zero
         weight (a flat island filters to zero), and the two-flat-segments
-        regression reports 2 admitted with every weight zero.
+        regression reports 6 admitted channels, three per segment, with every
+        weight zero.
     template_weights:
         ``w_i`` on the full channel grid, zero on excluded channels.
     admitted_mask:
@@ -298,6 +300,25 @@ class CcfBudget:
         ``V_ph = t sum_i u_i^2 v_i``. Applying a public adjoint to
         ``template_weights`` on the raw grid does *not* reproduce it, because
         that adjoint has no way to know the island boundaries.
+    island_channel_counts:
+        Length of each admitted island, in channels, in ascending wavelength
+        order. Published because the filter acts within islands, not across
+        the channel total: an island shorter than the filter width gets a
+        boxcar renormalized over the whole block, which is a different filter
+        from the one the width nominally asks for.
+    island_self_subtraction_factors:
+        `self_subtraction_factor` computed island by island (``H`` is block
+        diagonal, so signal and propagated variance are both island sums and
+        each island's retention stands alone). A one-channel island reports
+        0.0, because a single sample cannot separate line from continuum.
+        Beyond that the spread is large and *not* monotone in island length --
+        an island shorter than the filter width has its boxcar renormalized
+        over the whole block, so the filter removes only the island mean and
+        can retain more than a long island does. Measured on the shipped
+        systematics config: islands of 382/196/17 channels retain
+        0.066/0.167/0.556 against a global 0.078. A photon-weighted average
+        over that spread describes none of them, which is why both arrays are
+        published.
     """
 
     ccf_snr: float
@@ -312,6 +333,8 @@ class CcfBudget:
     template_weights: NDArray[np.float64]
     admitted_mask: NDArray[np.bool_]
     noise_weights: NDArray[np.float64]
+    island_channel_counts: NDArray[np.intp]
+    island_self_subtraction_factors: NDArray[np.float64]
 
     @property
     def n_effective_lines(self) -> float:
@@ -378,6 +401,139 @@ def channelize(
     )
     bin_means = resample_flux_conserving(wavelength, smoothed, edges)
     return bin_means * np.diff(edges)
+
+
+def _scaled_product(
+    factors: Sequence[float],
+    divisors: Sequence[float] = (),
+    exponent2: int = 0,
+) -> float:
+    """``prod(factors) / prod(divisors) * 2**exponent2``, materialized once.
+
+    Every factor is split by `math.frexp` into a mantissa in ``[0.5, 1)`` and an
+    integer power of two, so the running product cannot over- or underflow
+    however extreme the individual factors are. Only the closing `math.ldexp`
+    can, and by then the value genuinely is not representable.
+
+    Exponent bookkeeping rather than logarithms: the split is exact, whereas
+    ``exp(sum(log(x)))`` carries an absolute error in the log that becomes a
+    relative error of ``|log x| * eps`` in the result -- 1e-13 at the magnitudes
+    this module has to survive. Zero, infinity and NaN short-circuit, since
+    ``frexp`` has nothing useful to say about them.
+    """
+    mantissa = 1.0
+    exponent = int(exponent2)
+    for value in factors:
+        if value == 0.0 or not math.isfinite(value):
+            mantissa *= value
+            continue
+        split_mantissa, split_exponent = math.frexp(value)
+        mantissa *= split_mantissa
+        exponent += split_exponent
+        mantissa, extra = math.frexp(mantissa)
+        exponent += extra
+    for value in divisors:
+        if value == 0.0:
+            return math.copysign(math.inf, mantissa) if mantissa else math.nan
+        if not math.isfinite(value):
+            mantissa /= value
+            continue
+        split_mantissa, split_exponent = math.frexp(value)
+        mantissa /= split_mantissa
+        exponent -= split_exponent
+        mantissa, extra = math.frexp(mantissa)
+        exponent += extra
+    if mantissa == 0.0 or not math.isfinite(mantissa):
+        return mantissa
+    try:
+        return math.ldexp(mantissa, exponent)
+    except OverflowError:
+        return math.copysign(math.inf, mantissa)
+
+
+def _reciprocal_split(
+    values: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.int32]]:
+    """``1 / values`` as ``(mantissa, exponent2)`` with the mantissa in ``(1, 2]``.
+
+    A per-channel inverse variance can overflow float64 on its own (``v`` a
+    subnormal), and no single linear or logarithmic normalization brings a
+    ``5e-324``-to-``1e308`` span inside the exponent range. Keeping the power of
+    two beside the mantissa does, and exactly.
+    """
+    mantissa, exponent = np.frexp(np.asarray(values, dtype=np.float64))
+    return 1.0 / mantissa, -exponent
+
+
+def _sum_split(
+    mantissa: NDArray[np.float64], exponent: NDArray[np.int32]
+) -> tuple[float, int]:
+    """Sum ``mantissa * 2**exponent`` as a ``(mantissa, exponent2)`` pair."""
+    nonzero = mantissa != 0.0
+    if not bool(np.any(nonzero)):
+        return 0.0, 0
+    largest = int(np.max(exponent[nonzero]))
+    shift = np.clip(exponent - largest, -1100, 0).astype(np.int32)
+    with np.errstate(under="ignore"):
+        total = float(np.sum(np.ldexp(mantissa, shift)))
+    if total == 0.0 or not math.isfinite(total):
+        return total, 0
+    split_mantissa, split_exponent = math.frexp(total)
+    return split_mantissa, largest + split_exponent
+
+
+def _shifted(
+    mantissa: NDArray[np.float64], exponent: NDArray[np.int32], reference: int
+) -> NDArray[np.float64]:
+    """``mantissa * 2**(exponent - reference)``, underflowing to zero when tiny."""
+    shift = np.clip(exponent - reference, -1100, 1100).astype(np.int32)
+    with np.errstate(over="ignore", under="ignore"):
+        return np.ldexp(mantissa, shift)
+
+
+# A filtered template that is nothing but rounding residue must not be allowed
+# to become a detection. Measured worst case over flat arrays (lengths 1-4096,
+# widths 3-1001): max|H x| / max|x| = 89 * eps. This threshold sits ~11x above
+# that and ~3 orders of magnitude below the filtered amplitude of a 1e-10
+# fractional line (4e5 * eps), so it separates roundoff from any structure a
+# spectrum could physically carry.
+_ROUNDOFF_RTOL = 1024.0 * float(np.finfo(np.float64).eps)
+
+
+def _zero_roundoff_islands(
+    filtered: NDArray[np.float64],
+    raw: NDArray[np.float64],
+    islands: list[slice],
+    *,
+    rtol: float = _ROUNDOFF_RTOL,
+) -> NDArray[np.float64]:
+    """Zero each island whose filtered template is pure rounding residue.
+
+    ``H`` annihilates a constant analytically, but only to a few ulp in
+    floating point: a flat island of ``1.03 Hz`` filters to ``2.2e-16`` rather
+    than to zero. Every quantity downstream is scale-free in the template --
+    weights are normalized, and the SNR is a ratio -- so that residue does not
+    stay small. It is amplified into an ordinary-looking detection: 3 flat
+    channels at 1.03 Hz against a 100 Hz leak report ``ccf_snr = 13.1`` at
+    ``t = 3600 s``, from a spectrum with no line in it.
+
+    The test has to be per island and relative to that island's own template
+    magnitude. A global absolute threshold gets it wrong in both directions:
+    it misses roundoff on a bright island and erases real structure on a faint
+    one (a genuine residual on a 1 Hz island is pure noise to a threshold
+    calibrated for a 1e12 Hz one).
+    """
+    if not islands:
+        return filtered
+    out = filtered
+    for block in islands:
+        scale = float(np.max(np.abs(raw[block]))) if raw[block].size else 0.0
+        residual = float(np.max(np.abs(filtered[block]))) if scale > 0.0 else 0.0
+        if scale <= 0.0 or residual <= rtol * scale:
+            if out is filtered:
+                out = filtered.copy()
+            out[block] = 0.0
+    return out
 
 
 def _odd_width(width_channels: int) -> int:
@@ -745,8 +901,12 @@ def matched_filter_ccf(
     variance_admitted = variance_rate[admitted]
     planet_admitted = planet[admitted]
     islands = _islands(admitted)
-    planet_filtered = _filtered_blockwise(
-        planet_admitted, continuum_filter_width_channels, islands
+    planet_filtered = _zero_roundoff_islands(
+        _filtered_blockwise(
+            planet_admitted, continuum_filter_width_channels, islands
+        ),
+        planet_admitted,
+        islands,
     )
     leak_filtered = _filtered_blockwise(
         channels.leak_rate_hz[admitted], continuum_filter_width_channels, islands
@@ -826,6 +986,40 @@ def matched_filter_ccf(
     sq_sum = float(np.sum(admitted_weights * admitted_weights))
     n_effective_channels = abs_sum * abs_sum / sq_sum if sq_sum > 0.0 else 0.0
 
+    # Per island, because the global factor averages a crippled narrow island
+    # against healthy wide ones and hides it. H is block diagonal, so the
+    # signal and the propagated variance are both sums over islands and each
+    # island's retention is well defined on its own.
+    island_channel_counts = np.array(
+        [block.stop - block.start for block in islands], dtype=np.intp
+    )
+    island_self_subtraction = np.zeros(len(islands), dtype=np.float64)
+    for position, block in enumerate(islands):
+        if int(continuum_filter_width_channels) <= 0:
+            island_self_subtraction[position] = 1.0
+            continue
+        island_signal = float(
+            np.sum(admitted_weights[block] * planet_filtered[block])
+        )
+        island_variance = float(
+            np.sum(
+                noise_weights[block]
+                * noise_weights[block]
+                * variance_admitted[block]
+            )
+        )
+        island_unfiltered = float(
+            np.sum(
+                planet_admitted[block]
+                * planet_admitted[block]
+                / variance_admitted[block]
+            )
+        )
+        if island_signal > 0.0 and island_variance > 0.0 and island_unfiltered > 0.0:
+            island_self_subtraction[position] = (
+                island_signal / math.sqrt(island_variance)
+            ) / math.sqrt(island_unfiltered)
+
     return CcfBudget(
         ccf_snr=ccf_snr,
         ccf_snr_photon_limited=ccf_snr_photon_limited,
@@ -839,6 +1033,8 @@ def matched_filter_ccf(
         template_weights=weights,
         admitted_mask=admitted_mask,
         noise_weights=scattered_noise_weights,
+        island_channel_counts=island_channel_counts,
+        island_self_subtraction_factors=island_self_subtraction,
     )
 
 
@@ -909,20 +1105,44 @@ def ccf_vs_rv(
     than a theorem.
 
     **The pseudoinverse has a closed form here, so this stays O(n) per trial.**
-    ``H = I - S`` with ``S`` row-stochastic and irreducible, so by
-    Perron-Frobenius its unit eigenvalue is simple and ``null(H) = span{1}``
-    exactly. Hence ``range(H^T) = 1-perp``, and maximizing
-    ``(a.P)^2 / (t a^T diag(v) a)`` over ``a = H^T w`` in that subspace gives
+    ``H`` is block diagonal over the admitted islands (see `_islands`), and each
+    block is ``I - S`` with ``S`` row-stochastic and irreducible, so by
+    Perron-Frobenius each block's unit eigenvalue is simple. Hence ``null(H)``
+    is the span of the **island indicator vectors** -- not the single global
+    constant -- and ``range(H^T)`` is its orthogonal complement. Maximizing
+    ``(a.P)^2 / (t a^T diag(v) a)`` over that subspace is one Lagrange
+    constraint *per island*:
 
     ```text
-    a_i = m_i (T_i - lambda) / v_i,   lambda = sum_i m_i T_i/v_i / sum_i m_i/v_i,
+    a_i = m_i (T_i - lambda_k) / v_i   for channel i in island k,
+    lambda_k = sum_{i in k} m_i T_i/v_i / sum_{i in k} m_i/v_i,
     CCF(rv) = sqrt(t) * (a . R_obs) / sqrt(a^T diag(v) a),
     ```
 
     with ``R_obs`` the observed planet-plus-leak rate. No eigendecomposition and
     no dense matrix: ``a`` is the raw template inverse-variance weighted with a
-    variance-weighted mean removed, which is precisely "blind to the constant
-    mode and nothing else". A test pins this against the dense ``C_y^+`` form.
+    variance-weighted mean removed island by island, which is precisely "blind
+    to the per-island constant modes and nothing else". A test pins this against
+    the dense ``C_y^+`` form.
+
+    **How it is evaluated, and why not the obvious way.** Writing the offset out
+    gives an equivalent pair-difference form that the implementation uses
+    instead,
+
+    ```text
+    a_i = u_i (T_i - T_ref) - (u_i / s_k) sum_{j in k} u_j (T_j - T_ref),
+    u = 1/v,   s_k = sum_{j in k} u_j,   ref = the largest-u channel of island k,
+    ```
+
+    which differs in two ways that matter. A template constant on an island
+    gives ``T_i - T_ref = 0`` *exactly*, so such an island contributes exactly
+    nothing rather than a rounding residue that normalization would amplify into
+    an O(1) score; no threshold is needed, and none is applied, so genuine
+    structure on a faint island survives beside a bright one. And every product
+    is formed with `math.frexp` exponent bookkeeping, so a variance span wider
+    than float64's exponent range -- ``5e-324`` beside ``1e308``, where ``1/v``
+    overflows and no single normalization of ``u`` can hold both ends -- yields
+    the correct antisymmetric filter instead of a NaN.
 
     **What changed and why.** This previously paired ``w = diag(v)^-1 Ttilde``
     weights with the ``C_y`` denominator ``sqrt(w^T H diag(v) H^T w)``. Those
@@ -938,13 +1158,16 @@ def ccf_vs_rv(
     **Caveat, and it is a real one.** Whitening by the filtered covariance
     necessarily undoes whatever suppression ``H`` applied, because the filter
     attenuated signal and noise together and the ratio is restored. The optimum
-    is blind only to the constant mode, so unlike `matched_filter_ccf` -- which
-    keeps its fixed-template weights on purpose, and with them the boxcar's
-    suppression of smooth leak structure -- this scan is not protected against a
-    non-constant leak continuum. That is the price of a peak guarantee, and it
-    is why the two statistics differ: this one *locates* the radial velocity,
-    `matched_filter_ccf` *scores* the detection. Do not read this score as the
-    detection SNR.
+    is blind only to the per-island constant modes, so unlike
+    `matched_filter_ccf` -- which keeps its fixed-template weights on purpose,
+    and with them the boxcar's suppression of smooth leak structure -- this scan
+    is not protected against a non-constant leak continuum. The two statistics
+    are therefore not comparable in either direction: neither bounds the other
+    (``P = [1,2,1]`` under ``L = [9,8,9]`` is flat in total, so this scan reads
+    0.0 where the detection statistic reads 0.258, and a structured leak can
+    push this one far above). Do not read this score as the detection SNR, and
+    do not read its argmax as a radial velocity without checking
+    `rv_leak_contamination` first.
 
     Unrecognized keyword arguments are ignored so that the same ``mf_kwargs``
     mapping can be forwarded to both this function and `matched_filter_ccf`.
@@ -958,93 +1181,275 @@ def ccf_vs_rv(
     if not math.isfinite(integration_time_s) or integration_time_s < 0.0:
         raise ValueError("integration_time_s must be finite and non-negative")
 
-    n_ch = data_channels.n_channels
-    keep = _telluric_mask(
-        n_ch, telluric_transmission_per_channel, telluric_mask_threshold
+    analysis = _RvAnalysis.build(
+        data_channels,
+        continuum_filter_width_channels=continuum_filter_width_channels,
+        telluric_transmission_per_channel=telluric_transmission_per_channel,
+        telluric_mask_threshold=telluric_mask_threshold,
     )
-    variance_rate = data_channels.total_rate_hz()
-    admitted = _analysis_indices(keep, variance_rate)
-    observed = (data_channels.planet_rate_hz + data_channels.leak_rate_hz)[admitted]
-    variance_admitted = variance_rate[admitted]
-    sqrt_time = math.sqrt(integration_time_s)
-    bypassed = int(continuum_filter_width_channels) <= 0
-
     values = np.zeros(rv_array.size, dtype=np.float64)
-    if admitted.size == 0:
+    if analysis is None:
         return values
 
-    islands = _islands(admitted)
-    # Inverse variances scaled by sqrt(min*max) rather than the maximum: the
-    # maximum overflows the ratio outright for a span like 1e-308 to 1e308,
-    # while the geometric mean lands both ends inside the representable range.
-    rate_scale = math.sqrt(float(np.min(variance_admitted))) * math.sqrt(
-        float(np.max(variance_admitted))
-    )
-    inverse_variance = rate_scale / variance_admitted
-    island_inverse_totals = [
-        float(inverse_variance[block].sum()) for block in islands
+    observed = (data_channels.planet_rate_hz + data_channels.leak_rate_hz)[
+        analysis.admitted
     ]
-    v_max = float(np.max(variance_admitted))
-    sqrt_v_max = math.sqrt(v_max)
     observed_scale = float(np.max(np.abs(observed)))
     if observed_scale <= 0.0:
         return values
+    sqrt_time = math.sqrt(integration_time_s)
 
     for index, rv in enumerate(rv_array):
         trial = channels_at_trial_rv_fn(float(rv))
         _require_same_grid(trial, data_channels, rv)
-        template = trial.planet_rate_hz[admitted]
-        template_scale = float(np.max(np.abs(template)))
-        if template_scale <= 0.0:
+        filter_vector = analysis.filter_vector(
+            trial.planet_rate_hz[analysis.admitted]
+        )
+        if filter_vector is None:
             continue
-        template = template / template_scale
-        residual = np.empty_like(template)
-        if bypassed:
-            # H = I has no null space, so there is no zero-sum constraint and no
-            # mean to remove: the optimum is the plain inverse-variance
-            # weighting. Applying the constraint here would be wrong, and for a
-            # single admitted channel it silently returns zero.
-            residual = template
-            filter_vector = inverse_variance * template
-        else:
-            # H is block diagonal over islands, so null(H) is spanned by the
-            # per-island indicators: the constraint is a zero sum on EACH
-            # island, and the mean to subtract is per island too.
-            filter_vector = np.empty_like(template)
-            for block, total in zip(islands, island_inverse_totals, strict=True):
-                weights_block = inverse_variance[block]
-                offset = (
-                    float(np.sum(weights_block * template[block])) / total
-                    if total > 0.0
-                    else 0.0
-                )
-                residual[block] = template[block] - offset
-                filter_vector[block] = weights_block * residual[block]
-        # Guard on the TEMPLATE residual, not the weighted one. A template
-        # constant on every island leaves only rounding residue after the mean
-        # is subtracted, and normalizing by that would amplify 1-ulp noise into
-        # an O(1) score. Testing the weighted vector instead would wrongly
-        # reject a real signal whenever the inverse variances span widely, since
-        # the largest weighted entry can sit on a channel whose residual is zero.
-        if float(np.max(np.abs(residual))) <= 1e-12:
-            continue
-        filter_scale = float(np.max(np.abs(filter_vector)))
-        if filter_scale <= 0.0:
-            continue
-        filter_vector = filter_vector / filter_scale
         # Normalize the variance and the observation inside their sums: at
         # v ~ 1e308 the plain sum of f^2 v overflows and the score collapses to
         # -0.0 on a representable answer.
         norm = math.sqrt(
-            float(np.sum(filter_vector * filter_vector * (variance_admitted / v_max)))
+            float(
+                np.sum(
+                    filter_vector
+                    * filter_vector
+                    * (analysis.variance_admitted / analysis.variance_max)
+                )
+            )
         )
         if norm <= 0.0:
             continue
         numerator = float(np.sum(filter_vector * (observed / observed_scale)))
         values[index] = (
-            sqrt_time * (observed_scale / sqrt_v_max) * (numerator / norm)
+            sqrt_time
+            * (observed_scale / math.sqrt(analysis.variance_max))
+            * (numerator / norm)
         )
     return values
+
+
+def rv_leak_contamination(
+    trial_planet_rate_hz: NDArray[np.float64],
+    *,
+    data_channels: ChannelSpectra,
+    leak_rate_hz_per_channel: NDArray[np.float64],
+    continuum_filter_width_channels: int,
+    telluric_transmission_per_channel: NDArray[np.float64] | None = None,
+    telluric_mask_threshold: float = 0.0,
+    **_ignored: object,
+) -> float:
+    """How much of the RV score a leak could contribute, relative to the planet.
+
+    `ccf_vs_rv` peaks where the trial template best matches the *observed*
+    spectrum, so its argmax is the planet's radial velocity only when the leak
+    contributes little to the score. This is the size of that term:
+
+    ```text
+    contamination = |a . L| / |a . P_trial|,
+    ```
+
+    with ``a`` the whitened filter `ccf_vs_rv` builds for ``trial_planet_rate_hz``
+    and ``L`` the leak spectrum on the same channel grid. It is the ratio of the
+    leak's contribution to the score's numerator to the planet's, at one trial
+    velocity -- the term that shifts the peak, in the units of the term that
+    should set it. Well below 1 means the scan is measuring the planet; at or
+    above 1 the peak location is not evidence about the radial velocity.
+
+    ``L`` is passed separately from ``data_channels`` on purpose: a pipeline
+    that subtracts a bright-port-measured leak mean before correlating has no
+    leak left in its observation, and the honest question there is what the
+    score would suffer if that subtraction were imperfect. Pass the leak
+    spectrum the subtraction is meant to remove, and read the result as the
+    contamination at 100% subtraction error; scale it by the fractional error
+    for a realistic figure.
+
+    Returns ``inf`` when the planet term vanishes (no filter, or a template the
+    filter is blind to): a score with no planet content in it cannot localize
+    anything.
+    """
+    analysis = _RvAnalysis.build(
+        data_channels,
+        continuum_filter_width_channels=continuum_filter_width_channels,
+        telluric_transmission_per_channel=telluric_transmission_per_channel,
+        telluric_mask_threshold=telluric_mask_threshold,
+    )
+    if analysis is None:
+        return math.inf
+    template = np.asarray(trial_planet_rate_hz, dtype=np.float64)
+    if template.shape != (data_channels.n_channels,):
+        raise ValueError(
+            "trial_planet_rate_hz must have one entry per channel, got shape "
+            f"{template.shape} for {data_channels.n_channels} channels"
+        )
+    leak = np.asarray(leak_rate_hz_per_channel, dtype=np.float64)
+    if leak.shape != template.shape:
+        raise ValueError(
+            "leak_rate_hz_per_channel must have one entry per channel, got "
+            f"shape {leak.shape} for {data_channels.n_channels} channels"
+        )
+    filter_vector = analysis.filter_vector(template[analysis.admitted])
+    if filter_vector is None:
+        return math.inf
+
+    planet_admitted = template[analysis.admitted]
+    leak_admitted = leak[analysis.admitted]
+    planet_scale = float(np.max(np.abs(planet_admitted)))
+    leak_scale = float(np.max(np.abs(leak_admitted)))
+    planet_term = abs(
+        float(np.sum(filter_vector * (planet_admitted / planet_scale)))
+        if planet_scale > 0.0
+        else 0.0
+    )
+    leak_term = abs(
+        float(np.sum(filter_vector * (leak_admitted / leak_scale)))
+        if leak_scale > 0.0
+        else 0.0
+    )
+    if planet_term == 0.0 or planet_scale <= 0.0:
+        return math.inf
+    if leak_term == 0.0:
+        return 0.0
+    return _scaled_product((leak_term, leak_scale), (planet_term, planet_scale))
+
+
+@dataclass(frozen=True, eq=False)
+class _RvAnalysis:
+    """The channel set, islands, and inverse variances the RV scan works on.
+
+    Built once per observation and reused across trial velocities, which is
+    what keeps the scan ``O(n)`` per trial. The inverse variances are carried as
+    ``(mantissa, exponent2)`` pairs rather than floats: ``1/v`` overflows on its
+    own for a subnormal ``v``, and the pair-difference filter needs products of
+    a huge ``u`` with a tiny one, which no single normalization can hold.
+    """
+
+    admitted: NDArray[np.intp]
+    variance_admitted: NDArray[np.float64]
+    variance_max: float
+    islands: list[slice]
+    bypassed: bool
+    inverse_mantissa: NDArray[np.float64]
+    inverse_exponent: NDArray[np.int32]
+    island_references: list[int]
+    island_totals: list[tuple[float, int]]
+
+    @classmethod
+    def build(
+        cls,
+        data_channels: ChannelSpectra,
+        *,
+        continuum_filter_width_channels: int,
+        telluric_transmission_per_channel: NDArray[np.float64] | None,
+        telluric_mask_threshold: float,
+    ) -> _RvAnalysis | None:
+        """Return the analysis set, or ``None`` when no channel is admitted."""
+        keep = _telluric_mask(
+            data_channels.n_channels,
+            telluric_transmission_per_channel,
+            telluric_mask_threshold,
+        )
+        variance_rate = data_channels.total_rate_hz()
+        admitted = _analysis_indices(keep, variance_rate)
+        if admitted.size == 0:
+            return None
+        variance_admitted = variance_rate[admitted]
+        islands = _islands(admitted)
+        inverse_mantissa, inverse_exponent = _reciprocal_split(variance_admitted)
+        references: list[int] = []
+        totals: list[tuple[float, int]] = []
+        for block in islands:
+            # Largest inverse variance = smallest variance; comparing v avoids
+            # having to order the (mantissa, exponent) pairs by hand.
+            references.append(block.start + int(np.argmin(variance_admitted[block])))
+            totals.append(
+                _sum_split(inverse_mantissa[block], inverse_exponent[block])
+            )
+        return cls(
+            admitted=admitted,
+            variance_admitted=variance_admitted,
+            variance_max=float(np.max(variance_admitted)),
+            islands=islands,
+            bypassed=int(continuum_filter_width_channels) <= 0,
+            inverse_mantissa=inverse_mantissa,
+            inverse_exponent=inverse_exponent,
+            island_references=references,
+            island_totals=totals,
+        )
+
+    def filter_vector(
+        self, template_admitted: NDArray[np.float64]
+    ) -> NDArray[np.float64] | None:
+        """The whitened filter ``a`` for one trial template, up to a positive scale.
+
+        Returned normalized to ``max|a| ~ 1``; the statistic is a ratio in
+        ``a``, so the scale is free. ``None`` when the filter is identically
+        zero -- an all-zero template, or a template constant on every island,
+        which the filter genuinely cannot see.
+        """
+        template = np.asarray(template_admitted, dtype=np.float64)
+        template_scale = float(np.max(np.abs(template)))
+        if template_scale <= 0.0:
+            return None
+        template = template / template_scale
+
+        size = template.size
+        term_mantissa = np.zeros(size, dtype=np.float64)
+        term_exponent = np.zeros(size, dtype=np.int32)
+        offset_mantissa = np.zeros(size, dtype=np.float64)
+        offset_exponent = np.zeros(size, dtype=np.int32)
+
+        if self.bypassed:
+            # H = I has no null space, so there is no zero-sum constraint and no
+            # mean to remove: the optimum is the plain inverse-variance
+            # weighting. Applying the constraint here would be wrong, and for a
+            # single admitted channel it silently returns zero.
+            mantissa, exponent = np.frexp(template)
+            term_mantissa = self.inverse_mantissa * mantissa
+            term_exponent = self.inverse_exponent + exponent
+        else:
+            for block, reference, (total_mantissa, total_exponent) in zip(
+                self.islands,
+                self.island_references,
+                self.island_totals,
+                strict=True,
+            ):
+                delta = template[block] - template[reference]
+                mantissa, exponent = np.frexp(delta)
+                block_mantissa = self.inverse_mantissa[block] * mantissa
+                block_exponent = self.inverse_exponent[block] + exponent
+                term_mantissa[block] = block_mantissa
+                term_exponent[block] = block_exponent
+                weighted_mantissa, weighted_exponent = _sum_split(
+                    block_mantissa, block_exponent
+                )
+                if weighted_mantissa == 0.0 or total_mantissa == 0.0:
+                    continue
+                # u_i / s_k is at most 1 by construction, so it materializes
+                # safely even when u_i itself does not.
+                share = _shifted(
+                    self.inverse_mantissa[block] / total_mantissa,
+                    self.inverse_exponent[block],
+                    total_exponent,
+                )
+                offset_mantissa[block] = -(share * weighted_mantissa)
+                offset_exponent[block] = weighted_exponent
+
+        largest: int | None = None
+        for mantissa, exponent in (
+            (term_mantissa, term_exponent),
+            (offset_mantissa, offset_exponent),
+        ):
+            nonzero = mantissa != 0.0
+            if bool(np.any(nonzero)):
+                candidate = int(np.max(exponent[nonzero]))
+                largest = candidate if largest is None else max(largest, candidate)
+        if largest is None:
+            return None
+        return _shifted(term_mantissa, term_exponent, largest) + _shifted(
+            offset_mantissa, offset_exponent, largest
+        )
 
 
 @dataclass(frozen=True, eq=False)
@@ -1074,7 +1479,13 @@ class CcfContrastSolution:
         ``V_sys`` (counts^2). Independent of ``c`` in both regimes, which is
         what keeps the root closed-form.
     template_weights:
-        ``w_i`` frozen at zero contrast, zero where masked or ``v0_i = 0``.
+        ``w_i = Ptilde1_i / v0_i`` frozen at zero contrast, zero on masked
+        channels. **Not** zero where ``v0_i = 0``: those channels are where the
+        frozen weight diverges, and the limit taken there (see
+        `ccf_contrast_at_target_snr`) puts the whole weighting on them, leaving
+        the finite-variance channels at zero instead. Only channels with
+        neither variance nor template signal, and telluric-masked ones, are
+        excluded outright.
     """
 
     contrast_at_target_snr: float
@@ -1215,13 +1626,35 @@ def ccf_contrast_at_target_snr(
     value as optimistic at the percent level, or refine it with a single
     `matched_filter_ccf` evaluation at the returned contrast.
 
+    **Noiseless channels.** A channel with ``v0_i = 0`` and ``P1_i > 0`` is not
+    empty here, though it is for `matched_filter_ccf`: at contrast ``c`` its
+    variance is ``c P1_i``, which the ``c C2`` term already carries. Its frozen
+    weight diverges, so the weighting is taken in the limit ``v0 -> 0``, where
+    those channels dominate completely and the finite-variance channels drop to
+    zero weight. The *variance* sums keep every admitted channel:
+    ``u = H^T w`` spreads onto the island's ordinary neighbours and ``B2``
+    collects their photons. Island membership is decided on "has variance or
+    has template signal", never on ``v0``, so a noiseless channel between two
+    ordinary ones stays in their island -- ``P1 = [0,1,0]`` against
+    ``v0 = [1,0,1]`` at width 3 and ``n = 5, t = 1`` solves to
+    ``c = 25.4903810567...``, matching the same problem solved at
+    ``v0[1] = 1e-6, 1e-12, 1e-100``.
+
     Raises ``ValueError`` if ``A <= 0``: a template with no surviving line
-    structure (a lineless planet spectrum, or one whose lines all fall in
-    masked channels) has no contrast at which it reaches the target, and
+    structure (a lineless planet spectrum, one whose lines all fall in masked
+    channels, or one that is flat on every island so that ``H P1`` is pure
+    rounding residue) has no contrast at which it reaches the target, and
     reporting ``inf`` would silently poison a contrast curve. Also raises
-    ``ValueError`` -- not ``OverflowError`` -- if ``V_sys`` or the contrast root
-    is not representable in float64, so a caller sweeping separation anchors has
-    a single exception type to catch per anchor.
+    ``ValueError`` -- not ``OverflowError`` -- if the contrast root is not
+    representable in float64, so a caller sweeping separation anchors has a
+    single exception type to catch per anchor.
+
+    ``systematic_var_counts`` is a *diagnostic*, and it saturates to ``inf``
+    rather than aborting the solve: the root needs ``sqrt(V_sys)/t``, in which
+    the exposure cancels analytically, so a ``V_sys`` too large to represent
+    does not make the root unreachable. ``P1 = 1e10, L = 1e170, eps = 1`` at
+    ``t = 1e200`` returns ``c = 5e160`` with ``systematic_var_counts = inf``,
+    and that is deliberate.
     """
     arrays = _validate_rate_arrays(
         planet_rate_hz_per_channel_unit_contrast=(
@@ -1256,50 +1689,37 @@ def ccf_contrast_at_target_snr(
     # own shot noise -- the c*C2 term the quadratic already carries. Only
     # v0 = 0 AND P1 = 0 is genuinely empty.
     #
-    # Where any admitted channel has v0 = 0 the frozen weight P1tilde/v0
-    # diverges, and in the limit those channels dominate the statistic
-    # completely. Taking that limit: the true weight is P1tilde/(c P1), whose
-    # c cancels out of the scale-invariant statistic, so the analysis restricts
-    # to the zero-variance set weighted by P1tilde/P1, with B2 = 0 and the
-    # whole variance carried by C2. For a single channel at width 0 this gives
-    # c = n^2 C2 / (A^2 t) = 25 at n = 5, t = 1, which is the exact answer.
-    noiseless_signal = (variance_rate_zero_contrast <= 0.0) & (planet_unit > 0.0)
-    if np.any(keep & noiseless_signal):
-        admitted = np.flatnonzero(keep & noiseless_signal)
-        solve_variance = planet_unit  # v = c P1; the c cancels by scale invariance
-    else:
-        admitted = _analysis_indices(keep, variance_rate_zero_contrast)
-        solve_variance = variance_rate_zero_contrast
+    # Island topology is decided here, on "has any content at all", and never
+    # on v0. A noiseless channel sitting between two ordinary ones belongs to
+    # their island: it is adjacent in wavelength, and the continuum filter is a
+    # statement about wavelength adjacency, not about noise. Splitting it out
+    # into a singleton (which the previous version did) gave that island H = 0
+    # and raised "no template signal" on a problem whose answer is an ordinary
+    # number -- P1 = [0,1,0] against v0 = [1,0,1] at width 3 solves to
+    # c = 25.4903810567..., the limit of the same solve as v0[1] -> 0.
+    informative = (variance_rate_zero_contrast > 0.0) | (planet_unit > 0.0)
+    admitted = np.flatnonzero(keep & informative)
     if admitted.size == 0:
         raise ValueError(
             "no template signal survives: every channel is telluric-masked or "
-            "has zero variance, so no channel is admitted and no contrast "
-            "reaches the target SNR"
+            "has neither variance nor template signal, so no channel is "
+            "admitted and no contrast reaches the target SNR"
         )
     planet_admitted = planet_unit[admitted]
-    variance_admitted = solve_variance[admitted]
-    # True when the zero-variance branch above fired: v0 is zero on every
-    # admitted channel, so B2 vanishes and the root is purely self-noise
-    # limited.
-    self_noise_only = not np.shares_memory(
-        solve_variance, variance_rate_zero_contrast
-    )
+    variance_admitted = variance_rate_zero_contrast[admitted]
 
     # Accumulate the coefficients on NORMALIZED arrays. Forming A, B2 and C2
     # from the raw rates over/underflows on inputs whose root is perfectly
     # representable: P1 ~ 1e-200 against a 1e100 leak flushes A to zero,
     # P1 ~ 1e200 overflows C2, and a 1e-200 leak overflows w^2 while B2 is being
-    # built. Three scales keep every intermediate in range:
+    # built. Two linear scales and one power of two keep every intermediate in
+    # range:
     #
-    #   alpha = max|P1|                 -> |p| <= 1
-    #   beta  = sqrt(min v0 * max v0)   -> vv within sqrt(span) of 1
-    #   gamma = max|ptilde/vv|          -> |w_hat| <= 1
+    #   alpha = max|P1|            -> |p| <= 1
+    #   beta  = max v0             -> normalized variance <= 1
+    #   2^G   = max|ptilde/v0|     -> |w_hat| <= 1  (G an exact integer)
     #
-    # beta is the geometric mean, not the maximum: normalizing by the maximum
-    # drives the small end subnormal whenever v0 spans more than ~1e300, which
-    # is reachable (1e-10 against 1e308) and silently yields NaN. The geometric
-    # mean splits the span so both ends sit within sqrt(span) of 1. With
-    # kappa = (alpha/beta) gamma the scales come back out analytically,
+    # With kappa = alpha 2^G the scales come back out analytically,
     #
     #   A = kappa alpha A'',        B2 = kappa^2 beta B2'',
     #   C2 = kappa^2 alpha C2'',    B_w = kappa beta B_w'',
@@ -1312,39 +1732,75 @@ def ccf_contrast_at_target_snr(
             "no template signal survives continuum filtering and telluric "
             "masking (A <= 0), so no contrast reaches the target SNR"
         )
-    scale_rate = float(np.max(variance_admitted))
+    # All-noiseless problems have max v0 = 0; the normalization is then free
+    # (B2 and the leak are identically zero) and 1.0 keeps the divisions valid.
+    scale_rate = float(np.max(variance_admitted)) or 1.0
     normalized_planet = planet_admitted / scale_planet
     normalized_variance = variance_admitted / scale_rate
 
     islands = _islands(admitted)
-    planet_unit_filtered = _filtered_blockwise(
-        normalized_planet, continuum_filter_width_channels, islands
+    planet_unit_filtered = _zero_roundoff_islands(
+        _filtered_blockwise(
+            normalized_planet, continuum_filter_width_channels, islands
+        ),
+        normalized_planet,
+        islands,
     )
     leak_filtered = _filtered_blockwise(
         leak[admitted] / scale_rate, continuum_filter_width_channels, islands
     )
-    # Weights in LOG space. Dividing ptilde by the normalized variance
-    # overflows whenever v0 spans more than the exponent range -- 5e-324
-    # against 1e308 is a span of 1e631, and no single linear scale can bring
-    # both ends inside float64 (the geometric mean only halves the span). The
-    # logarithm halves the *exponent*, and subtracting the maximum before
-    # exponentiating means the argument is never positive, so |w_hat| <= 1
-    # whatever the span; negligible channels underflow to zero, which is the
-    # right answer for them.
-    with np.errstate(divide="ignore"):
-        log_weights = np.log(np.abs(planet_unit_filtered)) - np.log(
-            variance_admitted
+    # Where an admitted channel has v0 = 0 the frozen weight P1tilde/v0
+    # diverges, and in the limit those channels dominate the weighting
+    # completely -- every finite-variance channel's weight is smaller by a
+    # factor v0 -> 0 and drops out. Taking that limit: the true weight there is
+    # P1tilde/(c P1), whose c cancels out of the scale-invariant statistic, so
+    # the WEIGHTS restrict to the zero-variance set with denominator P1. The
+    # variance sums do not restrict: u = H^T w spreads onto the island's
+    # ordinary channels, and B2 = sum u^2 v0 collects their photons.
+    #
+    # The test is on the FILTERED template, not the raw one: a noiseless
+    # channel the filter cannot see carries zero weight in the limit too
+    # (P1tilde/(c P1) = 0 there), so it must not be allowed to displace the
+    # ordinary channels that can still see something.
+    dominant = (
+        (variance_admitted <= 0.0)
+        & (planet_admitted > 0.0)
+        & (planet_unit_filtered != 0.0)
+    )
+    if np.any(dominant):
+        weight_variance = np.where(dominant, planet_admitted, math.inf)
+    else:
+        weight_variance = np.where(
+            variance_admitted > 0.0, variance_admitted, math.inf
         )
-    if not np.any(np.isfinite(log_weights)):
+
+    # Weights with the power of two kept beside the mantissa. Dividing ptilde by
+    # the variance overflows whenever v0 spans more than the exponent range --
+    # 5e-324 against 1e308 is a span of 1e631, and no single linear scale can
+    # bring both ends inside float64. Subtracting the largest exponent before
+    # materializing bounds |w_hat| by ~1 whatever the span, and negligible
+    # channels underflow to zero, which is the right weight for them. The split
+    # is exact, so unlike accumulating logarithms it costs no precision at
+    # extreme magnitudes.
+    usable_weight = (weight_variance > 0.0) & np.isfinite(weight_variance)
+    weight_mantissa, weight_exponent = np.frexp(planet_unit_filtered)
+    variance_mantissa, variance_exponent = np.frexp(
+        np.where(usable_weight, weight_variance, 1.0)
+    )
+    weight_mantissa = np.where(
+        usable_weight, weight_mantissa / variance_mantissa, 0.0
+    )
+    weight_exponent = (weight_exponent - variance_exponent).astype(np.int32)
+    nonzero_weight = weight_mantissa != 0.0
+    if not bool(np.any(nonzero_weight)):
         raise ValueError(
             "no template signal survives continuum filtering and telluric "
             "masking (A <= 0), so no contrast reaches the target SNR"
         )
-    log_weight_scale = float(np.max(log_weights[np.isfinite(log_weights)]))
-    admitted_weights = np.sign(planet_unit_filtered) * np.exp(
-        log_weights - log_weight_scale
+    weight_scale_exponent = int(np.max(weight_exponent[nonzero_weight]))
+    admitted_weights = _shifted(
+        weight_mantissa, weight_exponent, weight_scale_exponent
     )
-    admitted_weights[~np.isfinite(admitted_weights)] = 0.0
 
     normalized_signal = float(np.sum(admitted_weights * planet_unit_filtered))
     if normalized_signal <= 0.0:
@@ -1359,10 +1815,8 @@ def ccf_contrast_at_target_snr(
     noise_weights = _filtered_adjoint_blockwise(
         admitted_weights, continuum_filter_width_channels, islands
     )
-    normalized_photon_var = (
-        0.0
-        if self_noise_only
-        else float(np.sum(noise_weights * noise_weights * normalized_variance))
+    normalized_photon_var = float(
+        np.sum(noise_weights * noise_weights * normalized_variance)
     )
     normalized_selfnoise = float(
         np.sum(noise_weights * noise_weights * normalized_planet)
@@ -1397,24 +1851,43 @@ def ccf_contrast_at_target_snr(
     except OverflowError:
         normalized_systematic = math.inf
 
-    # kappa = alpha * exp(log_weight_scale) is the physical weight scale. It can
-    # itself overflow while the root is fine, so the diagnostics are grouped to
-    # cancel the small factors first and only ever use `*` (which saturates to
-    # inf) rather than `**` (which raises).
-    weight_scale = scale_planet * math.exp(min(log_weight_scale, 709.0))
-    if log_weight_scale > 709.0:
-        weight_scale = math.inf
+    # kappa = alpha * 2^G is the physical weight scale, and it can overflow on
+    # its own while every reported quantity is representable: P1 = 1e-300
+    # against a 5e-324 leak puts 2^G at 2e323, yet the weight is 2.0e23 and
+    # A = B2 = 2.0e-277. So the diagnostics are never formed by materializing
+    # kappa and multiplying. Each is assembled in sign-and-exponent form by
+    # `_scaled_product`, which folds every factor's power of two into an integer
+    # and materializes once at the end -- the tiny planet scale cancels the huge
+    # weight scale before anything is rounded to inf or NaN.
+    weight_mantissa_scale, weight_planet_exponent = math.frexp(scale_planet)
     weights = np.zeros(n_ch, dtype=np.float64)
-    weights[admitted] = admitted_weights * weight_scale
-    signal_coefficient = (normalized_signal * weight_scale) * scale_planet
-    photon_var_zero_contrast = (normalized_photon_var * weight_scale) * (
-        weight_scale * scale_rate
+    weights[admitted] = _shifted(
+        admitted_weights * weight_mantissa_scale,
+        np.zeros(admitted.size, dtype=np.int32),
+        -(weight_scale_exponent + weight_planet_exponent),
     )
-    planet_selfnoise_coefficient = (normalized_selfnoise * weight_scale) * (
-        weight_scale * scale_planet
+    signal_coefficient = _scaled_product(
+        (normalized_signal, scale_planet, scale_planet),
+        exponent2=weight_scale_exponent,
     )
-    leak_scale = weight_scale * scale_rate
-    systematic_var_counts = (normalized_systematic * leak_scale) * leak_scale
+    photon_var_zero_contrast = _scaled_product(
+        (normalized_photon_var, scale_planet, scale_planet, scale_rate),
+        exponent2=2 * weight_scale_exponent,
+    )
+    planet_selfnoise_coefficient = _scaled_product(
+        (normalized_selfnoise, scale_planet, scale_planet, scale_planet),
+        exponent2=2 * weight_scale_exponent,
+    )
+    systematic_var_counts = _scaled_product(
+        (
+            normalized_systematic,
+            scale_planet,
+            scale_planet,
+            scale_rate,
+            scale_rate,
+        ),
+        exponent2=2 * weight_scale_exponent,
+    )
 
     # Solve the normalized quadratic. Substituting the scale relations above
     # into (A^2 t^2) c^2 - (n^2 t C2) c - n^2 (t B2 + V_sys) = 0 and dividing
@@ -1431,9 +1904,11 @@ def ccf_contrast_at_target_snr(
     # Both P and sqrt(Q) carry the same factor g = n/(alpha A''), and hypot is
     # homogeneous, so g factors out of the whole root. Keep it factored: g
     # overflows on its own for alpha ~ 1e-308 and underflows for a subnormal
-    # target, on roots that are perfectly representable either way. Multiply by
-    # n/A'' first and divide by alpha last, so the cancelling factors meet
-    # before the extreme one is applied.
+    # target, on roots that are perfectly representable either way. No fixed
+    # multiplication order rescues both ends -- `n * bracket` underflows to zero
+    # for n = 1e-163 against a 3.2e-172 bracket whose quotient by alpha = 1e-278
+    # is an ordinary 3.2e-57 -- so the closing product is assembled with
+    # exponent bookkeeping and materialized once.
     sqrt_time = math.sqrt(integration_time_s)
     linear_term = (
         target_snr * normalized_selfnoise / normalized_signal / integration_time_s
@@ -1446,9 +1921,9 @@ def ccf_contrast_at_target_snr(
     # nothing is squared and 2*sqrt(Q) is never formed, either of which would
     # overflow before the root does.
     bracket = 0.5 * linear_term + math.hypot(0.5 * linear_term, constant_term)
-    # Multiply by the bracket before dividing: a subnormal target snr loses its
-    # last bits to `target/A''` and returns 0 on a representable root.
-    contrast = ((target_snr * bracket) / normalized_signal) / scale_planet
+    contrast = _scaled_product(
+        (target_snr, bracket), (normalized_signal, scale_planet)
+    )
     if not math.isfinite(contrast) or contrast <= 0.0:
         raise ValueError(
             f"the contrast solution is not representable (got {contrast!r}) for "

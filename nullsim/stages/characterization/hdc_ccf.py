@@ -84,6 +84,7 @@ from nullsim.physics.hdc import (
     ccf_vs_rv,
     channelize,
     matched_filter_ccf,
+    rv_leak_contamination,
 )
 from nullsim.physics.spectra import (
     TemplateSpectrum,
@@ -293,7 +294,7 @@ class HdcCcfStage(BaseStage):
             planet_rv_kms=planet_rv_kms,
             mf_kwargs=mf_kwargs,
         )
-        rv_grid_kms, snr_vs_rv = _ccf_vs_rv(
+        rv_grid_kms, snr_vs_rv, rv_leak_contamination_value = _ccf_vs_rv(
             params=params,
             planet_rv_kms=planet_rv_kms,
             channels=channels,
@@ -371,6 +372,39 @@ class HdcCcfStage(BaseStage):
             "snr_vs_resolving_power_r": r_scan.astype(np.float64, copy=True),
             "snr_vs_rv": snr_vs_rv.astype(np.float64, copy=True),
             "snr_vs_rv_kms": rv_grid_kms.astype(np.float64, copy=True),
+            # |a . L| / |a . P| for the whitened RV filter at the scene
+            # velocity: the term that can move the scan's peak, over the term
+            # that should set it. NaN when no scan was run.
+            "rv_leak_contamination": float(rv_leak_contamination_value),
+            # The same ratio against the leak the observation actually retains.
+            # The scan runs on a bright-port-subtracted spectrum, so what is
+            # left is the null instability the rest of this stage already
+            # charges: a fraction eps_systematic of the leak, taken static (the
+            # no-fringe-tracking worst case). The verdict is graded on this,
+            # not on the raw ratio, because the raw ratio is the contamination
+            # of a subtraction that was never assumed to fail completely.
+            "rv_leak_contamination_effective": (
+                eps_systematic * float(rv_leak_contamination_value)
+            ),
+            "rv_scan_localization_valid": _rv_localization_valid(
+                eps_systematic * float(rv_leak_contamination_value)
+            ),
+            "rv_scan_localization_grade": _rv_localization_grade(
+                eps_systematic * float(rv_leak_contamination_value)
+            ),
+            # Per admitted island, in ascending wavelength. The global
+            # self_subtraction_factor is a photon-weighted average over
+            # islands whose retention can differ by a factor of 8 in either
+            # direction, so it describes none of them; a one-channel island
+            # retains nothing at all.
+            "ccf_island_channel_counts": budget.island_channel_counts.astype(
+                np.int64, copy=True
+            ),
+            "ccf_island_self_subtraction_factors": (
+                budget.island_self_subtraction_factors.astype(
+                    np.float64, copy=True
+                )
+            ),
             "integration_time_for_target_snr_s": _integration_time_for_target_snr_s(
                 budget=budget,
                 integration_time_s=float(params.integration_time_s),
@@ -462,18 +496,52 @@ class HdcCcfStage(BaseStage):
                 "matched filter for the filtered data y = H N under its own "
                 "covariance C_y = t H diag(v) H^T, "
                 "sqrt(t) * (a(rv) . R_obs) / sqrt(a^T diag(v) a) with "
-                "a_i = m_i (T_i(rv) - lambda) / v_i and lambda the "
-                "variance-weighted template mean -- the closed form of the "
-                "C_y-pseudoinverse optimum, since null(H) is exactly the "
-                "constant mode. Being a cosine under one inner product, it is "
-                "maximized where the template best matches the OBSERVED "
-                "spectrum, which is the true radial velocity only when the "
-                "filtered leak projection is negligible (a smooth leak); a "
-                "structured leak can move the peak. It is a LOCALIZATION "
-                "diagnostic and is NOT ccf_snr_photon_limited: whitening "
-                "undoes the continuum filter's suppression of smooth leak "
-                "structure, which the fixed-template detection statistic keeps "
-                "on purpose, so this score sits above the detection SNR."
+                "a_i = m_i (T_i(rv) - lambda_k) / v_i and lambda_k the "
+                "variance-weighted template mean of ISLAND k -- the closed "
+                "form of the C_y-pseudoinverse optimum, since null(H) is "
+                "spanned by the island indicator vectors (H is block diagonal "
+                "over the maximal runs of admitted channels, so there is one "
+                "Lagrange offset per island, not one global constant). Being a "
+                "cosine under one inner product, it is maximized where the "
+                "template best matches the OBSERVED spectrum, which is the "
+                "true radial velocity only when the leak's contribution to the "
+                "score is small; a structured leak can move the peak, by "
+                "-5.99 at the truth against 9.80 four channels away on the "
+                "physics-side counterexample. Read rv_leak_contamination and "
+                "rv_scan_localization_valid before reading the argmax as a "
+                "velocity. It is a LOCALIZATION diagnostic and is NOT "
+                "ccf_snr_photon_limited: whitening undoes the continuum "
+                "filter's suppression of smooth leak structure, which the "
+                "fixed-template detection statistic keeps on purpose. The two "
+                "are not comparable in either direction and neither bounds the "
+                "other -- a planet flat in total against its leak scores 1e-15 "
+                "here while detection reads 0.258."
+            ),
+            "rv_leak_contamination_model": (
+                "|a . L| / |a . P_template| for the whitened RV filter a at the "
+                "scene radial velocity: the leak's contribution to the score's "
+                "numerator over the planet's, i.e. the size of the term that "
+                "can shift the peak in units of the term that should set it. "
+                "The scan itself runs on a leak-mean-subtracted observation "
+                "(bright-port monitoring, standard HDC practice), so "
+                "rv_leak_contamination is the contamination at 100% "
+                "subtraction error -- an upper bound, and it is routinely "
+                "above 1 without meaning anything is wrong. "
+                "rv_leak_contamination_effective multiplies it by "
+                "eps_systematic, the fractional leak instability this stage "
+                "already charges as V_sys, which is the leak the subtraction "
+                "cannot remove; it is taken static, the no-fringe-tracking "
+                "worst case, with no averaging credit. "
+                "rv_scan_localization_grade cuts the EFFECTIVE value at 0.1 "
+                "('reliable') and 1.0 ('unreliable'), and "
+                "rv_scan_localization_valid is the grade being 'reliable'. "
+                "Those two cuts are CONVENTIONS, not derived bounds: no "
+                "theorem places the peak at the true velocity below either of "
+                "them. What they exist to catch is the physics-side "
+                "counterexample, true RV -5.99 against 9.80 four channels "
+                "away. "
+                "inf means the filter carries no planet content at all and the "
+                "scan localizes nothing; NaN means no scan was run."
             ),
             "source_model": (
                 "nullsim characterization.hdc_ccf: nullsim.physics.hdc "
@@ -583,6 +651,31 @@ _CCF_MODEL = (
 )
 
 
+# Cuts on |a . L| / |a . P|, the leak's share of the RV score's numerator.
+# Conventions, not derived bounds: below 0.1 the leak term is a 10% perturbation
+# on the term that sets the peak, which left the peak at the true velocity in
+# every probe we ran, but no theorem says it must. At or above 1 the leak can
+# dominate the numerator outright and the peak location is not evidence.
+_RV_CONTAMINATION_RELIABLE = 0.1
+_RV_CONTAMINATION_UNRELIABLE = 1.0
+
+
+def _rv_localization_grade(contamination: float) -> str:
+    """``reliable`` / ``marginal`` / ``unreliable`` / ``not evaluated``."""
+    if not math.isfinite(contamination):
+        return "unreliable" if contamination == math.inf else "not evaluated"
+    if contamination < _RV_CONTAMINATION_RELIABLE:
+        return "reliable"
+    if contamination < _RV_CONTAMINATION_UNRELIABLE:
+        return "marginal"
+    return "unreliable"
+
+
+def _rv_localization_valid(contamination: float) -> bool:
+    """True only for the ``reliable`` grade: the argmax is worth reading."""
+    return _rv_localization_grade(contamination) == "reliable"
+
+
 _REJECTED_NAN_KEYS: tuple[str, ...] = (
     "ccf_snr",
     "ccf_snr_photon_limited",
@@ -594,6 +687,8 @@ _REJECTED_NAN_KEYS: tuple[str, ...] = (
     "self_subtraction_factor",
     "n_effective_channels",
     "n_effective_lines",
+    "rv_leak_contamination",
+    "rv_leak_contamination_effective",
     "telluric_masked_fraction",
     "integration_time_for_target_snr_s",
     "resolving_power_used",
@@ -606,20 +701,33 @@ _REJECTED_NAN_KEYS: tuple[str, ...] = (
     "channel_band_coverage_fraction",
 )
 
-_REJECTED_EMPTY_ARRAY_KEYS: tuple[str, ...] = (
-    "ccf_channel_centers_um",
-    "ccf_channel_edges_um",
-    "ccf_planet_rate_hz_per_channel",
-    "ccf_leak_rate_hz_per_channel",
-    "ccf_sky_rate_hz_per_channel",
-    "ccf_variance_rate_hz_per_channel",
-    "template_weights_per_channel",
-    "snr_vs_resolving_power",
-    "snr_vs_resolving_power_photon_limited",
-    "snr_vs_resolving_power_r",
-    "snr_vs_rv",
-    "snr_vs_rv_kms",
-)
+# Every array key an accepted payload publishes, with the dtype it publishes it
+# in. A consumer must not have to know whether the optimizer succeeded to know
+# what keys exist: the schema is the same either way, and rejection empties the
+# arrays rather than dropping them. A behavioral test compares the two key sets.
+_REJECTED_EMPTY_ARRAY_KEYS: dict[str, np.dtype[Any]] = {
+    "ccf_channel_centers_um": np.dtype(np.float64),
+    "ccf_channel_edges_um": np.dtype(np.float64),
+    "ccf_planet_rate_hz_per_channel": np.dtype(np.float64),
+    "ccf_leak_rate_hz_per_channel": np.dtype(np.float64),
+    "ccf_sky_rate_hz_per_channel": np.dtype(np.float64),
+    "ccf_variance_rate_hz_per_channel": np.dtype(np.float64),
+    "template_weights_per_channel": np.dtype(np.float64),
+    "ccf_admitted_mask_per_channel": np.dtype(bool),
+    "noise_weights_per_channel": np.dtype(np.float64),
+    "ccf_island_channel_counts": np.dtype(np.int64),
+    "ccf_island_self_subtraction_factors": np.dtype(np.float64),
+    "snr_vs_resolving_power": np.dtype(np.float64),
+    "snr_vs_resolving_power_photon_limited": np.dtype(np.float64),
+    "snr_vs_resolving_power_r": np.dtype(np.float64),
+    "snr_vs_rv": np.dtype(np.float64),
+    "snr_vs_rv_kms": np.dtype(np.float64),
+    "coarse_wavelength_um": np.dtype(np.float64),
+    "coarse_bin_width_um": np.dtype(np.float64),
+    "coarse_stellar_rate_hz": np.dtype(np.float64),
+    "coarse_planet_throughput": np.dtype(np.float64),
+    "coarse_leak_fraction": np.dtype(np.float64),
+}
 
 
 def _rejected_payload(
@@ -638,12 +746,17 @@ def _rejected_payload(
         key: float("nan") for key in _REJECTED_NAN_KEYS
     }
     payload.update(
-        {key: np.empty(0, dtype=np.float64) for key in _REJECTED_EMPTY_ARRAY_KEYS}
+        {
+            key: np.empty(0, dtype=dtype)
+            for key, dtype in _REJECTED_EMPTY_ARRAY_KEYS.items()
+        }
     )
     payload.update(
         {
             "n_channels": 0,
             "n_channels_used": 0,
+            "rv_scan_localization_valid": False,
+            "rv_scan_localization_grade": "not evaluated",
             "upstream_spectro_component": spectro_name,
             "spectro_solution_accepted": False,
             "invalidity_reason": acceptance.reason,
@@ -1361,9 +1474,21 @@ def _ccf_vs_rv(
     channel_builder: _ChannelBuilder,
     resolving_power: float,
     mf_kwargs: dict[str, Any],
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
+    """The RV scan, its velocity grid, and the leak contamination of its peak.
+
+    The third return value is `nullsim.physics.hdc.rv_leak_contamination` at the
+    scene radial velocity: the size of the term that can move the peak off the
+    true velocity, relative to the planet term that should set it. The scan
+    correlates against a leak-subtracted observation (see below), so this is the
+    contamination at 100% subtraction error -- an upper bound, not a prediction.
+    """
     if params.rv_scan_points <= 1:
-        return (np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64))
+        return (
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.float64),
+            float("nan"),
+        )
 
     rv_grid = np.linspace(
         planet_rv_kms - float(params.rv_scan_halfwidth_kms),
@@ -1386,9 +1511,23 @@ def _ccf_vs_rv(
     def trial(rv_kms: float) -> ChannelSpectra:
         return channel_builder.channels(resolving_power, rv_kms, planet_only=True)
 
-    return rv_grid, ccf_vs_rv(
-        trial, rv_grid, data_channels=data_channels, **mf_kwargs
+    scan = ccf_vs_rv(trial, rv_grid, data_channels=data_channels, **mf_kwargs)
+    contamination = rv_leak_contamination(
+        trial(planet_rv_kms).planet_rate_hz,
+        data_channels=data_channels,
+        leak_rate_hz_per_channel=channels.leak_rate_hz,
+        **{
+            key: value
+            for key, value in mf_kwargs.items()
+            if key
+            in (
+                "continuum_filter_width_channels",
+                "telluric_transmission_per_channel",
+                "telluric_mask_threshold",
+            )
+        },
     )
+    return rv_grid, scan, contamination
 
 
 def _find_spectro_component(

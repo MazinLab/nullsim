@@ -13,6 +13,7 @@ from nullsim.physics.hdc import (
     channelize,
     continuum_filter,
     matched_filter_ccf,
+    rv_leak_contamination,
     snr_vs_resolving_power,
 )
 from nullsim.physics.spectra import constant_r_grid
@@ -1051,10 +1052,12 @@ def test_ccf_vs_rv_peak_survives_a_zero_filled_shifted_template():
 
 
 def test_ccf_vs_rv_matches_the_dense_pseudoinverse_statistic():
-    # The O(n) closed form must equal the literal C_y^+ statistic. H = I - S
-    # with S row-stochastic and irreducible, so null(H) = span{1} exactly and
-    # the pseudoinverse optimum over range(H^T) = 1-perp is the inverse-variance
-    # weighting with a variance-weighted mean removed.
+    # The O(n) closed form must equal the literal C_y^+ statistic. Nothing is
+    # masked here, so there is a single island and null(H) is span{1}; the
+    # pseudoinverse optimum over range(H^T) = 1-perp is then the
+    # inverse-variance weighting with a variance-weighted mean removed. (With a
+    # mask, null(H) is spanned by the island indicators and there is one
+    # removed mean per island -- covered by the island tests.)
     rng = np.random.default_rng(4)
     n, width = 24, 5
     planet = rng.uniform(0.0, 10.0, n)
@@ -1483,3 +1486,318 @@ def test_published_fields_reproduce_the_photon_variance():
     # The naive raw-grid adjoint disagrees, which is why u is published.
     naive = continuum_filter_adjoint(budget.template_weights, 5)
     assert not np.allclose(naive, budget.noise_weights)
+
+
+# --- Round 4: roundoff, island-local guards, and exponent bookkeeping --------
+
+
+@pytest.mark.parametrize(
+    ("planet_hz", "leak_hz", "time_s", "was"),
+    [
+        # Both cases scored an ordinary detection out of nothing but the
+        # boxcar's last-ulp error on a flat island: H P = [2.22e-16] * 3 and
+        # [1.42e-14] * 3 respectively, at magnitudes a real spectrograph sees.
+        (1.03, 100.0, 3600.0, 13.099246596246202),
+        (100.1, 1000.0, 1.0, 6.221889683422173),
+    ],
+)
+def test_flat_island_rounding_residue_is_not_a_detection(
+    planet_hz, leak_hz, time_s, was
+):
+    planet = np.full(3, planet_hz)
+    residue = continuum_filter(planet, 15)
+    # The residue is real and nonzero: this test would pass vacuously if the
+    # filter happened to annihilate the island exactly.
+    assert 0.0 < float(np.max(np.abs(residue))) < 1e-13 * planet_hz
+    assert was > 5.0  # what the unguarded statistic reported
+
+    budget = matched_filter_ccf(
+        _channels(planet, np.full(3, leak_hz)),
+        integration_time_s=time_s,
+        eps_systematic=0.0,
+        servo_bw_hz=100.0,
+        with_fringe_tracking=True,
+        continuum_filter_width_channels=15,
+        telluric_transmission_per_channel=None,
+        telluric_mask_threshold=0.0,
+    )
+    assert budget.ccf_snr == 0.0
+    assert budget.ccf_snr_photon_limited == 0.0
+    assert budget.signal_counts == 0.0
+    assert np.all(budget.template_weights == 0.0)
+    # An admitted island with zero weight, not an excluded one.
+    assert budget.n_channels_used == 3
+
+
+def test_a_real_line_on_a_narrow_island_still_scores():
+    # The scale-aware guard must not be a blanket "narrow islands are noise"
+    # rule: the same three channels with a genuine line come through.
+    planet = np.array([1.03, 1.06, 1.03])
+    budget = matched_filter_ccf(
+        _channels(planet, np.full(3, 100.0)),
+        integration_time_s=3600.0,
+        eps_systematic=0.0,
+        servo_bw_hz=100.0,
+        with_fringe_tracking=True,
+        continuum_filter_width_channels=15,
+        telluric_transmission_per_channel=None,
+        telluric_mask_threshold=0.0,
+    )
+    assert budget.ccf_snr > 0.1
+    assert np.count_nonzero(budget.template_weights) == 3
+
+
+def test_solver_rejects_a_template_that_is_flat_on_every_island():
+    # Same defect on the solver side: a flat template has no line structure, so
+    # there is no contrast at which it reaches the target. Rounding residue
+    # used to produce a finite, wildly optimistic answer instead.
+    with pytest.raises(ValueError, match="no template signal survives"):
+        ccf_contrast_at_target_snr(
+            np.full(5, 1.03),
+            np.full(5, 100.0),
+            np.zeros(5),
+            np.zeros(5),
+            **_solver_kwargs(continuum_filter_width_channels=15),
+        )
+
+
+def test_rv_scan_keeps_a_faint_island_beside_a_bright_one():
+    # The old guard tested the globally normalized template residual against an
+    # absolute 1e-12, so a 1e12 Hz island next to a 1 Hz one pushed the faint
+    # island's genuine residual to ~8e-13 and zeroed the whole trial. Islands
+    # are scaled and tested independently now -- and a flat island contributes
+    # exactly zero without any threshold, because the pair differences that
+    # build the filter are identically zero on it.
+    n = 7
+    planet = np.array([1e12, 1e12, 1e12, 0.0, 1.0, 1.0, 2.0])
+    telluric = np.array([1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0])
+    data = _channels(planet, np.zeros(n))
+    (both,) = ccf_vs_rv(
+        lambda _rv: _channels(planet, np.zeros(n)),
+        [0.0],
+        data_channels=data,
+        continuum_filter_width_channels=3,
+        telluric_transmission_per_channel=telluric,
+        telluric_mask_threshold=0.5,
+        integration_time_s=1.0,
+    )
+    # sqrt(0.4): the flat bright island contributes nothing, so the score is
+    # the faint island's own statistic, exactly as if it stood alone.
+    assert both == pytest.approx(math.sqrt(0.4), rel=1e-12)
+
+    faint = np.array([1.0, 1.0, 2.0])
+    alone_data = _channels(faint, np.zeros(3))
+    (alone,) = ccf_vs_rv(
+        lambda _rv: _channels(faint, np.zeros(3)),
+        [0.0],
+        data_channels=alone_data,
+        continuum_filter_width_channels=3,
+        integration_time_s=1.0,
+    )
+    assert both == pytest.approx(alone, rel=1e-12)
+
+
+def test_ccf_vs_rv_survives_a_variance_span_wider_than_the_exponent_range():
+    # v = [5e-324, 1e308]: 1/v overflows at the small end, and normalizing the
+    # inverse variances (linearly or in logs) underflows the large end to zero,
+    # which killed the pair product the answer is made of. The optimal filter
+    # here is antisymmetric, a = [-1, 1] up to scale, and the score is the
+    # difference of the two rates over the noisy channel's sigma.
+    planet = np.array([5e-324, 1e308])
+    data = _channels(planet, np.zeros(2))
+    (got,) = ccf_vs_rv(
+        lambda _rv: _channels(planet, np.zeros(2)),
+        [0.0],
+        data_channels=data,
+        continuum_filter_width_channels=3,
+        integration_time_s=1.0,
+    )
+    assert np.isfinite(got)
+    assert got == pytest.approx(1e154, rel=1e-12)
+
+
+def test_solver_mixes_noiseless_and_noisy_channels_in_one_island():
+    # P1 = [0,1,0] against v0 = [1,0,1]: the noiseless channel is adjacent in
+    # wavelength to two ordinary ones, so it belongs to their island and the
+    # width-3 filter sees all three. Splitting it into a singleton (H = 0) made
+    # this raise. The answer is the limit of the same solve as v0[1] -> 0.
+    planet_unit = np.array([0.0, 1.0, 0.0])
+    zeros = np.zeros(3)
+    solution = ccf_contrast_at_target_snr(
+        planet_unit,
+        np.array([1.0, 0.0, 1.0]),
+        zeros,
+        zeros,
+        **_solver_kwargs(
+            integration_time_s=1.0,
+            target_snr=5.0,
+            eps_systematic=0.0,
+            continuum_filter_width_channels=3,
+        ),
+    )
+    assert solution.contrast_at_target_snr == pytest.approx(
+        25.49038105676658, rel=1e-12
+    )
+    # Analytic check independent of the implementation: with the weight on the
+    # noiseless channel, u = H^T w spreads onto its two neighbours, so B2 is
+    # NOT zero -- that is the whole difference from the singleton treatment.
+    assert solution.photon_var_zero_contrast > 0.0
+
+    for floor in (1e-6, 1e-12, 1e-100):
+        nearby = ccf_contrast_at_target_snr(
+            planet_unit,
+            np.array([1.0, floor, 1.0]),
+            zeros,
+            zeros,
+            **_solver_kwargs(
+                integration_time_s=1.0,
+                target_snr=5.0,
+                eps_systematic=0.0,
+                continuum_filter_width_channels=3,
+            ),
+        )
+        assert nearby.contrast_at_target_snr == pytest.approx(
+            solution.contrast_at_target_snr, rel=1e-5
+        )
+
+
+def test_solver_diagnostics_survive_a_weight_scale_that_overflows():
+    # P1 = 1e-300 against a subnormal leak puts the weight scale at 2^1074, so
+    # materializing it turned every reported field into inf or NaN while the
+    # root itself was fine. Assembling each field in exponent form keeps them.
+    solution = ccf_contrast_at_target_snr(
+        np.array([1e-300]),
+        np.array([5e-324]),
+        np.zeros(1),
+        np.zeros(1),
+        **_solver_kwargs(
+            integration_time_s=1.0,
+            target_snr=5.0,
+            eps_systematic=0.0,
+            continuum_filter_width_channels=0,
+        ),
+    )
+    assert solution.contrast_at_target_snr == pytest.approx(2.5e301, rel=1e-12)
+    assert solution.template_weights[0] == pytest.approx(2.0240225e23, rel=1e-7)
+    assert solution.signal_coefficient == pytest.approx(2.0240225e-277, rel=1e-7)
+    # A = B2 whenever filtering is bypassed: both are sum w^2 v0 there.
+    assert solution.photon_var_zero_contrast == pytest.approx(
+        solution.signal_coefficient, rel=1e-12
+    )
+    assert solution.planet_selfnoise_coefficient == pytest.approx(
+        4.0966672e-254, rel=1e-7
+    )
+    assert solution.systematic_var_counts == 0.0
+
+
+def test_solver_survives_a_target_snr_that_underflows_the_bracket():
+    # n * bracket = 1e-163 * 3.2e-172 underflows to zero, yet dividing that
+    # product by alpha = 1e-278 gives an ordinary 3.2e-57. No fixed
+    # multiplication order fixes both ends; the exponents have to be carried.
+    solution = ccf_contrast_at_target_snr(
+        np.array([1e-278]),
+        np.array([1e-59]),
+        np.zeros(1),
+        np.zeros(1),
+        **_solver_kwargs(
+            integration_time_s=1e284,
+            target_snr=1e-163,
+            eps_systematic=0.0,
+            continuum_filter_width_channels=0,
+        ),
+    )
+    assert solution.contrast_at_target_snr == pytest.approx(
+        3.1622776601683793e-57, rel=1e-12
+    )
+    # The photon-limited root n / sqrt(A t) with A = P1^2 / L. A itself is
+    # 1e-497 and does not exist in float64, so the reference has to be written
+    # as n sqrt(L) / (P1 sqrt(t)) -- the same regrouping the implementation
+    # does, and the reason the reported signal_coefficient underflows to zero
+    # on a problem whose root is ordinary.
+    reference = 1e-163 * math.sqrt(1e-59) / 1e-278 / math.sqrt(1e284)
+    assert solution.contrast_at_target_snr == pytest.approx(reference, rel=1e-12)
+
+
+def test_island_retention_is_published_per_island():
+    # The global self-subtraction factor is a photon-weighted average over
+    # islands and hides a crippled short one behind healthy long ones. A
+    # 30-channel comb, a 3-channel island and a singleton, under width 15:
+    # 0.890 / 0.632 / 0.0 against a global 0.801.
+    n = 40
+    planet = np.zeros(n)
+    planet[0:30:5] = 5.0
+    planet[32:35] = np.array([1.0, 5.0, 1.0])
+    planet[37] = 5.0
+    telluric = np.ones(n)
+    telluric[30:32] = 0.0
+    telluric[35:37] = 0.0
+    telluric[38:40] = 0.0
+    budget = matched_filter_ccf(
+        _channels(planet, np.full(n, 100.0)),
+        integration_time_s=3600.0,
+        eps_systematic=0.0,
+        servo_bw_hz=100.0,
+        with_fringe_tracking=True,
+        continuum_filter_width_channels=15,
+        telluric_transmission_per_channel=telluric,
+        telluric_mask_threshold=0.5,
+    )
+    assert list(budget.island_channel_counts) == [30, 3, 1]
+    assert budget.island_self_subtraction_factors == pytest.approx(
+        [0.8901042833, 0.6316426774, 0.0], rel=1e-8
+    )
+    # The one-channel island contributes no signal at all: H = 0 on it.
+    assert budget.self_subtraction_factor == pytest.approx(0.8009767693, rel=1e-8)
+    assert budget.island_self_subtraction_factors[2] == 0.0
+    assert int(budget.island_channel_counts.sum()) == budget.n_channels_used
+
+
+def test_rv_leak_contamination_flags_the_case_that_moves_the_peak():
+    # The structured-leak counterexample: the true velocity scores -5.99 while
+    # a four-channel shift scores 9.80, because the filter is correlating
+    # against leak structure. The contamination diagnostic is what a consumer
+    # checks before believing an argmax.
+    rng = np.random.default_rng(17)
+    n = 12
+    planet = np.zeros(n)
+    planet[[2, 5, 9]] = 4.0
+    structured_leak = 40.0 * rng.uniform(0.4, 1.6, n)
+    smooth_leak = np.full(n, 40.0)
+    data_structured = _channels(planet, structured_leak)
+    data_smooth = _channels(planet, smooth_leak)
+    kwargs = dict(continuum_filter_width_channels=5, telluric_mask_threshold=0.0)
+
+    structured = rv_leak_contamination(
+        planet,
+        data_channels=data_structured,
+        leak_rate_hz_per_channel=structured_leak,
+        **kwargs,
+    )
+    smooth = rv_leak_contamination(
+        planet,
+        data_channels=data_smooth,
+        leak_rate_hz_per_channel=smooth_leak,
+        **kwargs,
+    )
+    # A smooth leak is annihilated by the zero-sum filter: nothing to shift the
+    # peak with. A structured one contributes more than the planet does.
+    assert smooth < 1e-12
+    assert structured > 1.0
+
+    # And the diagnostic tracks the failure it is meant to predict.
+    def trial(shift):
+        return lambda _rv: _channels(np.roll(planet, int(shift)), structured_leak)
+
+    scores = [
+        float(
+            ccf_vs_rv(
+                trial(shift),
+                [0.0],
+                data_channels=data_structured,
+                integration_time_s=1.0,
+                **kwargs,
+            )[0]
+        )
+        for shift in range(n)
+    ]
+    assert int(np.argmax(scores)) != 0  # the truth does not win

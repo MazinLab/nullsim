@@ -31,14 +31,20 @@
 # large but not absurd. A config wanting the averaging branch would have to
 # argue for both numbers.
 #
-# Achieved at 3600 s (run 20260809-150200, ~2 s wall clock):
+# Achieved at 3600 s (run 20260809-160535, ~2 s wall clock):
 #
 #   spectro band SNR       3.11   (S = 4.84e7, B = 1.56e10 counts,
 #                                  systematic_var = 2.43e14 counts^2)
-#   ccf_snr               31.29   -> HDC wins by 10.1x
+#   ccf_snr               31.29   -> HDC wins by 10.07x
 #   ccf_snr_photon_limited 70.22
-#   ccf_systematic_var / ccf_photon_var = 1.860e4 / 4946 = 3.76
-#   ccf_systematic_rejection = 0.025
+#   ccf_systematic_var / ccf_photon_var = 1.976e4 / 4895 = 4.04
+#   ccf_systematic_rejection = 0.026
+#   rv_leak_contamination 357.7, effective 0.358 -> localization "marginal"
+#
+# The header read 3.76 for the variance ratio until now; that number predates
+# the covariance and blockwise-island fixes and was never refreshed. Nothing in
+# the round-4 pass moved this config: ccf_snr, the band SNR and both variances
+# are bit-identical to the previous run.
 #
 # Read that rejection factor as one illustrative realization. It is
 # |sum w L~| / (sum |w| L) for ONE coherent scalar eps multiplying ONE smooth

@@ -356,3 +356,29 @@ def test_hdc_ccf_plot_renders_when_upstream_cannot_be_identified(
     assert (tmp_path / "plots" / "hdc_ccf.png") in hdc_ccf(
         collection, tmp_path, ("png",)
     )
+
+
+def test_rv_panel_warns_when_the_peak_is_not_a_velocity_measurement() -> None:
+    """A labelled peak reads as a measurement whether or not it is one.
+
+    The scan maximizes the match to the OBSERVED spectrum, so a leak the
+    continuum filter cannot remove moves the peak. When the stage grades the
+    localization as anything but reliable, the panel has to say so on its face.
+    """
+
+    payload = _payload()
+    payload["rv_leak_contamination"] = 3.5
+    payload["rv_leak_contamination_effective"] = 3.5
+    payload["rv_scan_localization_grade"] = "unreliable"
+    fig = plot_hdc_ccf(payload)
+    texts = [t.get_text() for t in fig.axes[3].texts]
+    assert any("unreliable" in t for t in texts)
+    assert any("3.5" in t for t in texts)
+    plt.close(fig)
+
+    payload["rv_scan_localization_grade"] = "reliable"
+    fig = plot_hdc_ccf(payload)
+    assert not [
+        t for t in fig.axes[3].texts if "may not be the true velocity" in t.get_text()
+    ]
+    plt.close(fig)

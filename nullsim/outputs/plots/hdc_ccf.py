@@ -365,6 +365,7 @@ def _plot_snr_vs_rv(ax: plt.Axes, payload: dict[str, Any]) -> None:
             markersize=6,
             label=f"peak {score[peak]:.3g} at {rv_kms[peak]:.3g} km/s",
         )
+    _annotate_rv_contamination(ax, payload)
     ax.set_xlabel("Trial radial velocity (km/s)")
     # Unbounded matched-filter score, not a correlation coefficient.
     ax.set_ylabel("Matched-filter detection statistic (sigma)")
@@ -372,6 +373,36 @@ def _plot_snr_vs_rv(ax: plt.Axes, payload: dict[str, Any]) -> None:
     ax.grid(True, alpha=0.22)
     if ax.get_legend_handles_labels()[0]:
         ax.legend(loc="best", fontsize=8.5)
+
+
+def _annotate_rv_contamination(ax: plt.Axes, payload: dict[str, Any]) -> None:
+    """Say on the panel when the peak is not evidence about the velocity.
+
+    The scan peaks where the template matches the *observation*, so a leak the
+    continuum filter cannot remove moves the peak. A rendered curve with a
+    labelled peak reads as a measurement whether or not it is one, which is
+    exactly the failure this annotation exists to prevent.
+    """
+    grade = payload.get("rv_scan_localization_grade")
+    if not isinstance(grade, str) or grade == "reliable":
+        return
+    contamination = payload.get("rv_leak_contamination")
+    detail = ""
+    if isinstance(contamination, (int, float)) and np.isfinite(contamination):
+        detail = f" (|a.L|/|a.P| = {float(contamination):.3g})"
+    elif contamination == float("inf"):
+        detail = " (no planet content in the filter)"
+    ax.text(
+        0.5,
+        0.02,
+        f"RV localization {grade}{detail}:\npeak may not be the true velocity",
+        transform=ax.transAxes,
+        ha="center",
+        va="bottom",
+        fontsize=8,
+        color="#8c1a1a",
+        bbox={"facecolor": "#fdecec", "edgecolor": "#8c1a1a", "alpha": 0.85},
+    )
 
 
 def _variance_rate_per_channel(
