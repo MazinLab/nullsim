@@ -12,6 +12,7 @@ from nullsim.physics.spectra import (
     doppler_shift,
     interp_to_grid,
     load_template_csv,
+    provenance_number,
     resample_flux_conserving,
 )
 
@@ -219,3 +220,28 @@ def test_convolve_leaves_a_constant_flat_away_from_the_edges():
     sigma_samples = 20_000.0 / (2000.0 * 2.0 * np.sqrt(2.0 * np.log(2.0)))
     margin = int(np.ceil(8.0 * sigma_samples)) + 1
     assert out[margin:-margin] == pytest.approx(3.0, rel=1e-9)
+
+
+def test_provenance_number_does_not_confuse_a_key_with_its_suffix():
+    # The reason the two resolving powers are separate keys at all: a naive
+    # substring search for "resolving_power" happily matches
+    # "sampling_resolving_power" and hands back the grid density where the
+    # line-spread function was meant -- three times too optimistic here.
+    provenance = (
+        "kind: albedo; sampling_resolving_power: 90000; "
+        "lsf_resolving_power: 30000; samples_per_fwhm: 3"
+    )
+    assert provenance_number(provenance, "lsf_resolving_power") == 30000.0
+    assert provenance_number(provenance, "sampling_resolving_power") == 90000.0
+    # A bare "resolving_power" key is genuinely absent from this header and
+    # must read as absent rather than borrowing one of its namesakes.
+    assert provenance_number(provenance, "resolving_power") is None
+
+
+def test_provenance_number_reads_a_key_at_the_start_of_the_string():
+    assert provenance_number("resolving_power: 30000; kind: albedo", "resolving_power") == 30000.0
+
+
+def test_provenance_number_returns_none_for_missing_or_unparsable_values():
+    assert provenance_number("kind: albedo", "lsf_resolving_power") is None
+    assert provenance_number("lsf_resolving_power: none", "lsf_resolving_power") is None

@@ -1,10 +1,10 @@
 # Systematics-dominated companion to `hdc_ccf_smoke.toml`: the case where
 # cross-correlation actually buys something. The smoke config is photon
 # limited, and there the matched filter LOSES to the broadband band SNR
-# (ccf_snr 70.49 against band 387.41) -- correctly, because it throws away
+# (ccf_snr 69.90 against band 387.41) -- correctly, because it throws away
 # most of the planet's photons to isolate the lines. Here the leaked
 # starlight carries a quasi-static instability. It costs the band a factor
-# 125 and the CCF a factor 2.1, and that asymmetry is the whole point.
+# 125 and the CCF a factor 2.2, and that asymmetry is the whole point.
 #
 # The only changes from the smoke config are two knobs, set identically on
 # `characterization.spectro` and `performance.standard`:
@@ -31,18 +31,18 @@
 # large but not absurd. A config wanting the averaging branch would have to
 # argue for both numbers.
 #
-# Achieved at 3600 s (run 20260807-164521, ~2 s wall clock):
+# Achieved at 3600 s (run 20260809-125851, ~2 s wall clock):
 #
 #   spectro band SNR       3.11   (S = 4.84e7, B = 1.56e10 counts,
 #                                  systematic_var = 2.43e14 counts^2)
-#   ccf_snr               33.10   -> HDC wins by 10.7x
-#   ccf_snr_photon_limited 70.49
-#   ccf_systematic_var / ccf_photon_var = 1.757e4 / 4969 = 3.54
-#   ccf_systematic_rejection = 0.026
+#   ccf_snr               32.04   -> HDC wins by 10.3x
+#   ccf_snr_photon_limited 69.90
+#   ccf_systematic_var / ccf_photon_var = 1.860e4 / 4946 = 3.76
+#   ccf_systematic_rejection = 0.025
 #
 # Read that rejection factor as one illustrative realization. It is
 # |sum w L~| / (sum |w| L) for ONE coherent scalar eps multiplying ONE smooth
-# leak spectrum: the continuum filter keeps 2.6% of what the band SNR
+# leak spectrum: the continuum filter keeps 2.5% of what the band SNR
 # swallows whole. There is no chromatic-speckle covariance model behind it. A
 # perturbation with structure at the line scale would project onto the
 # template differently -- possibly much more strongly, possibly less -- and

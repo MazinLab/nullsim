@@ -69,7 +69,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -93,6 +92,7 @@ from nullsim.physics.spectra import (
     doppler_shift,
     load_template_csv,
     packaged_spectrum_path,
+    provenance_number,
     resample_flux_conserving,
 )
 from nullsim.pipeline import (
@@ -125,7 +125,6 @@ _DEFAULT_PLANET_RV_KMS = 30.0
 _R_SCAN_MIN = 100.0
 _R_SCAN_MAX = 30_000.0
 _STELLAR_TEMPLATE_BY_TYPE = {"G": "G", "K": "K", "M": "M"}
-_RESOLVING_POWER_RE = re.compile(r"resolving_power\s*:\s*([0-9.eE+]+)")
 
 
 @register_stage
@@ -1724,16 +1723,26 @@ def _load_cropped(
 
 
 def _template_resolving_power(spectrum: TemplateSpectrum) -> float:
-    """Read the snapshot's own resolving power out of its provenance header."""
+    """Read the snapshot's *content* resolving power from its header.
 
-    match = _RESOLVING_POWER_RE.search(spectrum.provenance)
-    if match is None:
+    ``lsf_resolving_power`` is the width of the line-spread function the
+    samples carry, which is what every content decision downstream needs: how
+    far the R scan may run, and whether the template has to be degraded before
+    it is laid on the analysis grid. It is deliberately not the sampling
+    density -- that is a property of the grid and is measured from the grid.
+
+    Snapshots written before the two were separated carry a single
+    ``resolving_power`` key that meant both at once; those are read as content
+    resolution, which is what the key was documented to be.
+    """
+
+    provenance = spectrum.provenance
+    value = provenance_number(provenance, "lsf_resolving_power")
+    if value is None:
+        value = provenance_number(provenance, "resolving_power")
+    if value is None or not (value > 0.0):
         return math.inf
-    try:
-        value = float(match.group(1))
-    except ValueError:
-        return math.inf
-    return value if value > 0.0 else math.inf
+    return value
 
 
 def _shape_on_grid(

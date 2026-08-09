@@ -19,6 +19,7 @@ Pure numpy/scipy: no TOML, ``SimulationState``, or stage imports.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -30,7 +31,7 @@ from scipy.ndimage import gaussian_filter1d
 C_KMS: float = 299792.458
 """Speed of light in km/s."""
 
-_KINDS = frozenset({"albedo", "transmission", "stellar_flux"})
+_KINDS = frozenset({"albedo", "transmission", "stellar_flux", "sky_radiance"})
 
 _TRANSMISSION_TOL = 1e-9
 
@@ -52,9 +53,9 @@ class TemplateSpectrum:
     values:
         Spectrum values on ``wavelength_um``. Interpretation is set by ``kind``.
     kind:
-        One of ``"albedo"``, ``"transmission"``, ``"stellar_flux"``.
-        ``"transmission"`` values are constrained to ``[0, 1]``; the others
-        must be non-negative.
+        One of ``"albedo"``, ``"transmission"``, ``"stellar_flux"``,
+        ``"sky_radiance"``. ``"transmission"`` values are constrained to
+        ``[0, 1]``; the others must be non-negative.
     provenance:
         Free-form origin string (model, snapshot date, citation).
     """
@@ -107,6 +108,8 @@ _PACKAGED_SPECTRA: dict[str, str] = {
     "m": "stellar_m2v.csv",
     "maunakea": "telluric_maunakea.csv",
     "armazones": "telluric_armazones.csv",
+    "maunakea_radiance": "sky_radiance_maunakea.csv",
+    "armazones_radiance": "sky_radiance_armazones.csv",
 }
 
 
@@ -115,12 +118,19 @@ def packaged_spectrum_path(name: str) -> Path:
 
     Names are case-insensitive:
 
-    - ``"earth"``, ``"venus"`` -- disk-integrated *apparent albedo* spectra at
+    - ``"earth"``, ``"venus"`` -- disk-integrated *reflected* albedo at
       quadrature phase (spectral shape; the absolute level is approximate and
-      is not the zero-phase geometric albedo).
+      is not the zero-phase geometric albedo). Each is a single homogeneous
+      atmospheric column integrated over the illuminated disk, so neither
+      carries clouds or any other horizontal structure: ``"earth"`` is a
+      clear-column endmember, not a representative Earth.
     - ``"G"``, ``"K"``, ``"M"`` -- PHOENIX stellar photon-flux shapes with
       arbitrary normalization.
-    - ``"maunakea"``, ``"armazones"`` -- telluric transmission snapshots.
+    - ``"maunakea"``, ``"armazones"`` -- total line-of-sight telluric
+      transmission snapshots.
+    - ``"maunakea_radiance"``, ``"armazones_radiance"`` -- sky radiance from
+      airglow and atmospheric thermal emission at the same sites, in absolute
+      ph/s/m2/um/arcsec2. Packaged and loadable; no stage reads them yet.
 
     Every file carries a full provenance header; read it before using the
     values for anything but their spectral shape. Raises ``KeyError`` listing
@@ -204,6 +214,28 @@ def load_template_csv(path: Path, kind: str | None = None) -> TemplateSpectrum:
         kind=resolved_kind,
         provenance="; ".join(provenance_parts),
     )
+
+
+def provenance_number(provenance: str, key: str) -> float | None:
+    """Read a numeric ``key: value`` entry out of a provenance string.
+
+    `load_template_csv` joins the header comments with ``"; "``, so the entries
+    survive as ``key: value`` fragments. The match is anchored on a word
+    boundary that excludes ``_``, which is the whole point: a bare substring
+    search for ``resolving_power`` also matches ``sampling_resolving_power``,
+    and reading a snapshot's grid density where its line-spread function was
+    meant is exactly the confusion this pair of keys exists to prevent.
+
+    Returns ``None`` when the key is absent or its value does not parse.
+    """
+    pattern = rf"(?:^|[^A-Za-z0-9_]){re.escape(key)}\s*:\s*([-+0-9.eE]+)"
+    match = re.search(pattern, provenance)
+    if match is None:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
 
 
 def constant_r_grid(

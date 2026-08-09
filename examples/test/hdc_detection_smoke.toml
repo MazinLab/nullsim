@@ -36,13 +36,13 @@
 # compares two curves describing the same observation. An explicit value that
 # disagreed would be refused rather than reconciled.
 #
-# Achieved (run 20260807-192153, ~3.6 s wall clock), at every anchor:
+# Achieved (run 20260809-125855, ~3.6 s wall clock), at every anchor:
 #
-#   ccf_contrast_gain      7.538   with the two knobs below
+#   ccf_contrast_gain      7.483   with the two knobs below
 #   ccf_contrast_gain      0.163   with them removed (photon limited)
 #
-# The switch costs the broadband curve a factor 62.6 at 10 mas (2.43e-6 ->
-# 1.52e-4) and the CCF curve only a factor 1.35 (1.49e-5 -> 2.01e-5). That
+# The switch costs the broadband curve a factor 62.5 at 10 mas (2.43e-6 ->
+# 1.52e-4) and the CCF curve only a factor 1.36 (1.49e-5 -> 2.03e-5). That
 # asymmetry is the entire result.
 #
 # The gain is the SAME at every anchor, and that is structural rather than a

@@ -319,17 +319,27 @@ Tests: `tests/outputs/test_outputs.py`, `test_end_to_end.py`, `test_paper.py`,
   overlays and calibration floors.
 - `nullsim/data/nayra_reference/*.json` — NAYRA E-ELT reference data
   (`calibration_time_J_M18.json`, `calibration_time_J_M36.json`).
-- `nullsim/data/spectra/*.csv` — HDC template snapshots on constant-R grids
-  (R = 30000, 0.5–1.8 um): planet albedos (`earth_albedo`, `venus_albedo`)
-  from the NASA Planetary Spectrum Generator, PHOENIX stellar photospheres
-  (`stellar_g2v`, `stellar_k2v`, `stellar_m2v`), and ESO SkyCalc telluric
-  transmission (`telluric_maunakea`, `telluric_armazones`). Each carries a
-  provenance header. `scripts/generate_hdc_spectra.py` regenerates all seven,
-  each from its own upstream: the two albedos from the PSG web API driven by
-  the frozen configs in `scripts/psg_config/*.cfg`, the photospheres from the
-  PHOENIX HiRes FITS archive, the tellurics from the SkyCalc REST service via
-  `skycalc_cli`. `characterization.hdc_ccf` declares the ones it reads as
-  `ExternalDependency` entries, so their bytes enter the run hash.
+- `nullsim/data/spectra/*.csv` — HDC template snapshots, 0.5–1.8 um, all on
+  one constant-R grid. Two resolving powers, kept distinct in the headers and
+  never conflated: `sampling_resolving_power` = 90000 (the grid, three samples
+  per FWHM) and `lsf_resolving_power` = 30000 (the content). Nine files:
+  reflected planet albedos (`earth_albedo`, `venus_albedo`) from the NASA
+  Planetary Spectrum Generator, PHOENIX stellar photospheres (`stellar_g2v`,
+  `stellar_k2v`, `stellar_m2v`), ESO SkyCalc total transmission
+  (`telluric_maunakea`, `telluric_armazones`), and SkyCalc sky radiance
+  (`sky_radiance_maunakea`, `sky_radiance_armazones`, airglow plus atmospheric
+  thermal emission; packaged and loadable, consumed by no stage yet).
+  `scripts/generate_hdc_spectra.py` regenerates all nine, each from its own
+  upstream: the albedos from the PSG web API driven by the frozen configs in
+  `scripts/psg_config/*.cfg` (which pin the entire `GENERATOR` block, because
+  PSG fills in anything omitted from its live defaults), the photospheres from
+  the PHOENIX HiRes FITS archive, transmission and radiance from the SkyCalc
+  REST service via `skycalc_cli`. `characterization.hdc_ccf` declares the ones
+  it reads as `ExternalDependency` entries, so their bytes enter the run hash.
+  Caveats that belong in the header and do: `earth_albedo` is a clear-column
+  Lambert disk with no clouds, not a representative Earth; `venus_albedo` is
+  reflected-only, its 1.7 um thermal emission measured and divided out;
+  Armazones is SkyCalc's native 3060 m site model and Maunakea is a proxy.
 
 Tests: `tests/catalogs/test_exoplanets.py` with
 `tests/catalogs/fixtures/sample_catalog.csv`.
