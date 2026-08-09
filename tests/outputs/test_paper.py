@@ -25,10 +25,6 @@ from nullsim.pipeline import Field, Geometry, Results, RunResult, SimulationStat
 from nullsim.pipeline import registry
 
 
-def test_output_paper_flag_loads() -> None:
-    assert _config().output.paper is True
-
-
 def test_write_paper_outputs_creates_bundle_manifest_and_core_figures(
     tmp_path: Path,
 ) -> None:

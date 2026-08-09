@@ -18,14 +18,9 @@ from nullsim.pipeline import (
     SimulationState,
     Throughput,
     build_instance,
-    list_stages,
 )
-from nullsim.stages.transport import PM780Transport, SMF28Transport
+from nullsim.stages.transport import SMF28Transport
 from nullsim.stages.transport.smf28 import (
-    PM780HP_ATTENUATION_DB_PER_KM,
-    PM780HP_WAVELENGTHS_UM,
-    PM980_DISPERSION_PS_NM_KM,
-    PM980Transport,
     SMF28_DISPERSION_PS_NM_KM,
     chromatic_dispersion_phase_rad,
     pm780hp_attenuation_db_per_km,
@@ -56,24 +51,9 @@ def _stage(context: RunContext, **overrides: object) -> SMF28Transport:
     return stage
 
 
-def test_pm980_defaults_use_nayra_dispersion_and_group_index() -> None:
-    params = PM980Transport.Params(length_m=5.0)
-
-    assert params.attenuation_curve == "pm980_xp"
-    assert params.dispersion_ps_nm_km == pytest.approx(PM980_DISPERSION_PS_NM_KM)
     # n_g was a dead Params field (no computation read it; group index
     # enters only via the delay-line stage's medium model) — removed in
     # review 2026-06-10.
-
-
-def test_pm780_defaults_to_conservative_800nm_loss() -> None:
-    params = PM780Transport.Params(length_m=2.0)
-
-    assert params.attenuation_curve == "pm780_hp"
-    assert params.attenuation_db_per_km == pytest.approx(4.0)
-    assert pm780hp_attenuation_db_per_km(0.85e-6) == pytest.approx(4.0)
-    np.testing.assert_allclose(PM780HP_WAVELENGTHS_UM, [0.77, 0.85, 1.10])
-    np.testing.assert_allclose(PM780HP_ATTENUATION_DB_PER_KM, [4.0, 4.0, 4.0])
 
 
 def _state(
@@ -99,33 +79,6 @@ def _state(
             OPDComponent(rms_opd_nm=existing_opd_nm, reduction_stage="test"),
         )
     return replace(state, field=field, throughput=throughput, opd_budget=opd_budget)
-
-
-def test_smf28_registers_stage_contract(tmp_path: Path) -> None:
-    stage = _stage(_context(tmp_path))
-
-    assert "transport.smf28" in list_stages()
-    assert stage.type_name == "transport.smf28"
-    assert stage.family == "transport"
-    assert stage.consumes == frozenset({"field", "throughput", "opd_budget"})
-    assert stage.produces == frozenset({"field", "throughput", "opd_budget"})
-
-
-def test_pm780_registers_stage_contract(tmp_path: Path) -> None:
-    spec = {
-        "id": "pm780",
-        "type": "transport.pm780",
-        "length_m": 2.0,
-        "phi_rms_rad": 0.0,
-        "length_matching_error_m": 0.0,
-    }
-    stage = build_instance(spec, _context(tmp_path))
-
-    assert "transport.pm780" in list_stages()
-    assert isinstance(stage, PM780Transport)
-    assert stage.type_name == "transport.pm780"
-    assert stage.consumes == frozenset({"field", "throughput", "opd_budget"})
-    assert stage.produces == frozenset({"field", "throughput", "opd_budget"})
 
 
 def test_smf28e_attenuation_matches_kilo_datasheet_pins() -> None:

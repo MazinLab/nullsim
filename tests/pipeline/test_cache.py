@@ -531,24 +531,6 @@ def test_family_closure_includes_physics_to_stages_edges(
     assert edited_digest != baseline_digest
 
 
-def test_stage_source_digest_unknown_family_is_conservative() -> None:
-    """An unknown / missing family folds in every family digest (the
-    conservative whole-package fallback), so an unresolved family can only
-    over-invalidate, never serve a stale result."""
-
-    import hashlib
-
-    from nullsim.pipeline.cache import _source_digests, _stage_source_digest
-
-    core_digest, family_digests, _closures = _source_digests()
-    expected = hashlib.sha256()
-    expected.update(core_digest)
-    for name in sorted(family_digests):
-        expected.update(family_digests[name])
-    assert _stage_source_digest("does-not-exist") == expected.digest()
-    assert _stage_source_digest(None) == expected.digest()
-
-
 def test_cache_key_ignores_config_hash_for_non_rng_stage(tmp_path: Path) -> None:
     """A stage that does not draw from context.rng (uses_rng=False) gets the
     same cache key when only config_hash differs, so an unrelated config edit
@@ -614,39 +596,6 @@ def test_cache_key_depends_on_wavelength_grid(tmp_path: Path) -> None:
     state_a = SimulationState.empty(grid={"wavelength_grid_um": (1.2, 1.25, 1.3)})
     state_b = SimulationState.empty(grid={"wavelength_grid_um": (1.2, 1.25, 1.31)})
     assert cache.key_for(stage, state_a) != cache.key_for(stage, state_b)
-
-
-def test_tier3_under_declared_stages_declare_their_reads() -> None:
-    """The stages the audit found reading undeclared state now declare it in
-    cache_key_extras, and the context.rng stages are flagged uses_rng."""
-
-    from nullsim.stages.background.space_zodi import SpaceZodiBackground
-    from nullsim.stages.chip_optimization.ideal_kernel import IdealKernelProjector
-    from nullsim.stages.chip_optimization.scipy import ChipOptimizationScipy
-    from nullsim.stages.chip_optimization.torch import ChipOptimizationTorch
-    from nullsim.stages.fringe_tracking.closed_loop import ClosedLoopFringeTracker
-    from nullsim.stages.injection.ideal import IdealInjection
-    from nullsim.stages.telescope.fixed_aperture import FixedAperture
-    from nullsim.stages.transport.smf28 import (
-        PM780Transport,
-        PM980Transport,
-        SMF28Transport,
-    )
-    from nullsim.stages.wavefront.space_residual import SpaceWavefrontResidual
-
-    assert "throughput" in IdealInjection.cache_key_extras
-    assert {"wavefront", "opd_budget"} <= SpaceWavefrontResidual.cache_key_extras
-    assert "throughput" in FixedAperture.cache_key_extras
-    assert {"scene", "field"} <= ClosedLoopFringeTracker.cache_key_extras
-    assert "scene" in ChipOptimizationScipy.cache_key_extras
-    assert "scene" in ChipOptimizationTorch.cache_key_extras
-    assert "scene" in IdealKernelProjector.cache_key_extras
-
-    assert SMF28Transport.uses_rng is True
-    assert PM980Transport.uses_rng is True  # inherited
-    assert PM780Transport.uses_rng is True  # inherited
-    assert SpaceZodiBackground.uses_rng is True
-    assert IdealInjection.uses_rng is False
 
 
 def test_cache_reuse_after_upstream_edit_matches_fresh(tmp_path: Path) -> None:

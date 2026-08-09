@@ -264,23 +264,6 @@ def test_backends_agree_on_broadband_kernel_objective_above_abs_floor(
     assert _agreement_ok(scipy_loss, torch_loss, rtol=1.0e-2, abs_floor=abs_floor)
 
 
-def test_kilo_clements_backends_agree_verbatim_xfail() -> None:
-    """Tripwire stub for the KILO ``TestClementsBackendsAgree`` reference.
-    Path: ``kilo/tests/test_chip_backends.py``,
-    commit ``47607de33e15b8cabdc0e3a4562a7abd98f582a2``. If this test ever
-    starts passing, a KILO kernel was bridged into nullsim.
-
-    Code Review 2026-05-16 Issue 47: ``pytest.xfail(...)`` as the first
-    statement short-circuited so the imports below NEVER ran — the
-    ``strict=True`` marker could never flip. Now uses ``importorskip``
-    so the missing-dep gate is the actual tripwire.
-    """
-
-    pytest.importorskip("torch")
-    pytest.importorskip("kilo.chip")
-    from kilo.chip import clements_to_unitary  # noqa: F401
-
-
 def test_torch_batched_clements_matches_single_builder() -> None:
     if not _torch_available():
         pytest.skip("torch unavailable")

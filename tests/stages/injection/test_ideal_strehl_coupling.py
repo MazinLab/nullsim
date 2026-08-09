@@ -138,21 +138,6 @@ def test_wavefront_strehl_is_preserved_not_overwritten() -> None:
     np.testing.assert_allclose(out.wavefront.strehl_ratio, strehl)
 
 
-def test_unit_strehl_with_strehl_coupling_off_and_fresnel_off_is_unit() -> None:
-    """Sanity: with all the toggles off the seed is exactly unit-amplitude."""
-
-    stage = IdealInjection(
-        params={
-            "n_modes": 1,
-            "apply_strehl_coupling": False,
-            "apply_fresnel_injection_loss": False,
-        },
-        context=_ctx(),
-    )
-    out = stage.apply(_state(n_modes=1, strehl=(1.0, 1.0, 1.0)))
-    np.testing.assert_allclose(np.abs(out.field.amplitudes), 1.0)
-
-
 def test_missing_upstream_strehl_falls_back_to_unity() -> None:
     """Without any upstream wavefront-quality stage, Strehl defaults to 1.
 

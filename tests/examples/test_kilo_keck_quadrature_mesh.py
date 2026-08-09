@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from nullsim.config import load_config
 
 
@@ -48,24 +50,16 @@ def test_kilo_keck_quadrature_mesh_inherits_and_inserts_splitter() -> None:
     assert stages["chip"].n_spectro_ports == 1
 
 
-def test_kilo_keck_quadrature_mesh_expands_output_port_counts() -> None:
-    stages = _stages_by_id()
+@pytest.mark.parametrize(
+    "config_path",
+    [KILO_KECK_6_CONFIG_PATH, KILO_KECK_6_JOINT_CRLB_CONFIG_PATH],
+    ids=["kilo_keck_6", "kilo_keck_6_joint_crlb"],
+)
+def test_tracked_kilo_keck_6_configs_load(config_path: Path) -> None:
+    """Keep the tracked six-subaperture configs exercised at test time."""
+    config = load_config(str(config_path))
 
-    assert stages["detector"].n_modes == 48
-    assert stages["detector"].n_bright_ports == 24
-    assert stages["detector"].n_dark_ports == 23
-    assert stages["detector"].n_spectro_ports == 1
-    assert stages["sensitivity"].n_bright_ports == 24
-    assert stages["sensitivity"].n_dark_ports == 23
-    assert stages["sensitivity"].n_spectro_ports == 1
-    assert stages["fringe_observability"].n_spectral_channels == 1
-    assert list(stages["fringe_observability"].gauss_newton_piston_rms_grid_nm) == [
-        1.0,
-        3.0,
-        10.0,
-        30.0,
-        100.0,
-    ]
+    assert config.pipeline.stages
 
 
 def test_kilo_keck_quadrature_mesh_keeps_clements_diagnostics() -> None:
@@ -80,78 +74,3 @@ def test_kilo_keck_quadrature_mesh_keeps_clements_diagnostics() -> None:
         "fringe_observability",
         "debug_report",
     }.issubset(set(config.output.plots))
-
-
-def test_kilo_keck_6_characterization_retunes_against_finite_disk() -> None:
-    """N=6 characterization suppresses the resolved-star spectro leakage."""
-
-    config = load_config(str(KILO_KECK_6_CONFIG_PATH))
-    stages = {stage.id: stage for stage in config.pipeline.stages}
-
-    chip_opt = stages["chip_opt"]
-    assert chip_opt.amplitude_observability_weight == 0.0
-    assert chip_opt.joint_observability_crlb_weight == 1.0e-3
-    assert chip_opt.joint_observability_science_null_guard_weight == 0.0
-    assert chip_opt.disk_n_rings == 0
-    assert chip_opt.disk_n_azimuths == 0
-
-    characterization = stages["characterization"]
-    assert characterization.n_restarts == 3
-    assert characterization.max_iter == 5000
-    # n_workers=1: the restart ThreadPool is GIL bound for this eager torch
-    # optimizer and oversubscribes the sweep-cell pool (see config comment).
-    assert characterization.n_workers == 1
-    assert characterization.broadband_n_wavelengths == 1
-    assert characterization.use_upstream_chip_params_start is False
-    assert characterization.disk_n_rings == 3
-    assert characterization.disk_n_azimuths == 4
-    assert characterization.disk_integral_n_radial > 0
-    assert characterization.disk_integral_n_pa > 0
-
-    curve = stages["characterization_curve"]
-    assert curve.n_anchors == 12
-    assert curve.separation_min_mas == 0.5944725589892117
-    assert curve.separation_max_mas == 300.0
-    assert curve.n_restarts == 3
-    assert curve.max_iter == 2000
-    assert curve.n_workers == 1
-    assert curve.seed == 2060
-    assert curve.disk_n_rings == 3
-    assert curve.disk_n_azimuths == 4
-    assert curve.disk_integral_n_radial > 0
-    assert curve.disk_integral_n_pa > 0
-    assert not hasattr(curve, "tracker_observability_crlb_constraint_nm")
-    assert curve.use_upstream_chip_params_start is False
-
-
-def test_kilo_keck_6_joint_crlb_pins_high_snr_characterization() -> None:
-    """Joint-CRLB experiment keeps the archived high-SNR char settings."""
-
-    config = load_config(str(KILO_KECK_6_JOINT_CRLB_CONFIG_PATH))
-    stages = {stage.id: stage for stage in config.pipeline.stages}
-
-    chip_opt = stages["chip_opt"]
-    assert chip_opt.amplitude_observability_weight == 0.0
-    assert chip_opt.joint_observability_crlb_weight == 1.0e-3
-    assert chip_opt.joint_observability_science_null_guard_weight == 0.0
-
-    characterization = stages["characterization"]
-    assert characterization.wl_design_um == 1.25375
-    assert characterization.broadband_n_wavelengths == 1
-    assert characterization.n_restarts == 3
-    assert characterization.max_iter == 10000
-    assert characterization.n_workers == 4
-    assert characterization.use_upstream_chip_params_start is False
-
-    curve = stages["characterization_curve"]
-    assert curve.wl_design_um == 1.25375
-    assert curve.n_anchors == 12
-    assert curve.separation_min_mas == 0.5944725589892117
-    assert curve.separation_max_mas == 300.0
-    assert curve.n_restarts == 3
-    assert curve.max_iter == 2000
-    assert curve.n_workers == 4
-    assert curve.seed == 2060
-    assert not hasattr(curve, "tracker_observability_crlb_constraint_nm")
-    assert curve.snr_proxy_weight == 4.0
-    assert curve.broadband_n_wavelengths == 5

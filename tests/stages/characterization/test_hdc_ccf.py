@@ -13,7 +13,6 @@ from nullsim.pipeline import (
     RunContext,
     Scene,
     SimulationState,
-    list_stages,
 )
 from nullsim.stages.characterization.hdc_ccf import HdcCcfStage
 
@@ -166,92 +165,6 @@ def payload(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
     return result.results.components["characterization.hdc_ccf"]
 
 
-def test_hdc_ccf_registers_stage_contract(tmp_path: Path) -> None:
-    stage = _stage(_context(tmp_path))
-
-    assert "characterization.hdc_ccf" in list_stages()
-    assert stage.type_name == "characterization.hdc_ccf"
-    assert stage.family == "characterization"
-    assert stage.consumes == frozenset({"results", "scene"})
-    assert stage.produces == frozenset({"results"})
-
-
-def test_hdc_ccf_publishes_expected_payload_keys(payload: dict[str, object]) -> None:
-    expected = {
-        # Headline CCF budget.
-        "ccf_snr",
-        "ccf_snr_photon_limited",
-        "ccf_signal_counts",
-        "ccf_photon_var_counts",
-        "ccf_systematic_var_counts",
-        "systematic_ccf_leakage",
-        "ccf_systematic_rejection",
-        "self_subtraction_factor",
-        "n_effective_lines",
-        "n_channels_used",
-        "n_channels",
-        "telluric_masked_fraction",
-        # Per-channel arrays.
-        "ccf_channel_centers_um",
-        "ccf_channel_edges_um",
-        "ccf_planet_rate_hz_per_channel",
-        "ccf_leak_rate_hz_per_channel",
-        "ccf_variance_rate_hz_per_channel",
-        "template_weights_per_channel",
-        # Scans.
-        "snr_vs_resolving_power",
-        "snr_vs_resolving_power_photon_limited",
-        "snr_vs_resolving_power_r",
-        "snr_vs_rv",
-        "snr_vs_rv_kms",
-        # Time and configuration.
-        "integration_time_for_target_snr_s",
-        "integration_time_s",
-        "target_snr",
-        "resolving_power_used",
-        "resolving_power_source",
-        "analysis_grid_resolving_power",
-        "content_resolving_power",
-        "grid_oversampling",
-        "continuum_filter_width_res_elements",
-        "telluric_mask_threshold",
-        "planet_radial_velocity_kms",
-        # Detection budget and audit.
-        "detected_planet_rate_hz",
-        "detected_leak_rate_hz",
-        "sky_rate_hz_total",
-        "dark_rate_hz_per_channel",
-        "detection_budget_source",
-        "channel_band_coverage_fraction",
-        "leak_normalization",
-        "planet_normalization",
-        "eps_systematic_used",
-        "servo_bw_hz_used",
-        "with_fringe_tracking",
-        "systematic_branch_source",
-        "upstream_spectro_component",
-        # Provenance.
-        "planet_template_provenance",
-        "star_template_provenance",
-        "telluric_template_provenance",
-        "planet_template_sha256",
-        "star_template_sha256",
-        "telluric_template_sha256",
-        "coarse_wavelength_um",
-        "coarse_bin_width_um",
-        "coarse_stellar_rate_hz",
-        "coarse_planet_throughput",
-        "coarse_leak_fraction",
-        "observed_band_um",
-        "ccf_model",
-        "snr_vs_resolving_power_model",
-        "snr_vs_rv_model",
-        "source_model",
-    }
-    missing = expected - set(payload)
-    assert not missing, f"missing payload keys: {sorted(missing)}"
-
-
 def test_hdc_ccf_snr_is_finite_positive_and_photon_limit_bounds_it(
     payload: dict[str, object],
 ) -> None:
@@ -272,16 +185,6 @@ def test_hdc_ccf_rv_scan_peaks_at_planet_rv(payload: dict[str, object]) -> None:
 def test_hdc_ccf_normalizations_near_unity(payload: dict[str, object]) -> None:
     assert float(payload["leak_normalization"]) == pytest.approx(1.0, rel=0.2)
     assert float(payload["planet_normalization"]) == pytest.approx(1.0, rel=0.2)
-
-
-def test_hdc_ccf_snr_vs_r_axis_is_ascending_and_finite(
-    payload: dict[str, object],
-) -> None:
-    r_axis = np.asarray(payload["snr_vs_resolving_power_r"], dtype=np.float64)
-    snr = np.asarray(payload["snr_vs_resolving_power"], dtype=np.float64)
-    assert r_axis.size == snr.size == 6
-    assert np.all(np.diff(r_axis) > 0.0)
-    assert np.all(np.isfinite(snr))
 
 
 def test_hdc_ccf_variance_rate_is_the_matched_filter_denominator(

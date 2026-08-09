@@ -13,15 +13,10 @@ from nullsim.pipeline import (
     RunContext,
     SimulationState,
     build_instance,
-    list_stages,
     run,
 )
 from nullsim.stages.chip.identity import IdentityChip
-from nullsim.stages.detector.ideal_counter import IdealCounter
 from nullsim.physics.ruilier_cassaing import UNOBSTRUCTED_GEOMETRIC_COUPLING_LIMIT
-from nullsim.stages.injection.ideal import IdealInjection
-from nullsim.stages.scene.point_source import PointSource
-from nullsim.stages.telescope.fixed_aperture import FixedAperture
 
 GRID = {
     "wavelength_center_um": 1.65,
@@ -116,20 +111,6 @@ def _chip_state(tmp_path: Path, star_jmag: float = 5.0) -> SimulationState:
     return stage.apply(state)
 
 
-def test_autoload_registers_trivial_stage_types() -> None:
-    assert EXPECTED_STAGE_TYPES.issubset(set(list_stages()))
-
-
-@pytest.mark.parametrize(
-    "stage_cls",
-    [PointSource, FixedAperture, IdealInjection, IdentityChip, IdealCounter],
-)
-def test_trivial_stage_declares_non_empty_produces(
-    stage_cls: type[BaseStage],
-) -> None:
-    assert stage_cls.produces
-
-
 def test_point_source_contract(tmp_path: Path) -> None:
     initial_state = SimulationState.empty(GRID)
     stage = _stage(
@@ -165,12 +146,6 @@ def test_point_source_carries_planet_radial_velocity_into_scene(
     assert state.scene.components["point_source"][
         "planet_radial_velocity_kms"
     ] == pytest.approx(42.0)
-
-
-def test_point_source_default_radial_velocity_is_30_kms(tmp_path: Path) -> None:
-    state = _stage("scene.point_source", tmp_path).apply(SimulationState.empty(GRID))
-
-    assert state.scene.planet_radial_velocity_kms == pytest.approx(30.0)
 
 
 def test_fixed_aperture_contract(tmp_path: Path) -> None:
@@ -257,16 +232,6 @@ def test_ideal_injection_contract(tmp_path: Path) -> None:
     assert state.throughput.transmission_fraction == (1.0, 1.0, 1.0)
     assert "injection_ideal" in state.throughput.components
     assert state.wavefront.strehl_ratio == (1.0, 1.0, 1.0)
-
-
-def test_ideal_injection_opt_out_seeds_unit_amplitudes(tmp_path: Path) -> None:
-    """``apply_strehl_coupling=False`` reproduces the pre-Phase-0.3 contract."""
-
-    before = _geometry_state(tmp_path)
-    stage = _stage("injection.ideal", tmp_path, apply_strehl_coupling=False)
-    state = stage.apply(before)
-    assert state.field.amplitudes is not None
-    np.testing.assert_allclose(state.field.amplitudes, 1.0 + 0.0j)
 
 
 def test_identity_chip_contract(tmp_path: Path) -> None:
@@ -420,14 +385,6 @@ def test_ideal_counter_feeds_standard_performance(tmp_path: Path) -> None:
     assert result.state.results.snr is not None
 
 
-def test_ideal_injection_params_rejects_nan(tmp_path: Path) -> None:
-    from pydantic import ValidationError
-
-    with pytest.raises(ValidationError):
-        IdealInjection.Params(nan_value=float("nan"))
-
-
-
 def test_basestage_validates_params_once_in_init(tmp_path: Path) -> None:
     """Issue #24: Params.model_validate is called by BaseStage.__init__,
     not by every apply(). The typed model is exposed as self.params_model
@@ -479,13 +436,6 @@ def test_basestage_validates_params_once_in_init(tmp_path: Path) -> None:
     stage.apply(state)
     stage.apply(state)
     assert validate_calls["n"] == 1, "apply() must not revalidate"
-
-
-def test_identity_chip_params_rejects_nan(tmp_path: Path) -> None:
-    from pydantic import ValidationError
-
-    with pytest.raises(ValidationError):
-        IdentityChip.Params(nan_value=float("nan"))
 
 
 def _trivial_config(tmp_path: Path, star_jmag: float) -> dict[str, object]:

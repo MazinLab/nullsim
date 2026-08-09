@@ -101,14 +101,6 @@ def _record(components: dict, run_dir: Path) -> RunRecord:
     )
 
 
-def test_plot_hdc_ccf_renders_four_panels() -> None:
-    fig = plot_hdc_ccf(_payload())
-
-    # Four panels plus the twinned axes on the spectrum and weight panels.
-    assert len(fig.axes) >= 6
-    plt.close(fig)
-
-
 def test_plot_hdc_ccf_title_carries_headline_scalars() -> None:
     fig = plot_hdc_ccf(_payload())
 

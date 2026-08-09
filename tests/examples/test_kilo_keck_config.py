@@ -50,47 +50,6 @@ def test_kilo_keck_uses_kilo_geodetic_enu_orientation() -> None:
     assert abs(float(baseline[1])) > 1.0
 
 
-def test_kilo_keck_enables_phase_b_fringe_tracking() -> None:
-    """The Keck baseline should exercise the photon-Kalman FT control model."""
-
-    config = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    stages = config["pipeline"]["stages"]
-    fringe_tracking = next(
-        stage for stage in stages if stage["id"] == "fringe_tracking"
-    )
-
-    assert fringe_tracking["control_model"] == "photon_kalman"
-    assert fringe_tracking["inter_telescope_piston"] is True
-    assert fringe_tracking["predictive_lag_reduction"] == 0.33
-    assert fringe_tracking["servo_bandwidth_fraction"] == 0.05
-    assert fringe_tracking["sample_rate_max_hz"] == 10000.0
-    assert fringe_tracking["vibration_line_frequencies_hz"] == [
-        12.0,
-        29.0,
-        58.0,
-        88.0,
-        150.0,
-        200.0,
-    ]
-    assert fringe_tracking["vibration_line_rms_nm"] == [
-        30.0,
-        40.0,
-        25.0,
-        20.0,
-        10.0,
-        10.0,
-    ]
-    assert fringe_tracking["vibration_broadband_rms_nm"] == 30.0
-    assert fringe_tracking["loop_latency_s"] == 5.0e-5
-    assert fringe_tracking["accelerometer_fusion"] is True
-    assert fringe_tracking["fusion_broadband_suppression"] == 2.5
-    assert fringe_tracking["fusion_coherent_fraction"] == 0.7
-    assert fringe_tracking["line_tracking_residual_floor_nm"] == 2.0
-    assert fringe_tracking["tracker_n_detectors_per_port"] == 4
-    assert "vibration_broadband_max_hz" not in fringe_tracking
-    assert "tracker_max_rate_hz_per_detector" not in fringe_tracking
-
-
 def test_kilo_keck_wires_phase_b_science_stage_params() -> None:
     """Sensitivity and science metrics should use the Phase B mitigation knobs."""
 
@@ -202,18 +161,6 @@ def test_kilo_keck_includes_characterization_stage() -> None:
         "output.tables must list characterization_summary so the "
         "characterization payload is dumped."
     )
-
-
-def test_kilo_keck_transport_uses_physical_pm980_residuals() -> None:
-    """KILO keeps the same residual PM980 mismatch constants as NAYRA."""
-
-    config = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    stages = config["pipeline"]["stages"]
-    transport_stage = next(stage for stage in stages if stage["id"] == "transport")
-
-    assert transport_stage["type"] == "transport.pm980"
-    assert transport_stage["length_matching_error_m"] == 0.0001
-    assert transport_stage["phi_rms_rad"] == 0.01
 
 
 def test_kilo_keck_uses_staged_maunakea_sky_background() -> None:

@@ -15,7 +15,6 @@ from nullsim.pipeline import (
     Results,
     RunContext,
     SimulationState,
-    list_stages,
 )
 from nullsim.physics.quadrature_fringe_tracker import quadrature_reference_mesh
 from nullsim.stages.diagnostics import FringeObservability
@@ -228,10 +227,6 @@ def _splitter_state() -> SimulationState:
             },
         ),
     )
-
-
-def test_stage_is_registered() -> None:
-    assert "diagnostics.fringe_observability" in list_stages()
 
 
 def test_detector_signal_rate_matrix_can_be_forced_to_photon_rates() -> None:

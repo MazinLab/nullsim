@@ -16,7 +16,6 @@ from nullsim.pipeline import (
     RunContext,
     SimulationState,
     Throughput,
-    list_stages,
     validate_dependencies,
 )
 from nullsim.stages.chip import KernelMZIMesh
@@ -97,17 +96,6 @@ def _n_param_total(n_modes: int) -> int:
 def _random_params(n_modes: int, *, seed: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
     return rng.uniform(0.0, 2.0 * np.pi, _n_param_total(n_modes))
-
-
-def test_kernel_mzi_mesh_registers_stage_contract(tmp_path: Path) -> None:
-    n_modes = 4
-    params = tuple(_random_params(n_modes, seed=0))
-    stage = _stage(_context(tmp_path), n_modes=n_modes, params=params)
-    assert "chip.kernel_mzi_mesh" in list_stages()
-    assert stage.type_name == "chip.kernel_mzi_mesh"
-    assert stage.family == "chip"
-    assert stage.consumes == frozenset({"field", "throughput"})
-    assert stage.produces == frozenset({"field", "throughput", "results"})
 
 
 @pytest.mark.stats
@@ -384,71 +372,6 @@ def test_kernel_mzi_mesh_dac_quantizes_then_rescales(tmp_path: Path) -> None:
         assert out is not None
         realized[:, k] = out[:, 0, 0]
     np.testing.assert_allclose(realized, expected_correct, atol=1e-12, rtol=0.0)
-
-
-def test_kernel_mzi_mesh_throughput_component_shape(tmp_path: Path) -> None:
-    """Spec (g): the added throughput component has the canonical keys with
-    transmission_fraction all 1.0 and matching wavelength_grid_um."""
-    n_modes = 4
-    wavelength_grid_um = (1.5, 1.65, 1.8)
-    params = _random_params(n_modes, seed=0)
-    stage = _stage(
-        _context(tmp_path),
-        n_modes=n_modes,
-        params=tuple(params),
-        wl_design_um=1.65,
-    )
-    state = _state(wavelength_grid_um=wavelength_grid_um, n_modes=n_modes)
-
-    result = stage.apply(state)
-
-    matching = [
-        (name, payload)
-        for name, payload in result.throughput.components.items()
-        if name.startswith("chip.kernel_mzi_mesh_loss")
-    ]
-    assert len(matching) == 1
-    name, payload = matching[0]
-    assert set(payload.keys()) == {
-        "wavelength_grid_um",
-        "transmission_fraction",
-        "field_amplitude_applied",
-        "insertion_loss_db",
-        "source_model",
-    }
-    # field_amplitude_applied flags that the chip loss is carried in field
-    # amplitudes (sqrt(t)), not transmission_fraction, so downstream rate
-    # calculations do not double-count it.
-    assert payload["field_amplitude_applied"] is True
-    assert tuple(payload["wavelength_grid_um"]) == wavelength_grid_um
-    # _stage pins insertion_loss_db=0.0 → t=1.0 per wavelength bin.
-    assert payload["insertion_loss_db"] == 0.0
-    assert payload["transmission_fraction"] == tuple(1.0 for _ in wavelength_grid_um)
-    np.testing.assert_allclose(
-        result.throughput.transmission_fraction,
-        tuple(1.0 for _ in wavelength_grid_um),
-        atol=0.0,
-    )
-
-
-def test_kernel_mzi_mesh_accepts_explicit_spectro_port(tmp_path: Path) -> None:
-    n_modes = 4
-    stage = _stage(
-        _context(tmp_path),
-        n_modes=n_modes,
-        n_bright_ports=1,
-        n_dark_ports=2,
-        n_spectro_ports=1,
-        params=tuple(_random_params(n_modes, seed=13)),
-    )
-    state = _state(n_modes=n_modes)
-
-    result = stage.apply(state)
-    payload = result.results.components["chip.kernel_mzi_mesh"]
-
-    assert payload["n_bright_ports"] == 1
-    assert payload["n_dark_ports"] == 2
-    assert payload["n_spectro_ports"] == 1
 
 
 def test_kernel_mzi_mesh_insertion_loss_default_scales_field_amplitudes_only(

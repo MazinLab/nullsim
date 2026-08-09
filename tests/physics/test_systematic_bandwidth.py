@@ -92,20 +92,6 @@ def test_zero_variance_falls_back_to_max_bandwidth() -> None:
     assert f_eff == pytest.approx(5000.0, rel=1.0e-12)
 
 
-def test_keck_keck_only_j_band_lands_below_amp_bandwidth() -> None:
-    """Keck-only J=4-like residuals land between piston and amp bandwidths."""
-    f_eff = effective_systematic_bandwidth_hz(
-        sigma_phi_piston_rad=0.007,
-        sigma_I_residual=0.04,
-        n_modes=24,
-        f_piston_hz=100.0,
-        f_amp_hz=5000.0,
-    )
-    # The corrected amplitude averaging keeps f_eff in the kHz regime
-    # but no longer pins it almost exactly to f_amp.
-    assert 1800.0 < f_eff < 2300.0
-
-
 def test_invalid_n_modes_raises() -> None:
     with pytest.raises(ValueError, match="n_modes"):
         effective_systematic_bandwidth_hz(

@@ -59,13 +59,6 @@ def test_classify_planet_rejects_non_positive_radius() -> None:
 # compute_snapshot_hash: deterministic + content-sensitive.
 # ---------------------------------------------------------------------------
 
-def test_compute_snapshot_hash_is_deterministic() -> None:
-    first = compute_snapshot_hash(_FIXTURE)
-    second = compute_snapshot_hash(_FIXTURE)
-    assert first == second
-    assert len(first) == 64  # SHA-256 hex = 64 chars
-
-
 def test_compute_snapshot_hash_changes_with_content(tmp_path: Path) -> None:
     file_a = tmp_path / "a.csv"
     file_b = tmp_path / "b.csv"

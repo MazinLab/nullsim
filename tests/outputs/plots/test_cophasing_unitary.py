@@ -11,7 +11,6 @@ from nullsim.outputs import RunCollection, RunRecord
 from nullsim.outputs.plots.cophasing_unitary import (
     _find_payload,
     cophasing_unitary,
-    plot_cophasing_unitary,
 )
 from nullsim.pipeline import Results, RunResult, SimulationState
 
@@ -38,12 +37,6 @@ def _payload() -> dict:
             "max_edge_opd_over_lambda": 0.18,
         },
     }
-
-
-def test_plot_cophasing_unitary_renders() -> None:
-    fig = plot_cophasing_unitary(_payload())
-
-    assert len(fig.axes) >= 6
 
 
 def test_find_payload_prefers_full_diagnostic_over_prepass() -> None:

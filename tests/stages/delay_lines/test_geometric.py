@@ -57,21 +57,6 @@ KILO_TRANSMISSION_ALT45_AZ90 = np.array(
 )
 
 
-def test_geometric_delay_lines_registers_stage_contract(tmp_path: Path) -> None:
-    stage = _build_geometric_delay_lines(tmp_path, max_delay_m=1.0)
-
-    assert stage.type_name == "delay_lines.geometric"
-    assert stage.family == "delay_lines"
-    # INS-9-001: opd_budget is intentionally NOT declared because the stage
-    # neither reads nor writes it. False declarations would defeat SPEC §6.1
-    # dependency validation.
-    # Per Code Review Issue 6 fix: stage now also consumes/produces
-    # ``field`` so it can apply per-aperture losses to ``field.amplitudes``
-    # per-mode instead of mean-smearing them into a scalar throughput.
-    assert stage.consumes == frozenset({"geometry", "throughput", "scene", "field"})
-    assert stage.produces == frozenset({"throughput", "field"})
-
-
 def test_kilo_maunakea_delay_line_pin_matches_reference(tmp_path: Path) -> None:
     stage = _build_geometric_delay_lines(tmp_path, max_delay_m=600.0)
     state = _delay_line_state(
@@ -732,31 +717,6 @@ def test_hc_1060_pm_records_pm_scalar_caveat(tmp_path: Path) -> None:
     assert diagnostics["polarization_model"] == "catalog_pm_scalar_phase"
     assert "PMD" in str(diagnostics["polarization_caveat"])
     assert diagnostics["dispersion_ps_nm_km"] == pytest.approx(80.0)
-
-
-def test_kilo_test_transport_delay_line_lengths_verbatim_xfail() -> None:
-    """Code Review 2026-05-16 Issue 47: gated via ``importorskip`` so the
-    ``strict=True`` marker can actually flip when KILO becomes importable.
-    Pre-fix the body was unreachable because of the leading
-    ``pytest.xfail(...)`` call.
-    """
-
-    pytest.importorskip("kilo.array")
-    pytest.importorskip("kilo.config")
-    pytest.importorskip("kilo.transport")
-
-    from kilo.array import telescope_enu_positions
-    from kilo.config import maunakea_telescopes
-    from kilo.transport import FiberConfig, compute_delay_line_lengths
-
-    telescope_enu = telescope_enu_positions(maunakea_telescopes())
-    fc = FiberConfig()
-    for alt in [10.0, 45.0, 90.0]:
-        for az in [0.0, 90.0, 180.0, 270.0]:
-            lengths = compute_delay_line_lengths(telescope_enu, fc, alt, az)
-            assert np.all(lengths >= -1e-10), (
-                f"Negative delay at alt={alt}, az={az}: {lengths}"
-            )
 
 
 def _build_geometric_delay_lines(

@@ -19,7 +19,6 @@ from nullsim.pipeline import (
     SimulationState,
     Throughput,
 )
-from nullsim.pipeline.registry import registry
 from nullsim.pipeline.state import Results
 from nullsim.stages.characterization import (
     CharacterizationDetectionCurve,
@@ -92,10 +91,6 @@ def _state() -> SimulationState:
         ),
         results=Results(components=components),
     )
-
-
-def test_characterization_stage_is_registered() -> None:
-    assert registry.stages["characterization.spectro"] is SpectroCharacterization
 
 
 def test_spectro_characterization_writes_payload(tmp_path: Path) -> None:
@@ -690,20 +685,6 @@ def test_realized_spectro_floor_replays_retuned_unitary_mc() -> None:
     assert "retuned spectro unitary" in model
     assert interferometric_floor > 0.0
     assert identity_floor == pytest.approx(0.0)
-
-
-def test_broadband_characterization_accepts_tracker_regularizer() -> None:
-    params = SpectroCharacterization.Params(
-        n_modes=2,
-        n_bright_ports=1,
-        n_dark_ports=0,
-        n_spectro_ports=1,
-        broadband_n_wavelengths=3,
-        tracker_observability_weight=1.0e-3,
-    )
-
-    assert params.broadband_n_wavelengths == 3
-    assert params.tracker_observability_weight == pytest.approx(1.0e-3)
 
 
 def test_spectro_characterization_dac_metrics_match_quantized_chip(

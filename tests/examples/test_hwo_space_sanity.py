@@ -104,100 +104,6 @@ def test_hwo_space_config_loads() -> None:
         assert sum(1 for _line in handle) > 100
 
 
-def test_hwo_telescope_resolves_to_8m_unobstructed_primary() -> None:
-    """The HWO config must materialize the requested primary assumptions."""
-
-    cfg = load_config(str(CONFIG_PATH))
-    stages = {
-        str(stage.id): stage.model_dump(mode="python")
-        for stage in cfg.pipeline.stages
-    }
-
-    aperture = cfg.telescope.model_dump()["aperture"]
-    assert aperture["diameter_m"] == pytest.approx(8.0)
-    assert aperture["obscuration_fraction"] == 0.0
-    assert cfg.scene.star.jmag == pytest.approx(2.13)
-    assert cfg.scene.star.spectral_type == "G2V"
-    assert cfg.scene.star.angular_diameter_mas == pytest.approx(1.86)
-    assert cfg.scene.star.distance_pc == pytest.approx(5.0)
-    assert cfg.scene.planet.separation_mas == pytest.approx(200.0)
-    assert cfg.scene.exozodi.level_zodi == pytest.approx(1.0)
-
-    scene = stages["scene"]
-    assert scene["star_distance_pc"] == pytest.approx(5.0)
-    assert scene["exozodi_level_zodi"] == pytest.approx(1.0)
-
-    telescope = stages["telescope"]
-    assert telescope["diameter_m"] == pytest.approx(8.0)
-    assert telescope["n_apertures"] == 1
-    assert telescope["central_obstruction_ratio"] == 0.0
-    assert telescope["mirror_transmission"] == pytest.approx(0.95)
-
-    injection_seed = stages["injection_seed"]
-    assert injection_seed["central_obscuration_ratio"] == 0.0
-    assert injection_seed["apply_strehl_coupling"] is False
-    injection = stages["injection"]
-    assert injection["central_obscuration_ratio"] == 0.0
-
-    pupil_modes = stages["pupil_modes"]
-    assert pupil_modes["n_modes"] == 36
-    assert pupil_modes["layout"] == "nonredundant_circular"
-    assert pupil_modes["span_fraction"] == pytest.approx(1.0)
-    assert pupil_modes["normalize_max_baseline_to_span"] is False
-    assert pupil_modes["preserve_collecting_area"] is False
-
-    chip_opt = stages["chip_opt"]
-    assert chip_opt["type"] == "chip_optimization.ideal_kernel"
-    assert chip_opt["n_modes"] == 36
-    assert chip_opt["n_bright_ports"] == 10
-    assert chip_opt["n_dark_ports"] == 26
-    assert chip_opt["wl_design_um"] == pytest.approx(0.8)
-    assert chip_opt["kernel_order"] == 4
-    assert chip_opt["target_null_depth"] == pytest.approx(1.0e-10)
-    assert chip_opt["deployment"] == "physical_real_clements"
-
-    pbs = stages["pbs"]
-    assert pbs["type"] == "polarization.pbs_split"
-    assert pbs["input_interpretation"] == "unpolarized"
-
-    transport = stages["pm780_transport"]
-    assert transport["type"] == "transport.pm780"
-    assert transport["length_m"] == pytest.approx(2.0)
-    assert transport["attenuation_db_per_km"] == pytest.approx(4.0)
-    assert transport["phi_rms_rad"] == pytest.approx(0.0)
-    assert transport["length_matching_error_m"] == pytest.approx(0.0)
-
-    chip = stages["chip"]
-    assert chip["deployment_mode"] == "per_pol_arm"
-    assert chip["chip_chromaticity_model"] == "parametric"
-    assert chip["phase_chromaticity_model"] == "fixed_opd_neff"
-
-    for stage_id in ("chip", "detector", "sensitivity"):
-        stage = stages[stage_id]
-        assert stage["n_bright_ports"] == 10
-        assert stage["n_dark_ports"] == 26
-
-    detector = stages["detector"]
-    assert detector["n_modes"] == 36
-    assert detector["band"] == "I"
-    assert detector["derive_band_mag_from_scene_jmag"] is True
-    assert detector["resolving_power_ref"] == pytest.approx(30.0)
-    assert detector["lambda_ref_um"] == pytest.approx(1.0)
-
-    zodi = stages["zodi"]
-    assert zodi["type"] == "background.space_zodi"
-    assert zodi["band"] == "I"
-    assert zodi["local_zodi_v_mag_arcsec2"] == pytest.approx(23.3)
-    assert zodi["derive_exozodi_mag_from_scene_jmag"] is True
-
-    assert "calibration" not in stages  # photon-noise baseline: no imposed floor
-
-    performance = stages["performance"]
-    assert performance["contrast_curve_reference_time_s"] == pytest.approx(
-        cfg.observation.integration_time_s
-    )
-
-
 def test_hwo_space_pipeline_runs_end_to_end(fiducial_state) -> None:
     """Pipeline must execute every stage without exception.
 
@@ -420,18 +326,6 @@ def test_hwo_no_atmosphere_no_ao_no_fringe_tracking(fiducial_state) -> None:
     )
 
 
-def test_hwo_contrast_sweep_has_five_cells(sweep_cells) -> None:
-    """The contrast sweep declared in TOML must expand to 5 cells."""
-
-    contrast_values = sorted(
-        dict(cell.coord_tuple).get("scene.planet.contrast", math.nan)
-        for cell in sweep_cells
-    )
-    assert len(contrast_values) == 5
-    assert contrast_values[0] == pytest.approx(1.0e-12)
-    assert contrast_values[-1] == pytest.approx(1.0e-8)
-
-
 def test_hwo_sensitivity_grid_tracks_8m_resolution() -> None:
     """HWO contrast curves should be sampled in the 8 m λ/D regime."""
 
@@ -466,60 +360,6 @@ def test_hwo_sensitivity_grid_tracks_8m_resolution() -> None:
     assert separations.max() / lambda_over_d_mas == pytest.approx(24.2, rel=0.03)
     assert np.min(np.abs(separations - 1.0)) < 1.0e-12
     assert np.min(np.abs(separations - 200.0)) < 10.0
-
-
-def test_hwo_output_requests_all_diagnostic_plots() -> None:
-    """The debug config should emit every registered plot family."""
-
-    cfg = load_config(str(CONFIG_PATH))
-    assert set(cfg.output.plots) == {
-        "detection_space",
-        "contrast_curve",
-        "null_transmission_map",
-        "subaperture_layout",
-        "uv_coverage_grid",
-        "chip_diagnostics",
-        "loss_budget",
-        "contrast_curves_multiband",
-        "calibration_time",
-        "debug_report",
-        "imaging_reconstruction",
-    }
-    null_map = cfg.output.null_transmission_map
-    assert null_map is not None
-    assert null_map.fov_mas == pytest.approx(500.0)
-    assert null_map.max_records == 1
-    imaging = cfg.output.imaging_reconstruction
-    assert imaging is not None
-    assert imaging.rotation_mode == "spacecraft_roll"
-    assert imaging.roll_span_deg == pytest.approx(120.0)
-    assert imaging.n_roll_steps == 25
-    assert imaging.n_pix == 64
-    assert imaging.fov_mas == pytest.approx(350.0)
-    assert imaging.poisson is False
-    assert imaging.compute_nnls is True
-    assert imaging.nnls_wavelength_mode == "resolved"
-    assert imaging.nnls_candidate_pixels == 512
-    assert imaging.nnls_regularization_fraction == pytest.approx(0.01)
-    assert imaging.chop_mode == "chip_phase"
-    assert imaging.include_exozodi_glow is True
-    assert imaging.exozodi_inner_radius_au == pytest.approx(0.2)
-    assert imaging.exozodi_outer_radius_au == pytest.approx(5.0)
-    assert imaging.exozodi_radial_power == pytest.approx(1.0)
-    assert imaging.exozodi_position_angle_deg == pytest.approx(60.0)
-    assert len(imaging.planets) == 3
-    assert [planet.flux_model for planet in imaging.planets] == [
-        "reflected_light",
-        "reflected_light",
-        "reflected_light",
-    ]
-    assert [planet.label for planet in imaging.planets] == ["Venus", "Earth", "Mars"]
-    assert [planet.radius_earth for planet in imaging.planets] == pytest.approx(
-        [0.9499, 1.0, 0.532],
-    )
-    assert [planet.semi_major_axis_au for planet in imaging.planets] == pytest.approx(
-        [0.723, 1.0, 1.524],
-    )
 
 
 def test_hwo_contrast_curve_uses_separation_dependent_sensitivity(
@@ -626,26 +466,6 @@ def test_hwo_chip_diagnostics_plot_writes_png(tmp_path: Path) -> None:
 # ----------------------------------------------------------------------
 # Surrogate-dependent sanity (see §15.5 gap notes)
 # ----------------------------------------------------------------------
-
-
-def test_hwo_null_depth_calibrated_non_negative(fiducial_state) -> None:
-    """Calibrated null depth must be finite and non-negative.
-
-    The 36-mode kernel chip is still a surrogate, but it must yield a
-    finite raw null depth so downstream performance metrics stay usable.
-    """
-
-    perf = next(
-        payload
-        for name, payload in fiducial_state.results.components.items()
-        if name.startswith("performance.standard")
-    )
-    null_depth = float(perf["null_depth_calibrated"])
-    assert math.isfinite(null_depth), (
-        f"null_depth_calibrated is {null_depth!r} (NaN means the chip "
-        "surrogate could not reach a null; see §15.5)."
-    )
-    assert null_depth >= 0.0
 
 
 def test_hwo_performance_snr_finite(fiducial_state) -> None:

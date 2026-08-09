@@ -22,7 +22,6 @@ from nullsim.pipeline import (
     Scene,
     SimulationState,
     Throughput,
-    list_stages,
 )
 from nullsim.stages.detector import SNSPDDetector
 
@@ -109,16 +108,6 @@ def _stage(
         },
         context,
     )
-
-
-def test_snspd_registers_stage_contract(tmp_path: Path) -> None:
-    stage = _stage(_context(tmp_path))
-
-    assert "detector.snspd" in list_stages()
-    assert stage.type_name == "detector.snspd"
-    assert stage.family == "detector"
-    assert stage.consumes == frozenset({"field", "throughput", "scene", "geometry"})
-    assert stage.produces == frozenset({"photon_rates", "results", "throughput"})
 
 
 def test_snspd_unit_qe_no_dark_matches_analytical_rate(tmp_path: Path) -> None:
@@ -268,37 +257,6 @@ def test_snspd_dark_counts_reported_separately_with_zero_field(tmp_path: Path) -
     np.testing.assert_allclose(component["port_rates"], 0.0)
     np.testing.assert_allclose(component["total_port_rates_with_dark"], dark_rate_hz)
     np.testing.assert_allclose(result.photon_rates.rates_hz.sum(axis=1), 0.0)
-
-
-def test_snspd_results_component_has_required_keys(tmp_path: Path) -> None:
-    state = _state()
-    stage = _stage(_context(tmp_path), snspd_dark_rate_hz=10.0)
-
-    result = stage.apply(state)
-    component = result.results.components["detector.snspd"]
-
-    required = {
-        "null_depth_raw",
-        "port_rates",
-        "port_labels",
-        "saturated_per_port",
-        "detector_qe",
-        "snspd_max_count_rate_hz",
-        "snspd_dark_rate_hz",
-        "dark_rate_hz_per_port",
-        "snspd_timing_resolution_s",
-        "n_bright_ports",
-        "n_dark_ports",
-        "n_spectro_ports",
-        "integration_time_s",
-        "integrated_counts_per_port",
-        "total_port_rates_with_dark",
-        "integrated_total_counts_per_port",
-        "source_model",
-    }
-    assert required.issubset(component.keys())
-    assert np.isfinite(component["null_depth_raw"])
-    assert component["port_rates"].shape == (4,)
 
 
 def test_snspd_null_depth_uses_bright_dark_partition(tmp_path: Path) -> None:

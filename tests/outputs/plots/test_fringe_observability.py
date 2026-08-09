@@ -13,7 +13,6 @@ from nullsim.outputs.plots.fringe_observability import (
     _fmt_float,
     _find_payload,
     fringe_observability,
-    plot_fringe_observability,
 )
 from nullsim.pipeline import Results, RunResult, SimulationState
 
@@ -112,12 +111,6 @@ def _payload() -> dict:
             "convergence_fraction": np.array([1.0, 1.0, 0.75, 0.25, 0.0]),
         },
     }
-
-
-def test_plot_fringe_observability_renders() -> None:
-    fig = plot_fringe_observability(_payload())
-
-    assert len(fig.axes) >= 7
 
 
 def test_fmt_float_distinguishes_nonfinite_values() -> None:

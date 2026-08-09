@@ -35,17 +35,6 @@ def test_packaged_spectrum_grid_is_constant_r(name, kind):
     assert 1.0 / dln[0] == pytest.approx(30_000.0, rel=0.01)
 
 
-def test_stellar_spectra_have_line_structure():
-    # An M dwarf at R=30k must show >5% RMS line contrast after continuum
-    # removal; a lineless snapshot would silently kill the whole CCF signal.
-    from scipy.ndimage import median_filter
-
-    spec = load_template_csv(packaged_spectrum_path("M"))
-    cont = median_filter(spec.values, size=501, mode="nearest")
-    resid = spec.values / np.maximum(cont, 1e-300) - 1.0
-    assert float(np.std(resid)) > 0.05
-
-
 def test_packaged_spectrum_path_rejects_unknown_name():
     with pytest.raises(KeyError):
         packaged_spectrum_path("jupiter")

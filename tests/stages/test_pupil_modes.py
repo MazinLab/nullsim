@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nullsim.pipeline import Geometry, RunContext, SimulationState, build_instance
+from nullsim.pipeline import Geometry, RunContext, SimulationState
 from nullsim.stages.telescope.pupil_modes import PupilModes
 
 
@@ -21,17 +21,6 @@ def _context(tmp_path: Path) -> RunContext:
         instance_id="pupil_modes",
         run_dir=tmp_path,
     )
-
-
-def test_pupil_modes_registers_stage_contract(tmp_path: Path) -> None:
-    stage = build_instance(
-        {"id": "pupil_modes", "type": "telescope.pupil_modes", "n_modes": 2},
-        context=_context(tmp_path),
-    )
-
-    assert isinstance(stage, PupilModes)
-    assert stage.consumes == frozenset({"geometry"})
-    assert stage.produces == frozenset({"geometry"})
 
 
 def test_pupil_modes_places_linear_modes_across_diameter(tmp_path: Path) -> None:

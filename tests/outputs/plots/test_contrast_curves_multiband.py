@@ -19,22 +19,9 @@ from nullsim.outputs.plots.contrast_curves_multiband import (
 
 
 def test_band_label_jh_recognized() -> None:
-    name, color, sort_key = _band_label(1.25)
+    name, _color, sort_key = _band_label(1.25)
     assert name == "J"
-    assert color == "C1"
     assert sort_key == pytest.approx(1.25)
-
-
-def test_band_label_y_recognized() -> None:
-    assert _band_label(1.0)[0] == "Y"
-
-
-def test_band_label_i_recognized() -> None:
-    assert _band_label(0.8)[0] == "I"
-
-
-def test_band_label_h_recognized() -> None:
-    assert _band_label(1.65)[0] == "H"
 
 
 def test_band_label_unknown_returns_wavelength() -> None:

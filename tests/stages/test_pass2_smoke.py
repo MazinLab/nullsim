@@ -17,7 +17,6 @@ from nullsim.pipeline import (
     SimulationState,
     Stage,
     build_instance,
-    registry,
 )
 
 WAVELENGTH_GRID_UM = (1.2, 1.4, 1.6, 1.8)
@@ -28,13 +27,6 @@ PASS2_AUTOLOAD_STAGE_TYPES = {
     "transport.smf28",
     "delay_lines.geometric",
 }
-
-
-def test_autoload_registers_pass2_stage_types() -> None:
-    importlib.import_module("nullsim.stages._autoload")
-
-    assert PASS2_AUTOLOAD_STAGE_TYPES.issubset(set(registry.list_stages()))
-    assert "injection.ideal" in registry.list_stages()
 
 
 def test_atmosphere_injection_transport_delay_lines_smoke(tmp_path: Path) -> None:

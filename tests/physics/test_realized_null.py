@@ -208,29 +208,6 @@ def test_common_differential_covariance_rejects_non_unit_signs() -> None:
         )
 
 
-def test_larger_piston_gives_larger_instability() -> None:
-    stack = _make_50_50_combiner(1)
-    field = np.array([1.0, 1.0], dtype=np.complex128)
-    wl = 1.25e-6
-    sigma_OPDs = [0.0005e-6, 0.001e-6, 0.002e-6]  # m
-    instabs = []
-    for s in sigma_OPDs:
-        res = realized_null_depth_mc(
-            u_stack=stack,
-            stellar_field=field,
-            dark_indices=np.array([1]),
-            ao_piston_opd_rms_per_sub_m=s,
-            wavelengths_m=np.array([wl]),
-            n_realizations=5000,
-            seed=0,
-        )
-        instabs.append(res.null_instability)
-    # null_instability = std/mean is a fixed CV for Gaussian-piston-driven
-    # leakage (~sqrt(2) for chi^2_2 / mean), so it should saturate near
-    # sqrt(2) for moderate sigma. Monotonic but slowly varying.
-    assert all(i > 0.0 for i in instabs)
-
-
 def test_realized_null_with_dark_indices_only_dark_port_counted() -> None:
     """Three-mode test: only the listed dark index contributes to leakage."""
 

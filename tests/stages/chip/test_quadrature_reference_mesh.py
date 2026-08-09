@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nullsim.pipeline import Field, RunContext, SimulationState, Throughput, list_stages
+from nullsim.pipeline import Field, RunContext, SimulationState, Throughput
 from nullsim.stages.chip import QuadratureReferenceMesh
 
 
@@ -43,16 +43,6 @@ def _state(
             wavelength_grid_um=wavelength_grid_um,
             transmission_fraction=tuple(1.0 for _ in wavelength_grid_um),
         ),
-    )
-
-
-def test_quadrature_reference_mesh_registers_stage_contract() -> None:
-    assert "chip.quadrature_reference_mesh" in list_stages()
-    assert QuadratureReferenceMesh.type_name == "chip.quadrature_reference_mesh"
-    assert QuadratureReferenceMesh.family == "chip"
-    assert QuadratureReferenceMesh.consumes == frozenset({"field", "throughput"})
-    assert QuadratureReferenceMesh.produces == frozenset(
-        {"field", "throughput", "results"}
     )
 
 

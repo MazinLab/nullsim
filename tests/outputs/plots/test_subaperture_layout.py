@@ -18,7 +18,7 @@ from nullsim.outputs.plots.subaperture_layout import (
     plot_subaperture_layout,
 )
 from nullsim.pipeline import Geometry, SimulationState
-from nullsim.physics.pupil_geometry import eelt_pupil, keck_pupil
+from nullsim.physics.pupil_geometry import keck_pupil
 
 
 _KECK_CONFIG = (
@@ -77,13 +77,6 @@ def test_circular_template_returns_none() -> None:
     assert _build_pupil_template("circular") is None
     assert _build_pupil_template("full_pupil") is None
     assert _build_pupil_template(None) is None
-
-
-def test_eelt_template_builds_nayra_pupil() -> None:
-    p = _build_pupil_template("eelt")
-    assert p == eelt_pupil()
-    assert len(p.spider_vanes) == 6
-    assert p.boundary_vertices is None
 
 
 def test_render_keck_pdf(tmp_path: Path) -> None:

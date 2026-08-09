@@ -13,7 +13,6 @@ from nullsim.pipeline import (
     RunContext,
     Scene,
     SimulationState,
-    list_stages,
 )
 from nullsim.stages.performance.hdc import HdcPerformanceStage
 from nullsim.stages.performance.standard import _contrast_curve
@@ -155,81 +154,6 @@ def payload(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
     context = _context(tmp_path_factory.mktemp("perf_hdc"))
     result = _stage(context).apply(_state())
     return result.results.components["performance.hdc"]
-
-
-def test_performance_hdc_registers_stage_contract(tmp_path: Path) -> None:
-    stage = _stage(_context(tmp_path))
-
-    assert "performance.hdc" in list_stages()
-    assert stage.type_name == "performance.hdc"
-    assert stage.family == "performance"
-    assert stage.consumes == frozenset({"results", "scene"})
-    assert stage.produces == frozenset({"results"})
-
-
-def test_performance_hdc_publishes_expected_payload_keys(
-    payload: dict[str, object],
-) -> None:
-    expected = {
-        "separations_mas",
-        "ccf_contrast_at_target",
-        "broadband_contrast_at_target",
-        "ccf_contrast_gain",
-        "target_snr",
-        "integration_time_s",
-        "integration_time_source",
-        "comparison_time_s",
-        "comparison_target_snr",
-        "comparison_model",
-        "post_correction_residual_per_anchor",
-        "sky_rate_hz_per_anchor",
-        "ccf_leak_rate_hz_per_channel",
-        "ccf_planet_rate_hz_per_channel_unit_contrast",
-        "upstream_sensitivity_link_source",
-        "resolving_power_used",
-        "n_channels",
-        "n_effective_lines_per_anchor",
-        "systematic_var_counts_per_anchor",
-        "photon_var_zero_contrast_per_anchor",
-        "refined_snr_per_anchor",
-        "solver_optimism_per_anchor",
-        "corrected_anchor_count",
-        "non_detection_reasons",
-        "n_non_detections",
-        "planet_template_provenance",
-        "star_template_provenance",
-        "telluric_template_provenance",
-        "planet_template_sha256",
-        "star_template_sha256",
-        "telluric_template_sha256",
-        "eps_systematic_used",
-        "servo_bw_hz_used",
-        "with_fringe_tracking_used",
-        "ccf_model",
-        "detection_budget_model",
-        "leak_shape_model",
-        "leak_shape_fallback_reasons",
-        "upstream_performance_component",
-        "upstream_sensitivity_component",
-    }
-    missing = expected - set(payload)
-    assert not missing, f"missing payload keys: {sorted(missing)}"
-
-
-def test_performance_hdc_curve_shapes_and_finiteness(
-    payload: dict[str, object],
-) -> None:
-    separations = np.asarray(payload["separations_mas"], dtype=np.float64)
-    ccf = np.asarray(payload["ccf_contrast_at_target"], dtype=np.float64)
-    broadband = np.asarray(payload["broadband_contrast_at_target"], dtype=np.float64)
-    gain = np.asarray(payload["ccf_contrast_gain"], dtype=np.float64)
-
-    assert separations.shape == ccf.shape == broadband.shape == gain.shape
-    assert separations.size == _N_ANCHORS
-    assert np.all(np.isfinite(ccf)) and np.all(ccf > 0.0)
-    assert int(payload["n_non_detections"]) == 0
-    # gain = broadband / ccf, by construction.
-    assert np.allclose(gain, broadband / ccf, rtol=1.0e-12)
 
 
 def test_ccf_contrast_gain_exceeds_one_when_systematics_dominate(

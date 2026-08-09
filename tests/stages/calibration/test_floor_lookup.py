@@ -21,7 +21,6 @@ from nullsim.pipeline import (
     RunContext,
     Scene,
     SimulationState,
-    list_stages,
 )
 from nullsim.stages.calibration import CalibrationFloorLookup
 
@@ -86,16 +85,6 @@ def _stage(
         },
         context,
     )
-
-
-def test_calibration_registers_stage_contract(tmp_path: Path) -> None:
-    stage = _stage(_context(tmp_path))
-
-    assert "calibration.floor_lookup" in list_stages()
-    assert stage.type_name == "calibration.floor_lookup"
-    assert stage.family == "calibration"
-    assert stage.consumes == frozenset({"results", "scene"})
-    assert stage.produces == frozenset({"results"})
 
 
 def test_calibration_default_floor_subtracts_one_microniull(tmp_path: Path) -> None:

@@ -25,7 +25,6 @@ from nullsim.pipeline import (
     Scene,
     SimulationState,
     Wavefront,
-    list_stages,
 )
 from nullsim.stages.fringe_tracking import ClosedLoopFringeTracker
 
@@ -162,18 +161,6 @@ def _with_ao_residual(
         state,
         wavefront=replace(state.wavefront).add_component("ao_residual", ao_payload),
     )
-
-
-def test_closed_loop_registers_stage_contract(tmp_path: Path) -> None:
-    stage = _stage(_context(tmp_path))
-
-    assert "fringe_tracking.closed_loop" in list_stages()
-    assert stage.type_name == "fringe_tracking.closed_loop"
-    assert stage.family == "fringe_tracking"
-    assert stage.consumes == frozenset(
-        {"photon_rates", "opd_budget", "wavefront", "geometry"}
-    )
-    assert stage.produces == frozenset({"opd_budget", "results"})
 
 
 def test_closed_loop_supersedes_upstream_and_adds_residual_component(

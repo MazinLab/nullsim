@@ -15,7 +15,6 @@ from nullsim.pipeline import (
     RunContext,
     SimulationState,
     Throughput,
-    list_stages,
 )
 from nullsim.stages.background import NayraSkyBackground
 
@@ -50,16 +49,6 @@ def _state() -> SimulationState:
             transmission_fraction=(0.5, 0.25),
         ),
     )
-
-
-def test_nayra_sky_registers_stage_contract(tmp_path: Path) -> None:
-    stage = NayraSkyBackground({"band": "J"}, _context(tmp_path))
-
-    assert "background.nayra_sky" in list_stages()
-    assert stage.type_name == "background.nayra_sky"
-    assert stage.family == "background"
-    assert stage.consumes == frozenset({"geometry", "throughput", "field"})
-    assert stage.produces == frozenset({"results"})
 
 
 def test_nayra_sky_rate_uses_effective_area_grid_and_throughput(

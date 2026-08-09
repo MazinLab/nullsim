@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nullsim.pipeline import Field, Geometry, RunContext, SimulationState, list_stages
+from nullsim.pipeline import Field, Geometry, RunContext, SimulationState
 from nullsim.stages.injection.mode_splitter import ModeSplitter
 
 
@@ -51,13 +51,6 @@ def _state() -> SimulationState:
     )
 
 
-def test_mode_splitter_registers_stage_contract() -> None:
-    assert "injection.mode_splitter" in list_stages()
-    assert ModeSplitter.type_name == "injection.mode_splitter"
-    assert ModeSplitter.consumes == frozenset({"field", "geometry"})
-    assert ModeSplitter.produces == frozenset({"field", "geometry"})
-
-
 def test_mode_splitter_preserves_detector_power_and_aperture_block_order(
     tmp_path: Path,
 ) -> None:
@@ -77,6 +70,7 @@ def test_mode_splitter_preserves_detector_power_and_aperture_block_order(
     split_area = float(payload["mode_area_m2"])
     assert split_area == pytest.approx(1.0)
     np.testing.assert_allclose(payload["mode_areas_m2"], np.full(8, 1.0))
+    assert payload["mode_diameter_m"] == pytest.approx(np.sqrt(8.0 / np.pi))
     np.testing.assert_array_equal(
         payload["physical_mode_indices"],
         np.array([0, 1, 0, 1, 2, 3, 2, 3]),
@@ -221,14 +215,3 @@ def test_mode_splitter_preserves_unequal_input_areas(tmp_path: Path) -> None:
             )
         )
     )
-
-
-def test_mode_splitter_records_area_and_physical_diameter(tmp_path: Path) -> None:
-    stage = ModeSplitter(params={"copies": 2}, context=_context(tmp_path))
-
-    out = stage.apply(_state())
-    payload = out.geometry.components["splitter"]
-
-    assert payload["mode_area_m2"] == pytest.approx(1.0)
-    np.testing.assert_allclose(payload["mode_areas_m2"], np.full(8, 1.0))
-    assert payload["mode_diameter_m"] == pytest.approx(np.sqrt(8.0 / np.pi))

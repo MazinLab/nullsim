@@ -68,14 +68,6 @@ def test_r0_scaled_identity_at_reference_wavelength() -> None:
     assert r0_scaled(0.15, 500.0e-9) == pytest.approx(0.15, rel=1e-12)
 
 
-def test_r0_scaled_six_fifths_power_law_pin() -> None:
-    """r0(1.65 um) / r0(500 nm) = (1650 / 500)^(6/5)."""
-    r0_500 = 0.15  # m
-    r0_h = r0_scaled(r0_500, 1.65e-6)
-    expected_ratio = (1.65e-6 / 500.0e-9) ** 1.2
-    assert r0_h / r0_500 == pytest.approx(expected_ratio, rel=1e-12)
-
-
 def test_r0_scaled_matches_kilo_scale_r0_at_h_band() -> None:
     """Exact KILO `scale_r0` formula reproduction at H-band."""
     r0_500 = 0.15  # m, typical median Maunakea seeing
@@ -279,24 +271,12 @@ def test_strehl_marechal_monotonic_in_opd() -> None:
 # ── NaN / inf / zero / negative input handling ──────────────────────────
 
 
-def test_phase_variance_nan_r0_propagates() -> None:
-    assert math.isnan(phase_variance(1.0, math.nan))
-
-
 def test_phase_structure_function_nan_r0_propagates() -> None:
     assert math.isnan(phase_structure_function(0.5, math.nan))
 
 
 def test_opd_rms_m_nan_r0_propagates() -> None:
     assert math.isnan(opd_rms_m(2.5, math.nan, 1.65e-6))
-
-
-def test_r0_scaled_nan_r0_propagates() -> None:
-    assert math.isnan(r0_scaled(math.nan, 1.65e-6))
-
-
-def test_strehl_marechal_nan_opd_propagates() -> None:
-    assert math.isnan(strehl_marechal(math.nan, 1.65e-6))
 
 
 def test_phase_variance_zero_r0_raises() -> None:

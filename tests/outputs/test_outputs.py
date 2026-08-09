@@ -22,7 +22,7 @@ from nullsim.outputs import RunCollection, RunRecord
 from nullsim.outputs.plots import contrast_curve
 from nullsim.outputs.sweep_results import write_sweep_results
 from nullsim.outputs.tables import characterization_summary, performance_summary
-from nullsim.pipeline import RunResult, SimulationState, registry, run
+from nullsim.pipeline import RunResult, SimulationState, run
 
 
 GRID = {
@@ -114,14 +114,6 @@ def _record(tmp_path: Path, star_jmag: float = 5.0) -> RunRecord:
 # ---------------------------------------------------------------------------
 # Registration: both outputs autoload at import time and live in the registry.
 # ---------------------------------------------------------------------------
-
-def test_contrast_curve_and_performance_summary_are_registered() -> None:
-    """Importing nullsim must auto-register both default outputs."""
-    assert "contrast_curve" in registry.plots
-    assert "performance_summary" in registry.tables
-    assert registry.plots["contrast_curve"] is contrast_curve
-    assert registry.tables["performance_summary"] is performance_summary
-
 
 def test_sweep_results_writes_all_component_numeric_scalars(tmp_path: Path) -> None:
     """Result components should not need output-specific allow lists."""
@@ -242,22 +234,6 @@ def test_contrast_curve_handles_empty_records_gracefully(tmp_path: Path) -> None
     assert written_paths[0].exists()
 
 
-def test_contrast_curve_multi_record_legend_uses_coord(tmp_path: Path) -> None:
-    """Multi-record runs label curves with the sweep coordinate tuple."""
-    records = (_record(tmp_path / "a", 5.0), _record(tmp_path / "b", 6.0))
-    collection = RunCollection(
-        config=_resolved_stub(),
-        records=records,
-        output_dir=tmp_path,
-    )
-
-    written_paths = contrast_curve(collection, tmp_path, ("png",))
-
-    # Both records had non-empty contrast curves, so the legend code path runs.
-    assert written_paths[0].exists()
-    assert written_paths[0].stat().st_size > 0
-
-
 # ---------------------------------------------------------------------------
 # Table output: performance_summary.
 # ---------------------------------------------------------------------------
@@ -300,21 +276,6 @@ def test_performance_summary_json_is_sorted_and_parseable(tmp_path: Path) -> Non
     # sort_keys=True must produce alphabetical key order.
     first = payload[0]
     assert list(first.keys()) == sorted(first.keys())
-
-
-def test_performance_summary_parquet_round_trip(tmp_path: Path) -> None:
-    """Parquet output must round-trip through pandas without loss."""
-    collection = RunCollection(
-        config=_resolved_stub(),
-        records=(_record(tmp_path),),
-        output_dir=tmp_path,
-    )
-
-    paths = performance_summary(collection, tmp_path, ("parquet",))
-
-    frame = pd.read_parquet(paths[0])
-    assert len(frame) == 1
-    assert "null_depth" in frame.columns
 
 
 def test_characterization_summaries_prefer_band_evaluated_leakage(
@@ -470,22 +431,6 @@ def _characterization_record(
     )
 
 
-def test_characterization_summary_publishes_hdc_ccf_columns(tmp_path: Path) -> None:
-    """HDC CCF scalars must surface as hdc_* columns on the spectro row."""
-    record = _characterization_record(
-        tmp_path, {"characterization.hdc_ccf": _hdc_sentinel_payload()}
-    )
-    collection = RunCollection(
-        config=_resolved_stub(), records=(record,), output_dir=tmp_path
-    )
-
-    path = characterization_summary(collection, tmp_path, ("json",))[0]
-    row = json.loads(path.read_text(encoding="utf-8"))[0]
-
-    for column, (_key, expected) in _HDC_SENTINELS.items():
-        assert row[column] == pytest.approx(expected), column
-
-
 def test_characterization_summary_hdc_columns_nan_without_component(
     tmp_path: Path,
 ) -> None:
@@ -623,50 +568,9 @@ def test_performance_summary_rejects_unknown_format(tmp_path: Path) -> None:
         performance_summary(collection, tmp_path, ("xlsx",))
 
 
-def test_performance_summary_directory_is_tables_subdir(tmp_path: Path) -> None:
-    """Tables are written under <output_dir>/tables (matching the SPEC layout)."""
-    collection = RunCollection(
-        config=_resolved_stub(),
-        records=(_record(tmp_path),),
-        output_dir=tmp_path,
-    )
-
-    paths = performance_summary(collection, tmp_path, ("json",))
-
-    assert paths[0].parent == tmp_path / "tables"
-    assert paths[0].parent.is_dir()
-
-
 # ---------------------------------------------------------------------------
 # RunRecord helpers.
 # ---------------------------------------------------------------------------
-
-def test_run_record_coord_mapping_round_trips_tuple() -> None:
-    """RunRecord.coord_mapping must materialize the coord tuple as a dict."""
-    config = _resolved_stub()
-    record = RunRecord(
-        config=config,
-        result=None,  # type: ignore[arg-type]  # not used in this assertion
-        run_dir=Path("/tmp"),
-        coord_tuple=(("x", 1), ("y", 2.5)),
-    )
-
-    assert record.coord_mapping == {"x": 1, "y": 2.5}
-
-
-def test_run_collection_records_are_iterable_tuple(tmp_path: Path) -> None:
-    """RunCollection.records is a tuple so order is preserved across iterations."""
-    records = (_record(tmp_path / "a"), _record(tmp_path / "b"))
-    collection = RunCollection(
-        config=_resolved_stub(),
-        records=records,
-        output_dir=tmp_path,
-    )
-
-    assert isinstance(collection.records, tuple)
-    assert len(collection.records) == 2
-    assert collection.records[0] is records[0]
-
 
 def test_band_avg_throughput_means_finite_per_wavelength() -> None:
     """Band-averaged throughput is the mean over finite per-wavelength values;

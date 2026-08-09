@@ -235,18 +235,3 @@ def test_reconstruct_clements_rejects_non_nearest_neighbor_order() -> None:
 # ---------------------------------------------------------------------------
 # Package-level import smoke (REQUIRED).
 # ---------------------------------------------------------------------------
-
-
-def test_package_level_physics_import_smoke() -> None:
-    """Every name in the architect's import list must be importable from nullsim.physics."""
-    from nullsim.physics import (  # noqa: F401  -- import smoke test
-        angular_spectrum_propagate,
-        decompose_clements as imported_decompose,
-        jones_to_stokes,
-        linear_polarizer,
-        reconstruct_clements as imported_reconstruct,
-        waveplate,
-    )
-
-    assert imported_decompose is decompose_clements
-    assert imported_reconstruct is reconstruct_clements

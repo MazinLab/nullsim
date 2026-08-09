@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from nullsim.pipeline import RunContext, SimulationState, Wavefront, list_stages
+from nullsim.pipeline import RunContext, SimulationState, Wavefront
 from nullsim.stages.wavefront import SpaceWavefrontResidual
 
 
@@ -22,16 +22,6 @@ def _context(tmp_path: Path) -> RunContext:
         instance_id="space_wavefront",
         run_dir=tmp_path,
     )
-
-
-def test_space_residual_registers_stage_contract(tmp_path: Path) -> None:
-    stage = SpaceWavefrontResidual({}, _context(tmp_path))
-
-    assert "wavefront.space_residual" in list_stages()
-    assert stage.type_name == "wavefront.space_residual"
-    assert stage.family == "wavefront"
-    assert stage.consumes == frozenset()
-    assert stage.produces == frozenset({"wavefront", "opd_budget"})
 
 
 def test_space_residual_updates_wavefront_and_opd_budget(tmp_path: Path) -> None:

@@ -17,7 +17,6 @@ from nullsim.pipeline import (
     SimulationState,
     Throughput,
 )
-from nullsim.pipeline.registry import list_stages
 from nullsim.stages.background import SpaceZodiBackground
 
 
@@ -70,14 +69,6 @@ def _state() -> SimulationState:
             )
         ),
     )
-
-
-def test_space_zodi_registers_stage_contract(tmp_path: Path) -> None:
-    stage = SpaceZodiBackground({"band": "I"}, _context(tmp_path))
-
-    assert "background.space_zodi" in list_stages()
-    assert stage.type_name == "background.space_zodi"
-    assert stage.family == "background"
 
 
 def test_space_zodi_uses_local_and_scene_exozodi_levels(tmp_path: Path) -> None:

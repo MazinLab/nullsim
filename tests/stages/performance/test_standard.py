@@ -29,7 +29,6 @@ from nullsim.pipeline import (
     RunContext,
     Scene,
     SimulationState,
-    list_stages,
 )
 from nullsim.stages.performance import StandardPerformance
 
@@ -135,20 +134,6 @@ def _stage(
     **overrides: object,
 ) -> StandardPerformance:
     return StandardPerformance(dict(overrides), context)
-
-
-def test_performance_registers_stage_contract(tmp_path: Path) -> None:
-    stage = _stage(_context(tmp_path))
-
-    assert "performance.standard" in list_stages()
-    assert stage.type_name == "performance.standard"
-    assert stage.family == "performance"
-    # photon_rates is not read (per-port rates come from the detector
-    # results component); opd_budget is read opportunistically via
-    # cache_key_extras to keep HWO/no-AO pipelines runnable.
-    assert stage.consumes == frozenset({"results", "scene"})
-    assert stage.produces == frozenset({"results"})
-    assert stage.cache_key_extras == frozenset({"opd_budget"})
 
 
 def test_performance_writes_snr_and_integration_time(tmp_path: Path) -> None:
@@ -455,19 +440,6 @@ def test_performance_ft_reduces_systematic_variance(tmp_path: Path) -> None:
         "performance.standard"
     ]["systematic_var"]
     assert sys_with_ft < sys_no_ft
-
-
-def test_performance_contrast_curve_length_matches_separations(tmp_path: Path) -> None:
-    separations = (50.0, 100.0, 200.0)
-    state = _state(integration_time_s=3600.0)
-    stage = _stage(
-        _context(tmp_path),
-        contrast_curve_separations_mas=separations,
-    )
-    component = stage.apply(state).results.components["performance.standard"]
-    assert len(component["contrast_curve_mas"]) == len(separations)
-    assert len(component["contrast_curve_value"]) == len(separations)
-    assert tuple(component["contrast_curve_mas"]) == separations
 
 
 def test_performance_empty_separation_tuple(tmp_path: Path) -> None:

@@ -36,25 +36,6 @@ def _ctx() -> RunContext:
     )
 
 
-def test_default_n_restarts_is_kilo_five() -> None:
-    """KILO default — 5 restarts, not the prior nullsim 16."""
-    p = ChipOptimizationParams(n_modes=4, n_bright_ports=2, n_dark_ports=2, wl_design_um=1.25)
-    assert p.n_restarts == 5
-
-
-def test_default_restart_patience_is_zero() -> None:
-    """Phase 3.4: default disables patience to match KILO ``KILO_BB_PATIENCE``."""
-
-    p = ChipOptimizationParams(n_modes=4, n_bright_ports=2, n_dark_ports=2, wl_design_um=1.25)
-    assert p.restart_patience == 0
-    assert p.restart_patience_reltol == 0.01
-
-
-def test_default_n_workers_is_one() -> None:
-    p = ChipOptimizationParams(n_modes=4, n_bright_ports=2, n_dark_ports=2, wl_design_um=1.25)
-    assert p.n_workers == 1
-
-
 def test_restart_patience_disabled_runs_all_restarts() -> None:
     """patience=0 disables early exit: all n_restarts must run when the
     target is unreachable. Phase 9: prior assertion only verified

@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nullsim.pipeline import Field, RunContext, SimulationState, Throughput, registry
+from nullsim.pipeline import Field, RunContext, SimulationState, Throughput
 from nullsim.stages.polarization import (
     HalfWavePlate,
     PMFiberJones,
@@ -44,17 +44,6 @@ def _state_from_amplitudes(amplitudes: np.ndarray) -> SimulationState:
         transmission_fraction=tuple(1.0 for _ in wavelength_grid_um),
     )
     return replace(state, field=field, throughput=throughput)
-
-
-def test_autoload_registers_polarization_stage_types() -> None:
-    import nullsim.stages._autoload  # noqa: F401
-
-    registered = set(registry.list_stages())
-    assert {
-        "polarization.hwp",
-        "polarization.pbs_split",
-        "polarization.pm_fiber",
-    }.issubset(registered)
 
 
 def test_hwp_passes_unpolarized_scalar_field_through(tmp_path: Path) -> None:

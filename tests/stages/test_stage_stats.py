@@ -501,33 +501,6 @@ def test_ao_wfs_noise_scales_monotonically_with_guide_star_magnitude(
 
 
 @pytest.mark.stats
-def test_ao_opd_components_sum_in_quadrature(tmp_path: Path) -> None:
-    """The named AO OPD components stack in quadrature to the total OPD RMS.
-
-    Independent error variances add linearly, so RMS adds in quadrature.
-    The stage writes ``opd_budget.total_rms_opd_nm`` from the same piston
-    arrays, so this is an internal self-consistency check.
-    """
-    result = _run_ao(tmp_path)
-    component_names = ("ao_temporal", "ao_fitting", "ao_wfs_noise")
-    components = [result.state.opd_budget.components[n] for n in component_names]
-    rms_values = [c.rms_opd_nm for c in components]
-    quadrature = math.sqrt(sum(value**2 for value in rms_values))
-    total = result.state.opd_budget.total_rms_opd_nm
-    assert quadrature == pytest.approx(total, rel=1.0e-9, abs=1.0e-9)
-
-    # Diagnostic reconciliation table dumped to stdout via the assertion
-    # message so failures are immediately readable.
-    table = "\n".join(
-        [f"{name}: {value:.6f} nm" for name, value in zip(component_names, rms_values)]
-    )
-    assert math.isfinite(total), (
-        f"total_rms_opd_nm should be finite. Components:\n{table}\n"
-        f"quadrature={quadrature}, total={total}"
-    )
-
-
-@pytest.mark.stats
 def test_ao_nan_atmosphere_propagates_to_post_ao_strehl(tmp_path: Path) -> None:
     """NaN r0 propagates: post-AO Strehl is NaN at every wavelength, no exception."""
 

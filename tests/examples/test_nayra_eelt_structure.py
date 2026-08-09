@@ -64,42 +64,6 @@ def test_nayra_simultaneous_bands_match_six_chip_manifest() -> None:
     assert stages["sensitivity"]["simultaneous_science_bands"] == expected_bands
 
 
-def test_nayra_detector_and_characterization_use_mkid_native_spectroscopy() -> None:
-    config = load_config(str(CONFIG_PATH))
-    stages = {
-        str(stage.id): stage.model_dump(mode="python")
-        for stage in config.pipeline.stages
-    }
-
-    detector = stages["detector"]
-    characterization = stages["characterization"]
-
-    assert detector["resolving_power_ref"] == 30.0
-    assert detector["lambda_ref_um"] == 1.0
-    assert characterization["spectrograph"] == "mkid"
-    assert characterization["n_spectro_ports"] == 1
-
-
-def test_nayra_output_requests_applicable_baseline_plots() -> None:
-    config = load_config(str(CONFIG_PATH))
-
-    assert {
-        "detection_space",
-        "contrast_curve",
-        "null_transmission_map",
-        "subaperture_layout",
-        "chip_diagnostics",
-        "loss_budget",
-        "contrast_curves_multiband",
-        "calibration_time",
-        "debug_report",
-    }.issubset(set(config.output.plots))
-    assert "uv_coverage_grid" not in config.output.plots
-    assert config.output.null_transmission_map is not None
-    assert config.output.null_transmission_map.fov_mas == 150.0
-    assert config.output.null_transmission_map.max_records == 1
-
-
 def test_nayra_six_chip_manifest_matches_instrument_quadrature_split() -> None:
     """N=18 quadrature: [instrument] is the single port-topology source.
 

@@ -134,35 +134,6 @@ def test_scipy_deep_null_small_system_nullsim_pin(tmp_path: Path) -> None:
     )
 
 
-def test_kilo_test_deep_null_small_system_verbatim_xfail() -> None:
-    """Tripwire stub for the KILO ``TestOptimizeNull::test_deep_null_small_system``
-    reference. Path: ``kilo/tests/test_chip.py``,
-    commit ``47607de33e15b8cabdc0e3a4562a7abd98f582a2``. If this test ever
-    starts passing it means a KILO API was bridged into nullsim; revisit the
-    xfail.
-
-    Code Review 2026-05-16 Issue 47: previously called ``pytest.xfail(...)``
-    as the first statement, which short-circuited so the ``from kilo.chip
-    import optimize_null`` below NEVER ran — ``strict=True`` could never
-    flip even if KILO was bridged. Now gated via ``pytest.importorskip``
-    so the import is the actual tripwire.
-    """
-
-    pytest.importorskip("kilo.chip")
-
-    # Will run only if kilo.chip is importable. The xfail marker keeps
-    # this expected-to-fail until KILO is bridged into nullsim's test
-    # dependency surface; when that lands, the assertion runs for real
-    # and the marker should be removed.
-    from kilo.chip import optimize_null
-
-    m = 4
-    stellar = np.ones(m, dtype=complex) / np.sqrt(m)
-    dark = np.array([0, 1])
-    _, null_depth = optimize_null(stellar, m, dark, n_restarts=10, seed=0)
-    assert null_depth < 1e-4
-
-
 def test_params_reject_zero_dark_ports() -> None:
     """Finding 6 regression: n_dark_ports must be >= 1. Pre-fix, the loss
     function took the mean of an empty dark-port slice and returned NaN.

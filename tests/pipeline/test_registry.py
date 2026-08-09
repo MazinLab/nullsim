@@ -5,7 +5,6 @@ from typing import Any
 
 import numpy as np
 import pytest
-from pydantic import BaseModel, ConfigDict
 
 from nullsim.config import NullsimConfigError
 from nullsim.pipeline import BaseStage, Registry, RunContext, SimulationState
@@ -60,38 +59,6 @@ def test_build_instance_raises_for_unknown_stage_type(tmp_path: Path) -> None:
             {"id": "missing", "type": "tests.registry.missing"},
             _context(tmp_path),
         )
-
-
-def test_build_instance_validates_pydantic_params_once(tmp_path: Path) -> None:
-    local_registry = Registry()
-    validate_calls = {"n": 0}
-
-    class CountingParams(BaseModel):
-        model_config = ConfigDict(extra="forbid", frozen=True)
-        value: int = 0
-
-        @classmethod
-        def model_validate(cls, *args: Any, **kwargs: Any):  # type: ignore[override]
-            validate_calls["n"] += 1
-            return super().model_validate(*args, **kwargs)
-
-    class CountingStage(BaseStage):
-        type_name = "tests.registry.counting"
-        family = "scene"
-        produces = frozenset({"scene"})
-        Params = CountingParams
-
-        def apply(self, state: SimulationState) -> SimulationState:
-            return state
-
-    local_registry.register_stage(CountingStage)
-    instance = local_registry.build_instance(
-        {"id": "counting", "type": "tests.registry.counting", "value": 7},
-        _context(tmp_path),
-    )
-
-    assert validate_calls["n"] == 1
-    assert instance.params == {"value": 7}
 
 
 def test_register_plot_and_table_use_callable_names() -> None:

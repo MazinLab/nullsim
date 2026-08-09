@@ -23,7 +23,6 @@ from nullsim.outputs.plots.detection_space import (
     _load_planet_overlay,
     _max_baseline_m,
     _observability_config,
-    _curve_legend_label,
     _plot_characterization_curves,
     _plot_detection_curves,
     _plot_hdc_curves,
@@ -436,27 +435,6 @@ def test_detection_space_overlays_hdc_ccf_curve() -> None:
     plt.close(fig)
 
 
-def test_detection_space_hdc_legend_label_mirrors_the_char_format_plus_r() -> None:
-    """The HDC label is the characterization family's per-record label with the
-    resolving power appended, so the three families read alike down the legend
-    and a J sweep stays distinguishable."""
-
-    collection = _hdc_collection(_hdc_payload(resolving_power_used=2500.0))
-    record = collection.records[0]
-    fig, axes = plt.subplots()
-
-    _plot_detection_curves(axes, collection)
-    _plot_hdc_curves(axes, collection)
-    _attach_legends(axes, (), collection)
-
-    labels = [text.get_text() for text in axes.get_legend().get_texts()]
-    char_label = _curve_legend_label(record, mode="char")
-    expected = char_label.replace("char-mode", "HDC CCF")[:-1] + ", R=2500)"
-    assert expected in labels
-    assert "J=4" in expected and "R=2500" in expected
-    plt.close(fig)
-
-
 def test_detection_space_without_hdc_component_is_unchanged() -> None:
     """Runs with no performance.hdc stage draw no HDC overlay and no legend
     entry, and raise nothing."""
@@ -824,18 +802,6 @@ def test_run_hash_changes_with_catalog_snapshot(tmp_path: Path) -> None:
     hash_a = _run_hash_with_externals(resolved_a, instances=())
     hash_b = _run_hash_with_externals(resolved_b, instances=())
     assert hash_a != hash_b
-
-
-def test_run_hash_unchanged_without_catalog_block() -> None:
-    """No catalog block → behavior identical to the previous baseline (no extra hash mixed in)."""
-    from nullsim.cli import _run_hash_with_externals
-
-    resolved_no_catalog = _resolved_with_catalog(None)
-    hash_no_catalog = _run_hash_with_externals(resolved_no_catalog, instances=())
-    # Re-call must be deterministic.
-    assert hash_no_catalog == _run_hash_with_externals(
-        resolved_no_catalog, instances=()
-    )
 
 
 def test_detection_space_legend_uses_paper_prose_class_labels(

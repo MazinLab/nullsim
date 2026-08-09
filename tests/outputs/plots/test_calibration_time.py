@@ -28,15 +28,6 @@ def test_render_one_trace(tmp_path: Path) -> None:
     assert len(fig.axes) == 1
 
 
-def test_render_three_traces(tmp_path: Path) -> None:
-    out = tmp_path / "calib_three.pdf"
-    plot_calibration_time(
-        [_trace("Y", "C0"), _trace("J", "C1"), _trace("H", "C3")],
-        save_path=out,
-    )
-    assert out.exists()
-
-
 def test_render_empty_returns_placeholder(tmp_path: Path) -> None:
     out = tmp_path / "calib_empty.pdf"
     fig = plot_calibration_time([], save_path=out)

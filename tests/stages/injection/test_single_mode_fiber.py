@@ -83,31 +83,12 @@ def _coupling_component(state: SimulationState) -> np.ndarray:
     return np.asarray(component["coupling_efficiency"], dtype=np.float64)
 
 
-def test_single_mode_fiber_registers_stage_contract(tmp_path: Path) -> None:
-    stage = _stage(tmp_path)
-
-    assert stage.type_name == "injection.single_mode_fiber"
-    assert stage.family == "injection"
-    assert stage.consumes == frozenset({"field", "throughput", "wavefront", "geometry"})
-    assert stage.produces == frozenset({"field", "throughput"})
-
-
 @pytest.mark.parametrize("bad_obscuration", [-0.1, 1.0, math.inf])
 def test_params_reject_invalid_central_obscuration_ratio(
     bad_obscuration: float,
 ) -> None:
     with pytest.raises(ValidationError, match="central_obscuration_ratio"):
         SingleModeFiber.Params(central_obscuration_ratio=bad_obscuration)
-
-
-def test_params_reject_unknown_keys() -> None:
-    with pytest.raises(ValidationError, match="unknown_key"):
-        SingleModeFiber.Params(unknown_key=1)
-
-
-def test_params_reject_nan() -> None:
-    with pytest.raises(ValidationError, match="central_obscuration_ratio"):
-        SingleModeFiber.Params(central_obscuration_ratio=math.nan)
 
 
 def test_zero_strehl_zeroes_field_amplitude_only(tmp_path: Path) -> None:

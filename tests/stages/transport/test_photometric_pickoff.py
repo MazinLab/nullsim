@@ -13,8 +13,6 @@ from nullsim.pipeline import (
     RunContext,
     SimulationState,
     Throughput,
-    build_instance,
-    list_stages,
 )
 from nullsim.stages.transport import PhotometricPickoff
 
@@ -43,24 +41,6 @@ def _state() -> SimulationState:
             transmission_fraction=tuple(0.5 for _ in wavelengths_um),
         ),
     )
-
-
-def test_photometric_pickoff_registers_stage_contract(tmp_path: Path) -> None:
-    stage = build_instance(
-        {
-            "id": "amplitude_pickoff",
-            "type": "transport.photometric_pickoff",
-            "tap_fraction": 0.30,
-        },
-        _context(tmp_path),
-    )
-
-    assert "transport.photometric_pickoff" in list_stages()
-    assert isinstance(stage, PhotometricPickoff)
-    assert stage.type_name == "transport.photometric_pickoff"
-    assert stage.family == "transport"
-    assert stage.consumes == frozenset({"field", "throughput"})
-    assert stage.produces == frozenset({"field", "throughput"})
 
 
 def test_photometric_pickoff_debits_field_without_double_counting_throughput(

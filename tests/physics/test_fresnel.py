@@ -12,30 +12,7 @@ import math
 import numpy as np
 import pytest
 
-from nullsim.physics import (
-    HWPConfig,
-    angular_spectrum_propagate as exported_propagate,
-    decompose_clements,
-    hwp_retardance,
-    jones_to_stokes,
-    linear_polarizer,
-    polarizing_beam_splitter_arm,
-    reconstruct_clements,
-    waveplate,
-)
 from nullsim.physics.fresnel import angular_spectrum_propagate
-
-
-def test_package_level_physics_import_smoke() -> None:
-    assert exported_propagate is angular_spectrum_propagate
-    assert decompose_clements.__name__ == "decompose_clements"
-    assert reconstruct_clements.__name__ == "reconstruct_clements"
-    assert linear_polarizer.__name__ == "linear_polarizer"
-    assert waveplate.__name__ == "waveplate"
-    assert jones_to_stokes.__name__ == "jones_to_stokes"
-    assert hwp_retardance.__name__ == "hwp_retardance"
-    assert polarizing_beam_splitter_arm.__name__ == "polarizing_beam_splitter_arm"
-    assert HWPConfig().band_half_width_lambda == pytest.approx(0.25)
 
 
 def test_zero_distance_returns_original_for_propagating_spectrum() -> None:

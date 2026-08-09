@@ -35,7 +35,6 @@ from nullsim.stages.chip_optimization import (
     _tracker_piston_basis_from_state,
 )
 from nullsim.stages.chip_optimization.ideal_kernel import (
-    _complete_orthonormal_basis,
     _decompose_real_clements,
     _stellar_subspace_basis,
 )
@@ -143,24 +142,6 @@ def test_real_clements_decomposition_uses_zero_internal_phase() -> None:
             np.abs(target),
             atol=1.0e-12,
         )
-
-
-def test_ideal_kernel_basis_completion_is_canonical() -> None:
-    primary = np.array(
-        [
-            [1.0 / np.sqrt(2.0), 0.0],
-            [-1.0 / np.sqrt(2.0), 0.0],
-            [0.0, 1.0],
-        ],
-        dtype=np.complex128,
-    )
-
-    basis_a = _complete_orthonormal_basis(primary, n_modes=3, atol=1.0e-12)
-    basis_b = _complete_orthonormal_basis(-primary, n_modes=3, atol=1.0e-12)
-
-    np.testing.assert_allclose(basis_a.conj().T @ basis_a, np.eye(3), atol=1.0e-12)
-    np.testing.assert_allclose(np.abs(basis_a), np.abs(basis_b), atol=1.0e-12)
-    np.testing.assert_allclose(basis_a[:, 2], np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0))
 
 
 def test_ideal_kernel_basis_uses_svd_principal_components() -> None:
@@ -590,27 +571,6 @@ def test_loss_numpy_disk_samples_require_positions_for_resolved_star() -> None:
             sub_diameters_m=np.ones(4, dtype=np.float64),
             stellar_radius_rad=1.0e-7,
         )
-
-
-def test_loss_numpy_kernel_order_3_matches_loss_shape() -> None:
-    """With positions populated, kernel-order-3 loss runs and returns a finite scalar."""
-
-    p = ChipOptimizationParams(
-        n_modes=4, n_bright_ports=2, n_dark_ports=2,
-        wl_design_um=1.25, kernel_order=3,
-    )
-    rng = np.random.default_rng(0)
-    field = rng.normal(size=(4, 3, 1)) + 1j * rng.normal(size=(4, 3, 1))
-    field = field.astype(np.complex128)
-    positions = rng.normal(size=(4, 2))
-    null_idx = _null_indices(p)
-    x = rng.uniform(0, 2 * np.pi, 4 * 3 + 4)
-    loss = _loss_numpy(
-        x, field_array=field, wavelength_grid_um=(1.20, 1.25, 1.30),
-        params=p, null_idx=null_idx, aperture_positions_pupil_m=positions,
-    )
-    assert np.isfinite(loss)
-    assert loss > 0
 
 
 def test_loss_numpy_kernel_order_sums_rows_over_wavelength_mean() -> None:

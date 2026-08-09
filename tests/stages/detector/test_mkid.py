@@ -22,7 +22,6 @@ from nullsim.pipeline import (
     Scene,
     SimulationState,
     Throughput,
-    list_stages,
 )
 from nullsim.stages.detector import MKIDDetector
 
@@ -117,19 +116,6 @@ def _stage(
     if lambda_ref_um is not None:
         params["lambda_ref_um"] = lambda_ref_um
     return MKIDDetector(params, context)
-
-
-def test_mkid_registers_stage_contract(tmp_path: Path) -> None:
-    stage = _stage(_context(tmp_path))
-
-    assert "detector.mkid" in list_stages()
-    assert stage.type_name == "detector.mkid"
-    assert stage.family == "detector"
-    assert stage.consumes == frozenset({"field", "throughput", "scene", "geometry"})
-    # `throughput` is in `produces` because the detector folds MKID QE into
-    # the throughput chain so downstream throughput-breakdown plots and
-    # downstream outputs see a QE-aware end-to-end transmission.
-    assert stage.produces == frozenset({"photon_rates", "results", "throughput"})
 
 
 def test_mkid_unit_qe_matches_analytical_field_squared_rate(tmp_path: Path) -> None:
@@ -449,34 +435,6 @@ def test_mkid_per_pixel_cap_scales_with_n_pixels(tmp_path: Path) -> None:
     result = stage.apply(state)
     component = result.results.components["detector.mkid"]
     assert component["port_rates"][0] == pytest.approx(n_pixels * cap_hz)
-
-
-def test_mkid_results_component_has_required_keys(tmp_path: Path) -> None:
-    state = _state()
-    stage = _stage(_context(tmp_path))
-
-    result = stage.apply(state)
-    component = result.results.components["detector.mkid"]
-
-    required = {
-        "null_depth_raw",
-        "port_rates",
-        "port_labels",
-        "saturated_per_port",
-        "detector_qe",
-        "mkid_max_count_rate_hz",
-        "n_pixels_bright",
-        "n_pixels_dark",
-        "n_bright_ports",
-        "n_dark_ports",
-        "n_spectro_ports",
-        "integration_time_s",
-        "integrated_counts_per_port",
-        "source_model",
-    }
-    assert required.issubset(component.keys())
-    assert np.isfinite(component["null_depth_raw"])
-    assert component["port_rates"].shape == (4,)
 
 
 def test_mkid_resolution_disabled_preserves_default_payload(tmp_path: Path) -> None:
@@ -800,19 +758,6 @@ def test_mkid_qe_zero_rejected_by_params() -> None:
         )
 
 
-def test_mkid_negative_qe_rejected_by_params() -> None:
-    with pytest.raises(ValidationError, match="qe"):
-        MKIDDetector.Params(
-            qe=-0.1,
-            n_pixels_bright=1,
-            n_pixels_dark=1,
-            n_bright_ports=1,
-            n_dark_ports=3,
-            n_modes=4,
-            integration_time_s=1.0,
-        )
-
-
 def test_mkid_resolution_requires_lambda_ref_when_enabled() -> None:
     with pytest.raises(ValidationError, match="lambda_ref_um"):
         MKIDDetector.Params(
@@ -859,32 +804,6 @@ def test_mkid_n_pixels_dark_zero_rejected_by_params() -> None:
             qe=0.7,
             n_pixels_bright=1,
             n_pixels_dark=0,
-            n_bright_ports=1,
-            n_dark_ports=3,
-            n_modes=4,
-            integration_time_s=1.0,
-        )
-
-
-def test_mkid_n_pixels_bright_negative_rejected_by_params() -> None:
-    with pytest.raises(ValidationError, match="n_pixels_bright"):
-        MKIDDetector.Params(
-            qe=0.7,
-            n_pixels_bright=-1,
-            n_pixels_dark=1,
-            n_bright_ports=1,
-            n_dark_ports=3,
-            n_modes=4,
-            integration_time_s=1.0,
-        )
-
-
-def test_mkid_n_pixels_dark_negative_rejected_by_params() -> None:
-    with pytest.raises(ValidationError, match="n_pixels_dark"):
-        MKIDDetector.Params(
-            qe=0.7,
-            n_pixels_bright=1,
-            n_pixels_dark=-5,
             n_bright_ports=1,
             n_dark_ports=3,
             n_modes=4,

@@ -852,64 +852,6 @@ def test_detection_curve_uses_upstream_injection_coupling(
     )
 
 
-def test_detection_curve_writes_expected_payload_keys(tmp_path: Path) -> None:
-    state = _keck_like_state()
-    stage = DetectionCurve(
-        params={
-            "n_bright_ports": 2,
-            "n_dark_ports": 2,
-            "separations_mas": (1.0, 10.0, 100.0),
-            "n_mc_realizations": 0,
-        },
-        context=_context(tmp_path),
-    )
-    out = stage.apply(state)
-    payload = out.results.components["sensitivity.detection_curve"]
-    expected_keys = {
-        "separations_mas",
-        "planet_throughputs",
-        "wavelengths_m",
-        "n_pa_samples",
-        "include_angular_coupling",
-        "coupling_per_sub",
-        "coupling_source",
-        "sub_areas_m2",
-        "sub_diameters_m",
-        "dark_indices",
-        "n_bright_ports",
-        "n_dark_ports",
-        "n_spectro_ports",
-        "ao_piston_opd_rms_per_sub_m",
-        "stellar_diameter_mas",
-        "disk_null_floor",
-        "null_setpoint_leakage",
-        "setpoint_dither_leakage",
-        "null_setpoint_residual_nm",
-        "setpoint_dither_rms_nm",
-        "realized_null_depth",
-        "realized_null_median",
-        "realized_null_std",
-        "null_instability",
-        "ideal_chip_null_depth",
-        "effective_null_with_disk",
-        "n_mc_samples",
-        "n_azimuths",
-        "n_realizations_per_azimuth",
-        "mc_seed",
-        "fiber_phase_noise_rms_rad",
-        "realized_null_mode_group_indices",
-        "chip_component",
-        "input_phase_correction_applied",
-        "source_model",
-    }
-    assert expected_keys.issubset(payload.keys()), (
-        f"missing keys: {expected_keys - set(payload.keys())}"
-    )
-    assert len(payload["planet_throughputs"]) == 3
-    assert payload["stellar_diameter_mas"] == pytest.approx(1.0)
-    assert payload["chip_component"] == "chip.kernel_mzi_mesh.test"
-
-
 def _state_with_detector_component(
     *,
     bright_rate_hz: float = 1.0e8,

@@ -10,11 +10,6 @@ from nullsim.physics.ruilier_cassaing import (
 )
 
 
-def test_lifted_kilo_nayra_unobstructed_source_constant_to_subpercent() -> None:
-    """KILO and NAYRA both use 0.81 as the rounded geometric source value."""
-    assert geometric_coupling_limit(0.0) == pytest.approx(0.81, rel=6.0e-3)
-
-
 def test_lifted_kilo_nayra_strehl_half_source_value_to_subpercent() -> None:
     """KILO and NAYRA return 0.405 for Strehl 0.5 with Fresnel disabled."""
     assert coupling_efficiency(0.5, central_obscuration_ratio=0.0) == (

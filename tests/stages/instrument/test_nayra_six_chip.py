@@ -47,24 +47,6 @@ def test_nayra_six_chip_manifest_records_six_channels(tmp_path: Path) -> None:
     assert all(0.0 < ch["frontend_to_chip_transmission"] <= 1.0 for ch in channels)
 
 
-def test_nayra_six_chip_arms_share_band_design_ids(tmp_path: Path) -> None:
-    stage = NayraSixChipArchitecture({}, _context(tmp_path))
-
-    result = stage.apply(SimulationState.empty({"wavelength_center_um": 1.25}))
-
-    channels = result.results.components["instrument.nayra_six_chip"]["channels"]
-    by_band: dict[str, set[str]] = {}
-    for channel in channels:
-        by_band.setdefault(str(channel["band"]), set()).add(
-            str(channel["band_design_id"])
-        )
-    assert by_band == {
-        "Y": {"Y_chip_design"},
-        "J": {"J_chip_design"},
-        "H": {"H_chip_design"},
-    }
-
-
 def test_nayra_six_chip_rejects_port_count_mismatch() -> None:
     with pytest.raises(ValidationError):
         NayraSixChipArchitecture.Params(

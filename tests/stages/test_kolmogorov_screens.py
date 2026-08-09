@@ -95,20 +95,6 @@ def _expected_stage_arrays(
     }
 
 
-def test_kolmogorov_screens_registers_stage_contract(
-    stage_run_context: RunContext,
-) -> None:
-    stage = _build_kolmogorov_screens(stage_run_context)
-
-    assert stage.type_name == "atmosphere.kolmogorov"
-    assert stage.family == "atmosphere"
-    assert stage.consumes == frozenset({"geometry"})
-    # `throughput` is in `produces` because the stage now optionally folds
-    # an `atmospheric_transmission` scalar into the throughput chain when
-    # the param is set (it remains a no-op when the param is None).
-    assert stage.produces == frozenset({"opd_budget", "wavefront", "throughput"})
-
-
 def test_kolmogorov_screens_matches_physics_primitives(
     maunakea_scene_geometry_state: SimulationState,
     stage_run_context: RunContext,

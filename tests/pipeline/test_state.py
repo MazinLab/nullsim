@@ -9,43 +9,15 @@ import numpy as np
 import pytest
 
 from nullsim.pipeline import (
-    Field,
     Geometry,
-    OPDBudget,
-    PhotonRates,
     Results,
     Scene,
     SimulationState,
-    Throughput,
-    Wavefront,
 )
 
 EXPECTED_EMPTY_STATE_DIGEST_HEX = (
     "72ae107906862a7ec4bb109cd38e77dd275ef9919825fe523c6d6e1df081ce93"
 )
-
-
-def test_empty_state_has_all_eight_sub_budgets() -> None:
-    state = SimulationState.empty()
-
-    assert SimulationState.budget_names == (
-        "scene",
-        "geometry",
-        "field",
-        "opd_budget",
-        "throughput",
-        "wavefront",
-        "photon_rates",
-        "results",
-    )
-    assert isinstance(state.scene, Scene)
-    assert isinstance(state.geometry, Geometry)
-    assert isinstance(state.field, Field)
-    assert isinstance(state.opd_budget, OPDBudget)
-    assert isinstance(state.throughput, Throughput)
-    assert isinstance(state.wavefront, Wavefront)
-    assert isinstance(state.photon_rates, PhotonRates)
-    assert isinstance(state.results, Results)
 
 
 def test_add_component_returns_new_immutable_instance() -> None:
