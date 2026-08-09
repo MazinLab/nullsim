@@ -2,8 +2,9 @@
 
 These ``@pytest.mark.stats`` tests verify the physics-consistency claims
 spelled out by the architect for the KolmogorovScreens and PyramidWFS
-stages: wavelength scaling, seeing-limit envelopes, AO error scalings,
-and the OPD quadrature invariant. They also save diagnostic plots to
+stages: wavelength scaling, seeing-limit envelopes, and AO error
+scalings. (The OPD quadrature invariant is pinned in
+``test_pyramid_wfs.py``.) They also save diagnostic plots to
 ``tests/output/stats/`` so a human can audit the curves when a
 tolerance-bounded check passes but looks suspicious.
 

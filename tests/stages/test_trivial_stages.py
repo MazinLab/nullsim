@@ -23,14 +23,6 @@ GRID = {
     "wavelength_bandwidth_um": 0.30,
     "n_wavelength_bins": 3,
 }
-EXPECTED_STAGE_TYPES = {
-    "scene.point_source",
-    "telescope.fixed_aperture",
-    "injection.ideal",
-    "chip.identity",
-    "detector.ideal_counter",
-}
-
 # Canonical set of all sub-budget attribute names on SimulationState.
 _ALL_BUDGET_NAMES: frozenset[str] = frozenset({
     "scene",

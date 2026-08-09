@@ -15,6 +15,7 @@ from nullsim.pipeline import (
     Results,
     RunContext,
     SimulationState,
+    build_instance,
 )
 from nullsim.physics.quadrature_fringe_tracker import quadrature_reference_mesh
 from nullsim.stages.diagnostics import FringeObservability
@@ -315,8 +316,10 @@ def test_fringe_observability_stage_honors_count_rate_source(
 
 
 def test_fringe_observability_stage_publishes_rank_payload(tmp_path: Path) -> None:
-    stage = FringeObservability(
-        params={
+    stage = build_instance(
+        {
+            "id": "fringe_observability",
+            "type": "diagnostics.fringe_observability",
             "n_spectral_channels": 4,
             "n_monte_carlo": 16,
             "piston_rms_nm_for_mc": 10.0,
@@ -325,8 +328,9 @@ def test_fringe_observability_stage_publishes_rank_payload(tmp_path: Path) -> No
             "tracker_count_rate_cap_hz_per_channel": 1.0e12,
             "dark_rate_hz_per_channel": 10.0,
         },
-        context=_context(tmp_path),
+        _context(tmp_path),
     )
+    assert isinstance(stage, FringeObservability)
 
     out = stage.apply(_state())
     payload = out.results.components["fringe_observability"]

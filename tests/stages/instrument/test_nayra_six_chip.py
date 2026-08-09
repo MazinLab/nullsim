@@ -46,6 +46,16 @@ def test_nayra_six_chip_manifest_records_six_channels(tmp_path: Path) -> None:
     }
     assert all(0.0 < ch["frontend_to_chip_transmission"] <= 1.0 for ch in channels)
 
+    # The two PBS arms of a band share one chip design: A and B carry the same
+    # band_design_id, so six channels resolve to three distinct designs.
+    design_ids_by_band: dict[str, set[str]] = {}
+    for channel in channels:
+        design_ids_by_band.setdefault(channel["band"], set()).add(
+            channel["band_design_id"]
+        )
+    assert all(len(ids) == 1 for ids in design_ids_by_band.values())
+    assert len({ch["band_design_id"] for ch in channels}) == 3
+
 
 def test_nayra_six_chip_rejects_port_count_mismatch() -> None:
     with pytest.raises(ValidationError):

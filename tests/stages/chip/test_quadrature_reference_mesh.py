@@ -8,7 +8,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nullsim.pipeline import Field, RunContext, SimulationState, Throughput
+from nullsim.pipeline import (
+    Field,
+    RunContext,
+    SimulationState,
+    Throughput,
+    build_instance,
+)
 from nullsim.stages.chip import QuadratureReferenceMesh
 
 
@@ -49,8 +55,10 @@ def _state(
 def test_quadrature_reference_mesh_publishes_rectangular_isometry(
     tmp_path: Path,
 ) -> None:
-    stage = QuadratureReferenceMesh(
-        params={
+    stage = build_instance(
+        {
+            "id": "chip",
+            "type": "chip.quadrature_reference_mesh",
             "n_input_modes": 4,
             "n_bright_ports": 4,
             "n_dark_ports": 3,
@@ -59,8 +67,9 @@ def test_quadrature_reference_mesh_publishes_rectangular_isometry(
             "wl_design_um": 1.25,
             "insertion_loss_db": 0.0,
         },
-        context=_context(tmp_path),
+        _context(tmp_path),
     )
+    assert isinstance(stage, QuadratureReferenceMesh)
 
     out = stage.apply(_state())
     output_field = out.field.amplitudes

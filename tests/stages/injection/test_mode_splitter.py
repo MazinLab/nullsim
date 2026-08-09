@@ -8,7 +8,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nullsim.pipeline import Field, Geometry, RunContext, SimulationState
+from nullsim.pipeline import (
+    Field,
+    Geometry,
+    RunContext,
+    SimulationState,
+    build_instance,
+)
 from nullsim.stages.injection.mode_splitter import ModeSplitter
 
 
@@ -54,7 +60,11 @@ def _state() -> SimulationState:
 def test_mode_splitter_preserves_detector_power_and_aperture_block_order(
     tmp_path: Path,
 ) -> None:
-    stage = ModeSplitter(params={"copies": 2}, context=_context(tmp_path))
+    stage = build_instance(
+        {"id": "splitter", "type": "injection.mode_splitter", "copies": 2},
+        _context(tmp_path),
+    )
+    assert isinstance(stage, ModeSplitter)
 
     out = stage.apply(_state())
     split = out.field.amplitudes

@@ -20,13 +20,6 @@ from nullsim.pipeline import (
 )
 
 WAVELENGTH_GRID_UM = (1.2, 1.4, 1.6, 1.8)
-PASS2_AUTOLOAD_STAGE_TYPES = {
-    "ao.pyramid_wfs",
-    "atmosphere.kolmogorov",
-    "injection.single_mode_fiber",
-    "transport.smf28",
-    "delay_lines.geometric",
-}
 
 
 def test_atmosphere_injection_transport_delay_lines_smoke(tmp_path: Path) -> None:

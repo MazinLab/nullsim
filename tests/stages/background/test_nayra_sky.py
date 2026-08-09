@@ -15,6 +15,7 @@ from nullsim.pipeline import (
     RunContext,
     SimulationState,
     Throughput,
+    build_instance,
 )
 from nullsim.stages.background import NayraSkyBackground
 
@@ -55,14 +56,17 @@ def test_nayra_sky_rate_uses_effective_area_grid_and_throughput(
     tmp_path: Path,
 ) -> None:
     state = _state()
-    stage = NayraSkyBackground(
+    stage = build_instance(
         {
+            "id": "background",
+            "type": "background.nayra_sky",
             "band": "J",
             "sky_mag_arcsec2": 15.5,
             "spaxel_arcsec2": 0.005,
         },
         _context(tmp_path),
     )
+    assert isinstance(stage, NayraSkyBackground)
 
     result = stage.apply(state)
     payload = result.results.components["background.nayra_sky"]

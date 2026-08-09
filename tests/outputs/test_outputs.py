@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import nullsim  # noqa: F401  # ensures stage + output autoload
+import nullsim  # noqa: F401  # import side effect: stage autoload
 from nullsim.config import ResolvedConfig
 from nullsim.outputs import RunCollection, RunRecord
 from nullsim.outputs.plots import contrast_curve
@@ -110,10 +110,6 @@ def _record(tmp_path: Path, star_jmag: float = 5.0) -> RunRecord:
         coord_tuple=(("scene.star.jmag", star_jmag),),
     )
 
-
-# ---------------------------------------------------------------------------
-# Registration: both outputs autoload at import time and live in the registry.
-# ---------------------------------------------------------------------------
 
 def test_sweep_results_writes_all_component_numeric_scalars(tmp_path: Path) -> None:
     """Result components should not need output-specific allow lists."""

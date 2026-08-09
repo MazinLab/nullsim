@@ -51,11 +51,6 @@ def _stage(context: RunContext, **overrides: object) -> SMF28Transport:
     return stage
 
 
-    # n_g was a dead Params field (no computation read it; group index
-    # enters only via the delay-line stage's medium model) — removed in
-    # review 2026-06-10.
-
-
 def _state(
     wavelength_grid_um: tuple[float, ...] = (0.9, 1.0, 1.1),
     *,

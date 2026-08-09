@@ -22,6 +22,7 @@ from nullsim.pipeline import (
     Scene,
     SimulationState,
     Throughput,
+    build_instance,
 )
 from nullsim.stages.detector import SNSPDDetector
 
@@ -93,8 +94,10 @@ def _stage(
     integration_time_s: float = 1.0,
     band: str = "J",
 ) -> SNSPDDetector:
-    return SNSPDDetector(
+    stage = build_instance(
         {
+            "id": "detector",
+            "type": "detector.snspd",
             "qe": qe,
             "snspd_max_count_rate_hz": snspd_max_count_rate_hz,
             "snspd_dark_rate_hz": snspd_dark_rate_hz,
@@ -108,6 +111,8 @@ def _stage(
         },
         context,
     )
+    assert isinstance(stage, SNSPDDetector)
+    return stage
 
 
 def test_snspd_unit_qe_no_dark_matches_analytical_rate(tmp_path: Path) -> None:

@@ -207,17 +207,16 @@ This matches the existing package-wide convention: `ruilier_cassaing`,
 boundaries.  Keeping Fresnel consistent avoids silent unit-mismatch bugs
 when callers pass values from those primitives directly.
 
-### 3. Compat wrapper `propagate_angular_spectrum` is not a stable public surface
+### 3. Compat wrapper `propagate_angular_spectrum` (removed)
 
-A thin compat wrapper `propagate_angular_spectrum` is retained in
-`nullsim/physics/fresnel.py` to satisfy the pinning test
-(`test_fresnel_pinning.py`), which was written against the notes API before
-the implementation landed.  The wrapper converts meters to micrometers and
-delegates to `angular_spectrum_propagate`.
+`nullsim/physics/fresnel.py` once carried a thin compat wrapper
+`propagate_angular_spectrum` that converted meters to micrometers and
+delegated to `angular_spectrum_propagate`.  It existed only to satisfy
+`test_fresnel_pinning.py`, which had been written against the notes API in
+meters before the implementation landed.  It was never part of the stable
+public API — absent from `nullsim/physics/__init__.py` and excluded from
+`fresnel.py`'s `__all__`.
 
-`propagate_angular_spectrum` is **not** part of the stable public API:
-- It is absent from `nullsim/physics/__init__.py`.
-- It is excluded from `fresnel.py`'s `__all__`.
-- It exists only as a transitional bridge for the pinning test and should be
-  removed once the pinning test is updated to call `angular_spectrum_propagate`
-  directly with µm arguments.
+Both the wrapper and that pinning test were removed on 2026-08-09.  The
+propagator contract is now covered entirely by `tests/physics/test_fresnel.py`,
+which calls `angular_spectrum_propagate` directly with µm arguments.

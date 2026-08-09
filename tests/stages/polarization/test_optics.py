@@ -8,7 +8,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nullsim.pipeline import Field, RunContext, SimulationState, Throughput
+from nullsim.pipeline import (
+    Field,
+    RunContext,
+    SimulationState,
+    Throughput,
+    build_instance,
+)
 from nullsim.stages.polarization import (
     HalfWavePlate,
     PMFiberJones,
@@ -66,10 +72,16 @@ def test_hwp_rotates_two_pol_field(tmp_path: Path) -> None:
     amplitudes = np.zeros((1, 1, 2), dtype=np.complex128)
     amplitudes[0, 0, 0] = 1.0
     state = _state_from_amplitudes(amplitudes)
-    stage = HalfWavePlate(
-        {"hwp_angle_rad": np.pi / 4.0, "retardance_error_rms_rad": 0.0},
+    stage = build_instance(
+        {
+            "id": "hwp",
+            "type": "polarization.hwp",
+            "hwp_angle_rad": np.pi / 4.0,
+            "retardance_error_rms_rad": 0.0,
+        },
         _context(tmp_path, "hwp"),
     )
+    assert isinstance(stage, HalfWavePlate)
 
     result = stage.apply(state)
 
@@ -146,8 +158,10 @@ def test_pbs_split_jones_field_keeps_extinction_leakage(tmp_path: Path) -> None:
 def test_pm_fiber_projects_same_axis_power_and_records_jones(tmp_path: Path) -> None:
     amplitudes = np.ones((4, 2, 2), dtype=np.complex128)
     state = _state_from_amplitudes(amplitudes)
-    stage = PMFiberJones(
+    stage = build_instance(
         {
+            "id": "pm",
+            "type": "polarization.pm_fiber",
             "fiber_length_m": 30.0,
             "per_db_floor": 20.0,
             "slow_axis_alignment_rms_rad": 0.0,
@@ -155,6 +169,7 @@ def test_pm_fiber_projects_same_axis_power_and_records_jones(tmp_path: Path) -> 
         },
         _context(tmp_path, "pm"),
     )
+    assert isinstance(stage, PMFiberJones)
 
     result = stage.apply(state)
 

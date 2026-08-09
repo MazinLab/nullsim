@@ -18,7 +18,7 @@ Tests come in three buckets:
    must be clean at the design wavelength, while the deployed physical
    Clements mesh is allowed to show finite-bandwidth chromatic leakage.
 3. **Debug-output sanity**: the 36-mode exploratory run must emit
-   separation-dependent contrast curves and the full diagnostic plot set.
+   separation-dependent contrast curves.
 
 New gaps discovered while writing this config (NOT KILO/NAYRA gaps):
 

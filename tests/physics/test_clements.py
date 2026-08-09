@@ -230,8 +230,3 @@ def test_reconstruct_clements_rejects_non_nearest_neighbor_order() -> None:
 
     with pytest.raises(ValueError, match="nearest-neighbor"):
         reconstruct_clements(bad_decomp)
-
-
-# ---------------------------------------------------------------------------
-# Package-level import smoke (REQUIRED).
-# ---------------------------------------------------------------------------

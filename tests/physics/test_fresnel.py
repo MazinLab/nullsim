@@ -12,7 +12,9 @@ import math
 import numpy as np
 import pytest
 
-from nullsim.physics.fresnel import angular_spectrum_propagate
+# Imported through the package rather than the module so the public re-export
+# in nullsim/physics/__init__.py stays exercised.
+from nullsim.physics import angular_spectrum_propagate
 
 
 def test_zero_distance_returns_original_for_propagating_spectrum() -> None:

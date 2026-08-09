@@ -13,6 +13,7 @@ from nullsim.pipeline import (
     RunContext,
     SimulationState,
     Throughput,
+    build_instance,
 )
 from nullsim.stages.transport import PhotometricPickoff
 
@@ -46,10 +47,15 @@ def _state() -> SimulationState:
 def test_photometric_pickoff_debits_field_without_double_counting_throughput(
     tmp_path: Path,
 ) -> None:
-    stage = PhotometricPickoff(
-        params={"tap_fraction": 0.30},
-        context=_context(tmp_path),
+    stage = build_instance(
+        {
+            "id": "amplitude_pickoff",
+            "type": "transport.photometric_pickoff",
+            "tap_fraction": 0.30,
+        },
+        _context(tmp_path),
     )
+    assert isinstance(stage, PhotometricPickoff)
 
     result = stage.apply(_state())
 
