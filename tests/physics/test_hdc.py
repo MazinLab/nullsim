@@ -136,7 +136,12 @@ def test_snr_scales_as_sqrt_of_line_count():
     assert snr_with_lines(100) / snr_with_lines(25) == pytest.approx(2.0, rel=0.05)
 
 
-def test_telluric_mask_drops_channels_and_costs_snr_monotonically():
+def test_telluric_mask_costs_snr_monotonically_when_filtering_is_bypassed():
+    # Monotonicity holds ONLY in the bypass case used here (width 0, H = I),
+    # where SNR^2 = t sum_i m_i Ptilde_i^2/v_i is a sum of non-negative terms.
+    # With a filter active, dropping a channel changes H itself and can raise
+    # the SNR -- 1.871 to 4.266 on a six-channel width-3 probe. Do not
+    # generalize this test's claim.
     n = 400
     rng = np.random.default_rng(3)
     planet = rng.uniform(0.0, 1.0, n)
@@ -866,49 +871,37 @@ def test_ccf_contrast_solver_survives_large_systematic_over_small_signal():
     assert contrast == pytest.approx(5e160, rel=1e-9)
 
 
-def test_ccf_contrast_solver_raises_value_error_when_systematic_variance_overflows():
-    # eps * B_w * t ~ 1e155, whose square is past the float64 ceiling. The
-    # no-fringe-tracking branch squares with `**`, which raises OverflowError
-    # in matched_filter_ccf; the solver must normalize it to the ValueError it
-    # documents, so a per-anchor sweep has one exception type to catch.
+def test_ccf_contrast_solver_handles_a_systematic_beyond_raw_float64():
+    # Was a ValueError case. Normalizing the coefficient accumulation made it
+    # solvable: V_sys enters the root only through its normalized value, and
+    # eps*B_w*t ~ 1e155 is only unrepresentable in physical units. Both
+    # integration times give the same root because the systematics-dominated
+    # limit c -> n sqrt(V_sys)/(A t) = n eps B_w / A is t independent.
     args = (np.array([1e10]), np.array([1e170]), np.zeros(1), np.zeros(1))
-    with pytest.raises(ValueError, match="systematic variance overflows"):
-        ccf_contrast_at_target_snr(
+    for time_s in (1e140, 1e145):
+        solution = ccf_contrast_at_target_snr(
             *args,
             **_solver_kwargs(
-                integration_time_s=1e145,
+                integration_time_s=time_s,
                 target_snr=5.0,
                 eps_systematic=1.0,
                 with_fringe_tracking=False,
             ),
         )
+        assert solution.contrast_at_target_snr == pytest.approx(5e160, rel=1e-9)
 
-    # The fringe-tracking branch multiplies rather than squaring, so it
-    # saturates to inf silently; it must reach the same ValueError.
+    # A systematic that overflows even after normalization still raises, and
+    # still as ValueError rather than OverflowError.
     with pytest.raises(ValueError, match="systematic variance overflows"):
         ccf_contrast_at_target_snr(
             *args,
             **_solver_kwargs(
-                integration_time_s=1e160,
+                integration_time_s=1e200,
                 target_snr=5.0,
-                eps_systematic=1.0,
-                servo_bw_hz=1e-130,
-                with_fringe_tracking=True,
+                eps_systematic=1e120,
+                with_fringe_tracking=False,
             ),
         )
-
-    # Just below the threshold the diagnostic semantics are unchanged.
-    solution = ccf_contrast_at_target_snr(
-        *args,
-        **_solver_kwargs(
-            integration_time_s=1e140,
-            target_snr=5.0,
-            eps_systematic=1.0,
-            with_fringe_tracking=False,
-        ),
-    )
-    assert solution.systematic_var_counts == pytest.approx(1e300, rel=1e-9)
-    assert solution.contrast_at_target_snr == pytest.approx(5e160, rel=1e-9)
 
 
 def test_flat_spectra_are_exact_despite_large_systematics():
@@ -1118,3 +1111,217 @@ def test_ccf_contrast_solver_survives_large_b2_over_small_signal():
         / solution.signal_coefficient
     )
     assert contrast == pytest.approx(expected, rel=1e-9)
+
+
+# --- masking semantics and scale hardening (review round 2) -----------------
+
+
+def test_mask_semantics_agree_between_detection_and_rv_statistics():
+    # Regression: matched_filter_ccf masked the filtered-output weights and then
+    # formed a = H^T w, which H^T spreads back onto masked channels, so the
+    # detection statistic read photons the mask had excluded (0.1936) while the
+    # RV scan, constrained in raw space, reported 0.0. Both now use raw-channel
+    # exclusion, so both see the same subspace.
+    planet = np.array([4.0, 1.0, 0.5, 2.0, 2.0])
+    leak = np.full(5, 10.0) - planet
+    telluric = np.array([0.0, 0.0, 0.0, 1.0, 1.0])
+    data = _channels(planet, leak)
+    mask_kwargs = dict(
+        telluric_transmission_per_channel=telluric,
+        telluric_mask_threshold=0.5,
+    )
+
+    budget = matched_filter_ccf(
+        data,
+        integration_time_s=1.0,
+        eps_systematic=0.0,
+        servo_bw_hz=100.0,
+        with_fringe_tracking=True,
+        continuum_filter_width_channels=3,
+        **mask_kwargs,
+    )
+    (rv_score,) = ccf_vs_rv(
+        lambda _rv: _channels(planet, leak),
+        [0.0],
+        data_channels=data,
+        continuum_filter_width_channels=3,
+        integration_time_s=1.0,
+        **mask_kwargs,
+    )
+
+    assert budget.n_channels_used == 2
+    assert np.all(budget.template_weights[:3] == 0.0)
+    # Two admitted channels with equal planet rate: a zero-sum filter on them
+    # sees nothing, and the detection statistic must agree rather than
+    # manufacturing signal out of masked photons.
+    assert budget.ccf_snr_photon_limited == pytest.approx(0.0)
+    assert rv_score == pytest.approx(0.0)
+    assert rv_score >= budget.ccf_snr_photon_limited
+
+
+def test_rv_scan_dominates_the_detection_snr_under_a_mask():
+    # For a leak that the zero-sum filter largely annihilates -- the realistic
+    # case -- the whitened optimum sits at or above the fixed-filter detection
+    # SNR on the same admitted subspace. Not a theorem: the two correlate
+    # against different vectors (observed planet-plus-leak versus planet
+    # alone), so a leak that cancels the planet's structure can invert it. The
+    # point pinned here is that masking no longer breaks the comparison, which
+    # it did when the two used different feasible subspaces.
+    rng = np.random.default_rng(17)
+    n = 40
+    planet = rng.uniform(0.0, 3.0, n)
+    leak = rng.uniform(50.0, 200.0, n)
+    telluric = rng.uniform(0.0, 1.0, n)
+    data = _channels(planet, leak)
+    mask_kwargs = dict(
+        telluric_transmission_per_channel=telluric,
+        telluric_mask_threshold=0.4,
+    )
+    budget = matched_filter_ccf(
+        data,
+        integration_time_s=250.0,
+        eps_systematic=0.0,
+        servo_bw_hz=100.0,
+        with_fringe_tracking=True,
+        continuum_filter_width_channels=7,
+        **mask_kwargs,
+    )
+    (rv_score,) = ccf_vs_rv(
+        lambda _rv: _channels(planet, leak),
+        [0.0],
+        data_channels=data,
+        continuum_filter_width_channels=7,
+        integration_time_s=250.0,
+        **mask_kwargs,
+    )
+    assert budget.n_channels_used == int(np.count_nonzero(telluric >= 0.4))
+    assert rv_score >= budget.ccf_snr_photon_limited * (1.0 - 1e-12)
+
+
+def test_ccf_vs_rv_bypass_uses_the_unconstrained_optimum():
+    # width <= 0 means H = I, whose null space is empty, so there is no
+    # zero-sum constraint and no mean to remove: the optimum is a = T/v.
+    # Applying the constraint anyway returned 0 for a single channel.
+    rng = np.random.default_rng(2)
+    for n in (1, 2, 5):
+        planet = rng.uniform(0.5, 5.0, n)
+        leak = rng.uniform(0.5, 5.0, n)
+        data = _channels(planet, leak)
+        (got,) = ccf_vs_rv(
+            lambda _rv: _channels(planet, leak),
+            [0.0],
+            data_channels=data,
+            continuum_filter_width_channels=0,
+            integration_time_s=7.0,
+        )
+        rate = planet + leak
+        weights = planet / rate
+        expected = (
+            math.sqrt(7.0)
+            * float(weights @ rate)
+            / math.sqrt(float(np.sum(weights * weights * rate)))
+        )
+        assert got == pytest.approx(expected, rel=1e-12)
+        assert got > 0.0
+
+
+def test_ccf_vs_rv_survives_extreme_but_finite_variances():
+    # 1/v overflows on its own at v ~ 1e-308; normalizing the inverse variances
+    # and the filter vector before squaring keeps the score finite.
+    for magnitude in (1e-308, 1e-150, 1.0, 1e150):
+        planet = np.array([2.0, 1.0]) * magnitude
+        data = _channels(planet, np.zeros(2))
+        (got,) = ccf_vs_rv(
+            lambda _rv: _channels(np.array([1.0, 2.0]), np.zeros(2)),
+            [0.0],
+            data_channels=data,
+            continuum_filter_width_channels=3,
+            integration_time_s=1e308,
+        )
+        direction = np.array([-1.0, 1.0])
+        expected = (
+            math.sqrt(1e308)
+            * float(direction @ planet)
+            / math.sqrt(float(np.sum(direction * direction * planet)))
+        )
+        assert np.isfinite(got)
+        assert got == pytest.approx(expected, rel=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("planet_unit", "leak", "time_s", "expected", "label"),
+    [
+        ([1e-200, 0.0, 0.0], 1e100, 1e308, None, "A underflows unscaled"),
+        ([1e200, 0.0, 0.0], 1e100, 1e-100, None, "C2 overflows unscaled"),
+        ([1.0, 0.0, 0.0], 1e-200, 1.0, 25.0, "w^2 overflows unscaled"),
+    ],
+)
+def test_ccf_contrast_solver_scales_the_coefficient_accumulation(
+    planet_unit, leak, time_s, expected, label
+):
+    # The hardened root formula was not enough: A, B2 and C2 themselves
+    # over/underflow while being accumulated from raw rates. Normalizing by
+    # alpha = max|P1|, beta = sqrt(min v0 max v0) and gamma = max|w| fixes it.
+    planet_array = np.array(planet_unit, dtype=np.float64)
+    leak_array = np.full(planet_array.size, leak)
+    zeros = np.zeros(planet_array.size)
+    solution = ccf_contrast_at_target_snr(
+        planet_array,
+        leak_array,
+        zeros,
+        zeros,
+        **_solver_kwargs(
+            integration_time_s=time_s,
+            target_snr=5.0,
+            eps_systematic=0.0,
+            continuum_filter_width_channels=3,
+        ),
+    )
+    contrast = solution.contrast_at_target_snr
+    assert np.isfinite(contrast)
+    assert contrast > 0.0
+    if expected is not None:
+        assert contrast == pytest.approx(expected, rel=1e-9)
+
+
+def test_ccf_contrast_solver_handles_a_target_snr_that_squares_to_zero():
+    # n^2 underflows for a 1e-200 target, which used to zero the constant term
+    # and return 0. n now appears at most once per product.
+    solution = ccf_contrast_at_target_snr(
+        np.array([1.0, 2.0, 3.0]),
+        np.full(3, 100.0),
+        np.zeros(3),
+        np.zeros(3),
+        **_solver_kwargs(
+            integration_time_s=3600.0,
+            target_snr=1e-200,
+            eps_systematic=0.0,
+            continuum_filter_width_channels=3,
+        ),
+    )
+    assert solution.contrast_at_target_snr > 0.0
+    assert np.isfinite(solution.contrast_at_target_snr)
+
+
+def test_ccf_contrast_root_survives_a_discriminant_that_doubling_would_overflow():
+    # Discriminates the hypot(P/2, sqrt(Q)) rewrite from the old
+    # hypot(P, 2 sqrt(Q)): here sqrt(Q) ~ 9.2e307, so doubling it overflows to
+    # inf and the old form raised "not representable" on a finite root.
+    alpha = 1.1e-306
+    planet_unit = np.array([alpha, 0.5 * alpha, alpha])
+    solution = ccf_contrast_at_target_snr(
+        planet_unit,
+        np.full(3, 1.0),
+        np.zeros(3),
+        np.zeros(3),
+        **_solver_kwargs(
+            integration_time_s=1.0,
+            target_snr=5.0,
+            eps_systematic=0.0,
+            continuum_filter_width_channels=3,
+        ),
+    )
+    contrast = solution.contrast_at_target_snr
+    assert np.isfinite(contrast)
+    assert contrast == pytest.approx(9.225286e307, rel=1e-5)
+    assert not np.isfinite(2.0 * contrast)  # the quantity the old form doubled

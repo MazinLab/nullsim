@@ -344,9 +344,11 @@ class HdcCcfStage(BaseStage):
                 np.float64, copy=True
             ),
             # v_i = P_i + L_i + S_sky,i + D_i, the Poisson variance rate the
-            # matched filter divides by. Published because the weights alone do
-            # not determine a channel's SNR contribution: that is
-            # w_i^2 v_i = Ptilde_i^2 / v_i, which needs v_i.
+            # filter divides by. Published because the weights alone do not
+            # determine a channel's noise contribution: that is u_i^2 v_i with
+            # u = H^T w, NOT w_i^2 v_i. The continuum filter correlates
+            # neighbouring channels, so a channel's share depends on its
+            # neighbours' weights as well as its own.
             "ccf_variance_rate_hz_per_channel": channels.total_rate_hz().astype(
                 np.float64, copy=True
             ),

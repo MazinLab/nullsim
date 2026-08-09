@@ -20,8 +20,10 @@ C_y = t H diag(v) H^T + K Ltilde Ltilde^T,
 ```
 
 whose rank-one systematic part Sherman-Morrison inverts in closed form. It
-projects out the leak direction and can beat this statistic by an order of
-magnitude once systematics dominate.
+downweights the leak direction -- suppressing it by
+``1/(1 + K Ltilde^T C_ph^+ Ltilde)``, so "projects out" is exact only in the
+``K -> inf`` limit -- and can beat this statistic by an order of magnitude once
+systematics dominate.
 
 The filtered photon term matters: writing the photon part as the unfiltered
 ``diag(v t)`` does not give a bound at all. That version is
@@ -592,6 +594,35 @@ def _require_same_grid(
             )
 
 
+def _analysis_indices(
+    keep: NDArray[np.bool_], variance_rate_hz: NDArray[np.float64]
+) -> NDArray[np.intp]:
+    """Channels the statistic is allowed to read, as an index array.
+
+    **Masking semantics: raw-channel exclusion.** A telluric-masked channel
+    carries no usable data, so no statistic may depend on its photons at all.
+    Everything downstream therefore works on the compacted sub-vector of
+    admitted channels, and the continuum filter is built on *that* vector: the
+    statistic is ``a . N`` with ``a`` supported on this set, full stop.
+
+    The alternative -- filter on the full vector and zero the filtered-output
+    weights -- looks equivalent but is not, because ``H^T`` spreads support:
+    ``a = H^T w`` is generally nonzero where ``w`` is zero, so masked photons
+    leak back into the statistic. That is what `matched_filter_ccf` used to do,
+    and it is why its SNR disagreed with the RV scan under a mask (0.1936
+    against 0.0 on the review's five-channel probe).
+
+    Channels with ``v_i <= 0`` are excluded on the same footing, rather than
+    rejected with an error: a channel with no photons carries no information,
+    and admitting it would make ``H diag(v) H^T`` rank-deficient relative to
+    ``H``, breaking the ``range(C_y) = range(H)`` identity the RV optimum
+    relies on. Excluding it restores that identity by construction on the
+    reduced space, and degrades gracefully rather than failing a whole sweep
+    because one anchor has an empty channel.
+    """
+    return np.flatnonzero(keep & (variance_rate_hz > 0.0))
+
+
 def _weights(
     template_hz: NDArray[np.float64],
     variance_rate_hz: NDArray[np.float64],
@@ -636,20 +667,39 @@ def matched_filter_ccf(
     )
     variance_rate = channels.total_rate_hz()
     planet = channels.planet_rate_hz
-    planet_filtered = _filtered(planet, continuum_filter_width_channels)
-    leak_filtered = _filtered(channels.leak_rate_hz, continuum_filter_width_channels)
+    admitted = _analysis_indices(keep, variance_rate)
 
-    weights, usable = _weights(planet_filtered, variance_rate, keep)
+    # Raw-channel exclusion: compact to the admitted channels and build the
+    # filter on that vector, so the statistic cannot read a masked photon.
+    variance_admitted = variance_rate[admitted]
+    planet_admitted = planet[admitted]
+    planet_filtered = _filtered(planet_admitted, continuum_filter_width_channels)
+    leak_filtered = _filtered(
+        channels.leak_rate_hz[admitted], continuum_filter_width_channels
+    )
+
+    admitted_weights = (
+        planet_filtered / variance_admitted
+        if admitted.size
+        else np.zeros(0, dtype=np.float64)
+    )
+    weights = np.zeros(n_ch, dtype=np.float64)
+    weights[admitted] = admitted_weights
     # u = H^T w. The statistic is w . (H N) for independent Poisson counts N, so
     # its variance is t sum_i u_i^2 v_i, NOT the raw diagonal t sum_i w_i^2 v_i:
     # the filter correlates neighbouring channels.
-    noise_weights = _filtered_adjoint(weights, continuum_filter_width_channels)
-
-    signal_counts = float(np.sum(weights * planet_filtered) * integration_time_s)
-    photon_var_counts = float(
-        np.sum(noise_weights * noise_weights * variance_rate) * integration_time_s
+    noise_weights = _filtered_adjoint(
+        admitted_weights, continuum_filter_width_channels
     )
-    systematic_ccf_leakage = float(np.sum(weights * leak_filtered))
+
+    signal_counts = float(
+        np.sum(admitted_weights * planet_filtered) * integration_time_s
+    )
+    photon_var_counts = float(
+        np.sum(noise_weights * noise_weights * variance_admitted)
+        * integration_time_s
+    )
+    systematic_ccf_leakage = float(np.sum(admitted_weights * leak_filtered))
 
     systematic_var_counts = _systematic_variance_counts(
         systematic_ccf_leakage,
@@ -683,9 +733,9 @@ def matched_filter_ccf(
         self_subtraction_factor = 1.0
     else:
         snr_sq_unfiltered = float(
-            _masked_ratio(planet * planet, variance_rate, usable).sum()
+            np.sum(planet_admitted * planet_admitted / variance_admitted)
             * integration_time_s
-        )
+        ) if admitted.size else 0.0
         # No template signal at all to retain: report 0.0 by convention.
         self_subtraction_factor = (
             ccf_snr_photon_limited / math.sqrt(snr_sq_unfiltered)
@@ -693,8 +743,8 @@ def matched_filter_ccf(
             else 0.0
         )
 
-    abs_sum = float(np.sum(np.abs(weights)))
-    sq_sum = float(np.sum(weights * weights))
+    abs_sum = float(np.sum(np.abs(admitted_weights)))
+    sq_sum = float(np.sum(admitted_weights * admitted_weights))
     n_effective_channels = abs_sum * abs_sum / sq_sum if sq_sum > 0.0 else 0.0
 
     return CcfBudget(
@@ -706,7 +756,7 @@ def matched_filter_ccf(
         systematic_ccf_leakage=systematic_ccf_leakage,
         self_subtraction_factor=self_subtraction_factor,
         n_effective_channels=n_effective_channels,
-        n_channels_used=int(np.count_nonzero(usable)),
+        n_channels_used=int(admitted.size),
         template_weights=weights,
     )
 
@@ -820,30 +870,50 @@ def ccf_vs_rv(
         n_ch, telluric_transmission_per_channel, telluric_mask_threshold
     )
     variance_rate = data_channels.total_rate_hz()
-    usable = keep & (variance_rate > 0.0)
-    observed = data_channels.planet_rate_hz + data_channels.leak_rate_hz
-    inverse_variance = _masked_ratio(np.ones(n_ch), variance_rate, usable)
-    inverse_variance_total = float(inverse_variance.sum())
+    admitted = _analysis_indices(keep, variance_rate)
+    observed = (data_channels.planet_rate_hz + data_channels.leak_rate_hz)[admitted]
+    variance_admitted = variance_rate[admitted]
     sqrt_time = math.sqrt(integration_time_s)
+    bypassed = int(continuum_filter_width_channels) <= 0
 
     values = np.zeros(rv_array.size, dtype=np.float64)
-    if inverse_variance_total <= 0.0:
+    if admitted.size == 0:
         return values
+
+    # Inverse variances normalized to unit maximum. The score is invariant under
+    # rescaling the filter vector, and 1/v overflows on its own for v ~ 1e-308.
+    rate_scale = float(np.max(variance_admitted))
+    inverse_variance = rate_scale / variance_admitted
+    inverse_variance_total = float(inverse_variance.sum())
 
     for index, rv in enumerate(rv_array):
         trial = channels_at_trial_rv_fn(float(rv))
         _require_same_grid(trial, data_channels, rv)
-        template = trial.planet_rate_hz
-        # Variance-weighted mean: the one direction H cannot see.
-        offset = float(np.sum(inverse_variance * template)) / inverse_variance_total
-        filter_vector = inverse_variance * (template - offset)
-        filter_vector[~usable] = 0.0
-        norm = math.sqrt(float(np.sum(filter_vector**2 * variance_rate)))
+        template = trial.planet_rate_hz[admitted]
+        template_scale = float(np.max(np.abs(template)))
+        if template_scale <= 0.0:
+            continue
+        template = template / template_scale
+        if bypassed:
+            # H = I has no null space, so there is no zero-sum constraint and no
+            # mean to remove: the optimum is the plain inverse-variance
+            # weighting. Applying the constraint here would be wrong, and for a
+            # single admitted channel it silently returns zero.
+            filter_vector = inverse_variance * template
+        else:
+            # Subtract the variance-weighted mean: the one direction H destroys.
+            offset = (
+                float(np.sum(inverse_variance * template)) / inverse_variance_total
+            )
+            filter_vector = inverse_variance * (template - offset)
+        filter_scale = float(np.max(np.abs(filter_vector)))
+        if filter_scale <= 0.0:
+            continue
+        filter_vector = filter_vector / filter_scale
+        norm = math.sqrt(float(np.sum(filter_vector**2 * variance_admitted)))
         if norm <= 0.0:
             continue
-        values[index] = (
-            sqrt_time * float(np.sum(filter_vector * observed)) / norm
-        )
+        values[index] = sqrt_time * float(np.sum(filter_vector * observed)) / norm
     return values
 
 
@@ -1050,15 +1120,66 @@ def ccf_contrast_at_target_snr(
     variance_rate_zero_contrast = (
         leak + arrays["sky_rate_hz_per_channel"] + arrays["dark_rate_hz_per_channel"]
     )
-    planet_unit_filtered = _filtered(planet_unit, continuum_filter_width_channels)
-    leak_filtered = _filtered(leak, continuum_filter_width_channels)
+    admitted = _analysis_indices(keep, variance_rate_zero_contrast)
+    if admitted.size == 0:
+        raise ValueError(
+            "no template signal survives: every channel is telluric-masked or "
+            "has zero variance, so no channel is admitted and no contrast "
+            "reaches the target SNR"
+        )
+    planet_admitted = planet_unit[admitted]
+    variance_admitted = variance_rate_zero_contrast[admitted]
 
-    weights, _usable = _weights(
-        planet_unit_filtered, variance_rate_zero_contrast, keep
+    # Accumulate the coefficients on NORMALIZED arrays. Forming A, B2 and C2
+    # from the raw rates over/underflows on inputs whose root is perfectly
+    # representable: P1 ~ 1e-200 against a 1e100 leak flushes A to zero,
+    # P1 ~ 1e200 overflows C2, and a 1e-200 leak overflows w^2 while B2 is being
+    # built. Three scales keep every intermediate in range:
+    #
+    #   alpha = max|P1|                 -> |p| <= 1
+    #   beta  = sqrt(min v0 * max v0)   -> vv within sqrt(span) of 1
+    #   gamma = max|ptilde/vv|          -> |w_hat| <= 1
+    #
+    # beta is the geometric mean, not the maximum: normalizing by the maximum
+    # drives the small end subnormal whenever v0 spans more than ~1e300, which
+    # is reachable (1e-10 against 1e308) and silently yields NaN. The geometric
+    # mean splits the span so both ends sit within sqrt(span) of 1. With
+    # kappa = (alpha/beta) gamma the scales come back out analytically,
+    #
+    #   A = kappa alpha A'',        B2 = kappa^2 beta B2'',
+    #   C2 = kappa^2 alpha C2'',    B_w = kappa beta B_w'',
+    #   V_sys = (kappa beta)^2 V_sys''    (quadratic in B_w in both regimes)
+    #
+    # and kappa cancels out of the root entirely.
+    scale_planet = float(np.max(np.abs(planet_admitted)))
+    if scale_planet <= 0.0:
+        raise ValueError(
+            "no template signal survives continuum filtering and telluric "
+            "masking (A <= 0), so no contrast reaches the target SNR"
+        )
+    scale_rate = math.sqrt(float(np.min(variance_admitted))) * math.sqrt(
+        float(np.max(variance_admitted))
     )
+    normalized_planet = planet_admitted / scale_planet
+    normalized_variance = variance_admitted / scale_rate
 
-    signal_coefficient = float(np.sum(weights * planet_unit_filtered))
-    if signal_coefficient <= 0.0:
+    planet_unit_filtered = _filtered(
+        normalized_planet, continuum_filter_width_channels
+    )
+    leak_filtered = _filtered(
+        leak[admitted] / scale_rate, continuum_filter_width_channels
+    )
+    unscaled_weights = planet_unit_filtered / normalized_variance
+    scale_weight = float(np.max(np.abs(unscaled_weights)))
+    if scale_weight <= 0.0:
+        raise ValueError(
+            "no template signal survives continuum filtering and telluric "
+            "masking (A <= 0), so no contrast reaches the target SNR"
+        )
+    admitted_weights = unscaled_weights / scale_weight
+
+    normalized_signal = float(np.sum(admitted_weights * planet_unit_filtered))
+    if normalized_signal <= 0.0:
         raise ValueError(
             "no template signal survives continuum filtering and telluric "
             "masking (A <= 0), so no contrast reaches the target SNR"
@@ -1067,77 +1188,82 @@ def ccf_contrast_at_target_snr(
     # v = v0 + c P1, split by their dependence on c. Using u = H^T w keeps the
     # variance exact; using w would revert to the diagonal approximation. The
     # split stays affine in c, so the target-SNR condition stays quadratic.
-    noise_weights = _filtered_adjoint(weights, continuum_filter_width_channels)
-    photon_var_zero_contrast = float(
-        np.sum(noise_weights * noise_weights * variance_rate_zero_contrast)
+    noise_weights = _filtered_adjoint(
+        admitted_weights, continuum_filter_width_channels
     )
-    planet_selfnoise_coefficient = float(
-        np.sum(noise_weights * noise_weights * planet_unit)
+    normalized_photon_var = float(
+        np.sum(noise_weights * noise_weights * normalized_variance)
     )
-    leak_projection_hz = float(np.sum(weights * leak_filtered))
-    # `matched_filter_ccf` lets an overflowing V_sys surface as it comes: the
-    # no-fringe-tracking branch squares with `**`, which raises OverflowError,
-    # while the fringe-tracking branch multiplies and quietly yields inf. This
-    # entry point normalizes both to the ValueError it already documents for a
-    # non-representable result, so a caller sweeping separation anchors has one
-    # exception type to catch. Below the threshold nothing changes.
+    normalized_selfnoise = float(
+        np.sum(noise_weights * noise_weights * normalized_planet)
+    )
+    normalized_leak_projection = float(np.sum(admitted_weights * leak_filtered))
+
+    # V_sys in normalized units. The (kappa beta)^2 that turns it into counts^2
+    # is applied only to the reported field, never inside the root, so a
+    # diagnostic that saturates cannot make a representable root unreachable.
     try:
-        systematic_var_counts = _systematic_variance_counts(
-            leak_projection_hz,
+        normalized_systematic = _systematic_variance_counts(
+            normalized_leak_projection,
             integration_time_s,
             eps_systematic,
             servo_bw_hz,
             with_fringe_tracking,
         )
     except OverflowError:
-        systematic_var_counts = math.inf
-    if not math.isfinite(systematic_var_counts):
-        # Plain multiplication saturates to inf rather than raising, so this
-        # is safe to evaluate even when the square of it is not.
-        amplitude = eps_systematic * abs(leak_projection_hz) * integration_time_s
+        normalized_systematic = math.inf
+    if not math.isfinite(normalized_systematic):
         raise ValueError(
-            "systematic variance overflows float64; "
-            f"eps*B_w*t ~ {amplitude!r} with eps={eps_systematic!r}, "
-            f"B_w={leak_projection_hz!r}, t={integration_time_s!r}"
+            "systematic variance overflows float64 even after normalization; "
+            f"eps={eps_systematic!r}, normalized B_w="
+            f"{normalized_leak_projection!r}, t={integration_time_s!r}"
         )
 
-    # Solve in scaled variables. Forming the dimensional coefficients directly
-    # overflows or underflows well inside the range of physically valid inputs:
-    # A ~ 1e150 already squares past the float64 ceiling, and A^2 t^2 flushes to
-    # zero for rates around 1e-200. Substituting c = c0 x with the
-    # photon-limited root c0 = n / sqrt(A t) reduces the quadratic to
+    weight_scale = (scale_planet / scale_rate) * scale_weight
+    weights = np.zeros(n_ch, dtype=np.float64)
+    weights[admitted] = admitted_weights * weight_scale
+    # Reported diagnostics in physical units. These may saturate in the extreme
+    # corners the normalized solve still handles; the root never uses them.
+    signal_coefficient = normalized_signal * weight_scale * scale_planet
+    photon_var_zero_contrast = (
+        normalized_photon_var * weight_scale * weight_scale * scale_rate
+    )
+    planet_selfnoise_coefficient = (
+        normalized_selfnoise * weight_scale * weight_scale * scale_planet
+    )
+    # Multiplication, never `**`: float `*` saturates to inf while `**` raises
+    # OverflowError, and a saturating diagnostic must not abort a solvable root.
+    leak_scale = weight_scale * scale_rate
+    systematic_var_counts = normalized_systematic * leak_scale * leak_scale
+
+    # Solve the normalized quadratic. Substituting the scale relations above
+    # into (A^2 t^2) c^2 - (n^2 t C2) c - n^2 (t B2 + V_sys) = 0 and dividing
+    # through leaves
     #
-    #     x^2 - p x - q = 0,    p = c0 C2 / A,    q = B2/A + V_sys/(A t),
+    #     c^2 - P c - Q = 0,
+    #     P = g * (n C2''/(A'' t)),   g = n / (A'' alpha),
+    #     Q = g^2 (beta B2''/t + beta^2 V_sys''/t^2),
     #
-    # which removes the A t and A^2 products. The reduced coefficients are not
-    # themselves near unity -- p and q each still span the dynamic range of the
-    # inputs, and q overflows on its own for a large V_sys over a small A. So q
-    # is never materialized: only sqrt(q) is needed, and taking the square root
-    # of each term first halves its exponent, which is what actually keeps the
-    # arithmetic in range.
-    sqrt_signal = math.sqrt(signal_coefficient)
+    # so n never appears squared inside one product (a 1e-200 target flushes
+    # n^2 to zero) and beta t B2'' is never formed (it overflows for beta ~
+    # 1e100 at t ~ 1e308). Only sqrt(Q) is needed, and every factor in it
+    # enters at half exponent.
+    gain = (target_snr / normalized_signal) / scale_planet
+    reduced_linear = gain * (
+        target_snr * normalized_selfnoise / normalized_signal / integration_time_s
+    )
     sqrt_time = math.sqrt(integration_time_s)
-    contrast_scale = (target_snr / sqrt_signal) / sqrt_time
-    reduced_linear = contrast_scale * (
-        planet_selfnoise_coefficient / signal_coefficient
+    sqrt_reduced_constant = gain * math.hypot(
+        math.sqrt(scale_rate) * math.sqrt(normalized_photon_var) / sqrt_time,
+        (scale_rate / integration_time_s) * math.sqrt(normalized_systematic),
     )
-    # sqrt(q) = hypot(sqrt(B2/A), sqrt(V_sys/(A t))), with the systematic term
-    # grouped as sqrt(V_sys)/(sqrt(A) sqrt(t)): V_sys/A alone overflows for a
-    # large systematic against a small signal coefficient.
-    # sqrt(B2)/sqrt(A), never sqrt(B2/A): the covariance fix broke the A = B2
-    # identity, so the ratio itself can overflow on inputs whose root is
-    # perfectly representable (B2 ~ 1e126 against A ~ 1e-191).
-    sqrt_reduced_constant = math.hypot(
-        math.sqrt(photon_var_zero_contrast) / sqrt_signal,
-        (math.sqrt(systematic_var_counts) / sqrt_signal) / sqrt_time,
-    )
-    # 0.5 (p + sqrt(p^2 + 4q)) == 0.5 p + hypot(p/2, sqrt(q)). Written this way
-    # nothing is squared and 2*sqrt(q) is never formed, either of which would
+    # 0.5 (P + sqrt(P^2 + 4Q)) == 0.5 P + hypot(P/2, sqrt(Q)). Written this way
+    # nothing is squared and 2*sqrt(Q) is never formed, either of which would
     # overflow before the root does.
     reduced_root = 0.5 * reduced_linear + math.hypot(
         0.5 * reduced_linear, sqrt_reduced_constant
     )
-    contrast = contrast_scale * reduced_root
+    contrast = reduced_root
     if not math.isfinite(contrast) or contrast <= 0.0:
         raise ValueError(
             f"the contrast solution is not representable (got {contrast!r}) for "

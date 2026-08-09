@@ -824,10 +824,18 @@ def test_hdc_ccf_rv_statistic_peaks_at_the_true_radial_velocity(
     Re-pinned when the RV statistic became the whitened (C_y-pseudoinverse)
     matched filter. It used to equal ``ccf_snr_photon_limited`` at the true RV,
     because it shared that statistic's fixed-template weights; it no longer
-    does, and must not. Whitening by the filtered covariance recovers the
-    signal the continuum filter attenuated, so the localization score sits
-    strictly above the detection SNR -- Cauchy-Schwarz, since the optimum over
-    the subspace dominates any fixed filter in it.
+    does, and must not. Whitening recovers the signal the continuum filter
+    attenuated, so the localization score sits at or above the detection SNR
+    for a smooth leak like this one.
+
+    Not strictly above, and not a theorem. The optimum dominating any fixed
+    filter in its subspace would give ``>=`` only if both correlated against
+    the same vector, and they do not: the scan correlates against the observed
+    planet-plus-leak spectrum while the detection signal is the planet alone.
+    A leak that cancels the planet's structure (``P = [1, 2, 1]`` under
+    ``L = [9, 8, 9]``, total flat) leaves the observation featureless, and the
+    scan correctly reports 0.0 where detection reports 0.258. Equality is also
+    reachable, so this asserts ``>=`` with a tolerance.
     """
 
     rv_kms = np.asarray(payload["snr_vs_rv_kms"], dtype=np.float64)
@@ -836,7 +844,8 @@ def test_hdc_ccf_rv_statistic_peaks_at_the_true_radial_velocity(
 
     assert rv_kms[int(np.argmax(ccf))] == pytest.approx(_PLANET_RV_KMS, abs=1.0)
     assert at_true_rv == pytest.approx(float(np.max(ccf)), rel=1e-9)
-    assert at_true_rv > float(payload["ccf_snr_photon_limited"])
+    photon_limited = float(payload["ccf_snr_photon_limited"])
+    assert at_true_rv >= photon_limited * (1.0 - 1e-9)
     assert "whitened cross-correlation score" in str(payload["snr_vs_rv_model"])
     assert "LOCALIZATION" in str(payload["snr_vs_rv_model"])
 

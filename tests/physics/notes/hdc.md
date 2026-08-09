@@ -59,19 +59,20 @@ first pinned test.
 The high-pass is
 
 ```text
-H = I - S,      S = diag(1/c) K,     c = K 1,
+H = I - S,      S = diag(1/c) M,     c = M 1,
 ```
 
-with `K` the zero-padded boxcar of odd width `m >= 3`:
-`K_ij = 1/m` for `|i - j| <= m//2`, truncated to the array. Two properties do
-all the work.
+with `M` the zero-padded boxcar of odd width `m >= 3`:
+`M_ij = 1/m` for `|i - j| <= m//2`, truncated to the array. (`M`, not `K`: `K`
+is the systematic-amplitude scalar in the covariance below, and reusing the
+letter for both was confusing.) Two properties do all the work.
 
-*`K` is symmetric.* Restricting a symmetric Toeplitz matrix to a principal
-submatrix leaves it symmetric, so `K = K^T` exactly, and therefore
+*`M` is symmetric.* Restricting a symmetric Toeplitz matrix to a principal
+submatrix leaves it symmetric, so `M = M^T` exactly, and therefore
 
 ```text
-S   x = K x / c,
-S^T y = K (y / c),
+S   x = M x / c,
+S^T y = M (y / c),
 ```
 
 one smoother application each. `H^T = I - S^T` follows. No dense `n x n` matrix
@@ -164,7 +165,9 @@ C_y = t H diag(v) H^T + K Ltilde Ltilde^T,
 
 photon noise propagated through `H` plus the rank-one systematic, the
 maximum-SNR weights are `C_y^+ Ptilde`, whose rank-one part Sherman-Morrison
-inverts in closed form. That filter actively projects out the leak direction and
+inverts in closed form. That filter *downweights* the leak direction -- by
+`1/(1 + K Ltilde^T C_ph^+ Ltilde)`, so "projects it out" is exact only as
+`K -> inf`; at finite systematic amplitude the suppression is partial -- and
 beats the fixed-template statistic by roughly an order of magnitude once
 systematics dominate. `C_y` is singular because `H 1 = 0`, so the inverse is a
 pseudoinverse on `range(H)`, where both `Ptilde` and the data live.
@@ -247,13 +250,42 @@ required to stay under 1.05.
 
 ## Telluric Masking
 
-Channels whose atmospheric transmission falls below a threshold are removed by
-zeroing their weights. Because `SNR^2 = t sum_i m_i Ptilde_i^2 / v_i` is a sum
-of non-negative terms, dropping channels can only reduce the SNR, and raising
-the threshold produces a nested sequence of masks. The pinned test therefore
-requires both the channel count and the SNR to fall monotonically as the
-threshold tightens. Masking is a mask only: the transmission is assumed to be
-already folded into the rates.
+**Semantics: raw-channel exclusion.** A channel whose atmospheric transmission
+falls below the threshold carries no usable data, so no statistic may depend on
+its photons. The analysis compacts to the admitted channels and builds the
+continuum filter on *that* vector; the statistic is `a . N` with `a` supported
+on the admitted set, full stop. Channels with `v_i <= 0` are dropped on the
+same footing -- they carry no information, and admitting them would make
+`H diag(v) H^T` rank-deficient relative to `H`, breaking the
+`range(C_y) = range(H)` identity the RV optimum needs.
+
+The alternative reading -- filter the full vector, then zero the
+filtered-output weights -- looks equivalent and is not, because `H^T` spreads
+support: `a = H^T w` is generally nonzero where `w` is zero, so masked photons
+leak back in. `matched_filter_ccf` did exactly that until the 2026-08-09 review,
+which is why its SNR disagreed with the RV scan under a mask (0.1936 against
+0.0 on a five-channel probe where the two admitted channels have equal planet
+rate and a zero-sum filter on them can see nothing).
+
+**Masking is not monotonic in SNR.** With a diagonal covariance it would be:
+`SNR^2 = t sum_i m_i Ptilde_i^2 / v_i` is a sum of non-negative terms, so
+dropping a channel could only lose. That argument dies with the filter. The
+real quantity is
+
+```text
+SNR^2 = t (sum_i w_i Ptilde_i)^2 / sum_i u_i^2 v_i,    u = H^T w,
+```
+
+over the admitted sub-vector, and dropping a channel changes `H` itself -- the
+smoother's windows, its edge normalization, and which neighbours each surviving
+channel is filtered against. A noisy channel adjacent to a line can cost more
+in propagated variance than it returns in signal, so removing it *raises* the
+SNR. Measured on a six-channel probe with a width-3 filter: masking one channel
+took the SNR from 1.871 to 4.266. Nested masks therefore do not produce
+monotonically falling SNRs, and nothing should assert that they do.
+
+Masking is a mask only: the transmission is assumed to be already folded into
+the rates.
 
 ## Self-Subtraction And `N_eff`
 
@@ -337,9 +369,9 @@ one spectral line occupies several channels, so the field is
   0.0 by convention. There is no signal whose retention could be measured, and
   0.0 is the value that will not be mistaken for a healthy detection.
 
-Four cases are pinned: the reviewer's alternating counterexample at its exact
-value 1.11147, sparse absorption dips on a continuum (where the factor is a
-small fraction, ~0.18), the bypass path with an all-zero template, and the
+Four cases are pinned: the alternating case at 0.637088 (it read 1.11147 under
+the running median and the mismatched variance -- see above), sparse absorption
+dips on a continuum, the bypass path with an all-zero template, and the
 active-filter zero-denominator path.
 
 The effective line count is the participation ratio of the weights,
@@ -424,9 +456,18 @@ its fixed-template weights and with them the boxcar's leak suppression, at the
 cost of not being optimal; the localization statistic takes the optimum and with
 it the peak guarantee, at the cost of the suppression. The consequence to watch
 in payloads is that the RV score now sits *above* `ccf_snr_photon_limited`
-(3.777 against 1.117 in the stage fixture) where it used to equal it -- by
-Cauchy-Schwarz it must, since the optimum over a subspace dominates any fixed
-filter inside it. Do not read the RV score as a detection SNR.
+(3.777 against 1.117 in the stage fixture) where it used to equal it.
+
+That ordering is usual but **not a theorem**, and an earlier version of this
+note wrongly claimed Cauchy-Schwarz guaranteed it. The optimum dominating any
+fixed filter in its subspace would give `>=` only if both correlated against
+the same vector, and they do not: the scan correlates against the observed
+planet-plus-leak spectrum, while the detection signal is the planet alone. A
+leak that cancels the planet's structure inverts the ordering -- `P = [1, 2, 1]`
+under `L = [9, 8, 9]` is flat in total, so the scan correctly reports 0.0 for a
+featureless observation while detection reports 0.258 on the strength of
+knowing the leak. Do not read the RV score as a detection SNR, and do not
+assume either bounds the other.
 
 Two further requirements are enforced rather than assumed. The fixed data
 spectrum is a required input: a scan that shifts the template and rebuilds the
@@ -511,15 +552,29 @@ range of the inputs, and `q` overflows on its own whenever a large `V_sys`
 meets a small `A`. What actually keeps the arithmetic in range is that every
 surviving term enters through a square root, which halves its exponent:
 
-- `c0` is computed as `(n / sqrt(A)) / sqrt(t)`, never `n / sqrt(A t)`.
-- `q` is never materialized. Only `sqrt(q)` is needed, and it is built as
-  `hypot(sqrt(B2/A), sqrt(V_sys) / (sqrt(A) sqrt(t)))`. The systematic term has
-  to be grouped that way rather than as `sqrt(V_sys / (A t))`: `V_sys / A`
-  alone overflows for `A ~ 1e-150` against `V_sys ~ 1e300`, which is reachable
-  with `P1 = 1e10`, `L = 1e170`, `t = 1e140`, `eps = 1` — a case whose true
-  root, `5e160`, is perfectly representable.
-- The discriminant is `hypot(p, 2 sqrt(q))` rather than `sqrt(p^2 + 4q)`, so
-  neither argument is ever squared.
+- The coefficients themselves are accumulated on normalized arrays. Three
+  scales -- `alpha = max|P1|`, `beta = sqrt(min v0 * max v0)`, and
+  `gamma = max|ptilde/vv|` -- keep `p`, `vv` and `w` all `O(1)`, and the scales
+  come back out analytically (`A = kappa alpha A''`, `B2 = kappa^2 beta B2''`,
+  `C2 = kappa^2 alpha C2''`, `V_sys = (kappa beta)^2 V_sys''` with
+  `kappa = (alpha/beta) gamma`, which cancels from the root). Without this,
+  `P1 ~ 1e-200` against a `1e100` leak flushes `A` to zero, `P1 ~ 1e200`
+  overflows `C2`, and a `1e-200` leak overflows `w^2` while `B2` is being
+  built -- all on inputs whose roots are ordinary numbers.
+  `beta` is the *geometric* mean rather than the maximum on purpose: the
+  maximum drives the small end subnormal when `v0` spans more than `~1e300`
+  (`1e-10` against `1e308` is reachable) and silently yields NaN.
+- `q` is never materialized. Only `sqrt(q)` is needed, and every factor in it
+  enters at half exponent; the systematic term is grouped as
+  `sqrt(V_sys)/(sqrt(A) sqrt(t))`, never `sqrt(V_sys/(A t))`, because `V_sys/A`
+  alone overflows for `A ~ 1e-150` against `V_sys ~ 1e300`. Likewise `B2/A` is
+  never formed (`B2 ~ 1e126` against `A ~ 1e-191` is reachable now that the
+  covariance fix broke `A = B2`).
+- The root is `0.5 P + hypot(P/2, sqrt(Q))`, algebraically the same as
+  `0.5 (P + sqrt(P^2 + 4Q))` but never forming `2 sqrt(Q)`, which overflows at
+  `sqrt(Q) ~ 9.2e307` on a root that is itself finite.
+- `n` never appears squared inside a single product: a `1e-200` target snr
+  would flush `n^2` to zero and return a contrast of 0.
 
 Finally the returned root is checked finite and positive, and raises with the
 full coefficient set in the message if it is not.
@@ -621,7 +676,7 @@ order about `c = 0` and dividing by the frozen version gives
 SNR^2_true / SNR^2_frozen = 1 - 2 c Delta + O(c^2),
 
 Delta    = C2'/A - eta_ph E/B2 - eta_sys D/J0,
-eta_sys  = K J0^2 / (t A + K J0^2) = V_sys / (t B2 + V_sys),
+eta_sys  = K J0^2 / (t B2 + K J0^2) = V_sys / (t B2 + V_sys),
 eta_ph   = 1 - eta_sys,
 C2'      = sum_i Ptilde1_i^2 P1_i / v0_i^2          (from dG/dc)
 E        = sum_i u0_i (H^T g)_i v0_i,  g = Ptilde1 P1 / v0^2   (from dPhi/dc)
