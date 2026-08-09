@@ -156,11 +156,27 @@ SNR_photon = S / sqrt(V_ph) = sqrt(t * sum_i Ptilde_i^2 / v_i).
 
 ### This is not the optimal filter
 
-Under the full covariance `C = diag(v t) + K Ltilde Ltilde^T` -- photon noise
-plus the rank-one systematic -- the maximum-SNR weights are `C^-1 Ptilde`, which
-Sherman-Morrison gives in closed form. That filter actively projects out the
-leak direction and beats the fixed-template statistic by roughly an order of
-magnitude once systematics dominate.
+Under the full covariance of the *filtered* data,
+
+```text
+C_y = t H diag(v) H^T + K Ltilde Ltilde^T,
+```
+
+photon noise propagated through `H` plus the rank-one systematic, the
+maximum-SNR weights are `C_y^+ Ptilde`, whose rank-one part Sherman-Morrison
+inverts in closed form. That filter actively projects out the leak direction and
+beats the fixed-template statistic by roughly an order of magnitude once
+systematics dominate. `C_y` is singular because `H 1 = 0`, so the inverse is a
+pseudoinverse on `range(H)`, where both `Ptilde` and the data live.
+
+The filtered photon term is not a detail. Writing that term as the unfiltered
+`diag(v t)` -- as an earlier version of this note did -- gives
+`sqrt(t A)` with `A = sum_i Ptilde_i^2/v_i`, against an implemented statistic of
+`sqrt(t) A / sqrt(B2)`. Their ratio is `sqrt(A/B2)`, so the "bound" drops
+*below* the thing it is supposed to bound whenever `A > B2`. That is reachable:
+on a 17-channel width-5 probe with `A/B2 = 1.075`, the unfiltered form gives
+6.390e-03 against an implemented 6.624e-03, while the correct filtered optimum
+is 8.933e-03. A bound stated in the wrong space is not a bound.
 
 It is documented here as an **upper bound, not implemented**, because it assumes
 the leak spectrum `Ltilde` is known exactly. A filter that subtracts a leak it
@@ -341,29 +357,76 @@ argument.
 
 `ccf_vs_rv` correlates a fixed observed spectrum (planet at its true radial
 velocity plus leak, sky, dark) against templates rebuilt at trial velocities.
-The statistic is the *template-normalized* matched-filter score
+Its one job is to *locate* the planet, so it has to be a statistic whose maximum
+is provably at the truth. That forces a different filter from the detection
+statistic, and the difference is worth understanding.
+
+The data is `y = H N` with covariance `C_y = t H diag(v) H^T`. The generalized
+matched filter under that covariance,
 
 ```text
-CCF(rv) = sqrt(t) * (sum_i w_i(rv) Dtilde_i) / sqrt(sum_i w_i(rv)^2 v_i),
-w_i(rv) = m_i Ttilde_i(rv) / v_i,
+CCF(rv) = <Ttilde(rv), y>_{C_y^+} / sqrt(<Ttilde(rv), Ttilde(rv)>_{C_y^+}),
 ```
 
-with `v_i` and `Dtilde` taken from the observation and held fixed across the
-scan.
+is a cosine under a single inner product, so Cauchy-Schwarz bounds it by
+`sqrt(<y, y>_{C_y^+})` with equality only when `Ttilde(rv)` is parallel to `y`.
+The peak is at the true radial velocity, by construction.
 
-The normalization is load-bearing. The bare numerator is `T^T V^-1 D`, which
-scales with the template norm, so its value can be raised simply by giving the
-template more power inside the mask. Concretely: put planet lines of strength
-`[1, 1, 10]` at channels `[40, 60, 80]`, mask channel 80, and scan integer
-shifts. At the true shift the strong line is masked away and the numerator is
-`2/V`; at a shift of `-20` the template's strength-10 line lands on a
-strength-1 data line and the numerator is `11/V`. The bare numerator picks the
-wrong velocity. Dividing by `sqrt(T^T V^-1 T)` turns the statistic into a
-Cauchy-Schwarz cosine in the `V^-1` metric, bounded by `sqrt(D^T V^-1 D)` and
-attained only when `T ∝ D`, so the true velocity wins: the same example gives
-`0.141` at the true shift against `0.108` and `0.0099` at the competitors. Both
-halves of this are pinned -- the test asserts that the unnormalized numerator
-peaks at `-20` and that the shipped statistic peaks at 0.
+### The pseudoinverse is closed form here
+
+`C_y` is singular, but only just: `H = I - S` with `S` row-stochastic (rows sum
+to 1 by the window-fraction normalization) and irreducible (the band connects
+every channel), so Perron-Frobenius makes its unit eigenvalue simple and
+`null(H) = span{1}` exactly. Hence `range(H^T) = 1-perp`, and maximizing
+`(a . P)^2 / (t a^T diag(v) a)` over `a = H^T w` in that subspace is a
+one-constraint Lagrange problem with solution
+
+```text
+a_i = m_i (T_i - lambda) / v_i,   lambda = sum_i m_i T_i/v_i / sum_i m_i/v_i,
+CCF(rv) = sqrt(t) * (a . R_obs) / sqrt(a^T diag(v) a),
+```
+
+the raw template inverse-variance weighted with a variance-weighted mean
+removed. `sum_i a_i = 0` by construction of `lambda`. No eigendecomposition, no
+dense matrix, `O(n)` per trial. A test pins it against the literal
+`np.linalg.pinv` form at `rtol 1e-8`.
+
+### What was wrong before
+
+The scan used to take the fixed-template weights `w = diag(v)^-1 Ttilde` and
+divide by the covariance norm `sqrt(w^T C_y w)`. Numerator and denominator
+belong to different inner products, so the ratio is not a cosine and the
+Cauchy-Schwarz argument does not apply. It is not a small effect: on a
+ten-channel probe with a flat leak of 100 and
+
+```text
+P = [0.532967, 1.263326, 1.007460, 1.088272, 3.241559,
+     2.635570, 1.414478, 9.568137, 0.156691, 66.788444],
+```
+
+a template slid eight channels with zeros filling in behind scored 3.591
+against 3.383 for the truth -- the wrong template winning by 6.2%. Both halves
+are individually defensible: before the covariance fix the denominator was
+`sqrt(w^T diag(v) w)`, which *is* the right norm for those weights and made a
+valid cosine under `diag(v)^-1`. What broke it was swapping in the covariance
+denominator without also moving the weights.
+
+### The cost of the guarantee
+
+Whitening by `C_y` necessarily undoes whatever `H` suppressed. The filter
+attenuated signal and noise together, and dividing by the true noise restores
+the ratio; the optimum is blind only to the constant mode, which is the sole
+direction `H` genuinely destroys. So this scan, unlike `matched_filter_ccf`, is
+*not* protected against smooth non-constant leak structure.
+
+That is a deliberate split, not an inconsistency. The detection statistic keeps
+its fixed-template weights and with them the boxcar's leak suppression, at the
+cost of not being optimal; the localization statistic takes the optimum and with
+it the peak guarantee, at the cost of the suppression. The consequence to watch
+in payloads is that the RV score now sits *above* `ccf_snr_photon_limited`
+(3.777 against 1.117 in the stage fixture) where it used to equal it -- by
+Cauchy-Schwarz it must, since the optimum over a subspace dominates any fixed
+filter inside it. Do not read the RV score as a detection SNR.
 
 Two further requirements are enforced rather than assumed. The fixed data
 spectrum is a required input: a scan that shifts the template and rebuilds the
@@ -375,7 +438,7 @@ correlated index by index and quietly return a wrong answer.
 
 ## Contrast At A Target SNR (Detection Mode)
 
-`ccf_contrast_at_target_snr` inverts the matched filter: rather than scoring a
+`ccf_contrast_at_target_snr` inverts the photon-weighted CCF: rather than scoring a
 known planet, it asks how faint a planet the same observation would still detect
 at SNR `n`. That inversion is what a CCF contrast curve is made of, so it runs
 once per separation anchor and has to be cheap.
@@ -385,12 +448,17 @@ the actual planet rate is `c P1_i`. The planet-free variance rate is
 `v0_i = L_i + sky_i + dark_i`. With weights frozen at zero contrast,
 
 ```text
-w_i = m_i Ptilde1_i / v0_i,
-A   = sum_i w_i Ptilde1_i      [Hz per unit contrast]
-B2  = sum_i w_i^2 v0_i         [Hz]
-C2  = sum_i w_i^2 P1_i         [Hz per unit contrast]
-B_w = sum_i w_i Ltilde_i       [Hz]
+w_i  = m_i Ptilde1_i / v0_i,
+u0_i = (H^T w)_i                (the propagated noise weights)
+A    = sum_i w_i Ptilde1_i     [Hz per unit contrast]
+B2   = sum_i u0_i^2 v0_i       [Hz]
+C2   = sum_i u0_i^2 P1_i       [Hz per unit contrast]
+B_w  = sum_i w_i Ltilde_i      [Hz]
 ```
+
+`B2` and `C2` carry `u0`, not `w`: they are the two halves of the H-propagated
+photon variance rate, split by their dependence on `c`. Only `A` and `B_w`,
+which are signal projections rather than variances, keep the plain `w`.
 
 the signal is `c A t`, the photon variance is `t B2 + c t C2` (the planet's own
 shot noise is the `C2` term), and `V_sys` is whichever of the two regimes

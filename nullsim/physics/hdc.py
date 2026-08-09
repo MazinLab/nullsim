@@ -12,14 +12,30 @@ What this statistic is
 ----------------------
 A **photon-weighted CCF with a fixed template**: the weights are
 ``w_i = m_i Ptilde_i / v_i``, set by the template and the photon variance alone.
-It is *not* the optimal filter once a systematic is present. Under the rank-one
-systematic covariance the optimum is the Sherman-Morrison filter
-``C^-1 Ptilde`` with ``C = diag(v t) + K Ltilde Ltilde^T``, which actively
+It is *not* the optimal filter once a systematic is present. The optimum is the
+generalized filter ``C_y^+ Ptilde`` for the covariance of the *filtered* data,
+
+```text
+C_y = t H diag(v) H^T + K Ltilde Ltilde^T,
+```
+
+whose rank-one systematic part Sherman-Morrison inverts in closed form. It
 projects out the leak direction and can beat this statistic by an order of
-magnitude in the systematics-dominated regime. That optimum is documented as an
-upper bound only, not implemented: it assumes the leak spectrum is known
-exactly, and buying a 10x paper gain against an assumption the instrument
-cannot deliver is not the trade this module makes. See the derivation note.
+magnitude once systematics dominate.
+
+The filtered photon term matters: writing the photon part as the unfiltered
+``diag(v t)`` does not give a bound at all. That version is
+``sqrt(t sum_i Ptilde_i^2 / v_i) = sqrt(t A)`` against an implemented
+``sqrt(t) A / sqrt(B2)``, so it falls *below* the implemented statistic whenever
+``A > B2`` -- reachable, e.g. 6.390e-03 against 6.624e-03 on a 17-channel
+width-5 probe, where the correct filtered optimum is 8.933e-03. ``C_y`` is
+singular (``H 1 = 0``), so the inverse is a pseudoinverse taken on
+``range(H)``, where both ``Ptilde`` and the data live.
+
+That optimum is documented as an upper bound only, not implemented: it assumes
+the leak spectrum is known exactly, and buying a 10x paper gain against an
+assumption the instrument cannot deliver is not the trade this module makes.
+See the derivation note.
 
 Noise model
 -----------
@@ -218,11 +234,24 @@ class CcfBudget:
         filtered stellar leak. This, not the raw band leak, sets the systematic
         amplitude.
     self_subtraction_factor:
-        **SNR-retention ratio, not a flux ratio**:
-        ``sqrt(sum_i Ptilde_i^2 / v_i) / sqrt(sum_i P_i^2 / v_i)`` over the
-        unmasked channels. It answers "what fraction of the achievable
-        photon-limited SNR survives the continuum filter", which is the question
-        a filter width is actually traded against.
+        **SNR-retention ratio, not a flux ratio**: the photon-limited SNR of the
+        filtered statistic over the unfiltered one, on the same unmasked
+        channels,
+
+        ```text
+        (t sum_i w_i Ptilde_i) / sqrt(t sum_i u_i^2 v_i)
+        -------------------------------------------------,   u = H^T w.
+                 sqrt(t sum_i P_i^2 / v_i)
+        ```
+
+        The numerator carries the propagated variance, so this prices both
+        costs of filtering: signal lost to self-subtraction and noise gained
+        from the correlation ``H`` introduces. (The diagonal-era form
+        ``sqrt(sum Ptilde^2/v) / sqrt(sum P^2/v)`` is not this quantity -- it
+        reads 0.818 on the pinned alternating case where the implemented value
+        is 0.637.) It answers "what fraction of the achievable photon-limited
+        SNR survives the continuum filter", which is the question a filter
+        width is actually traded against.
 
         Non-negative by construction. Exactly 1.0 when continuum filtering is
         bypassed (``width <= 0``), unconditionally. 0.0 by convention when
@@ -831,13 +860,15 @@ class CcfContrastSolution:
     target_snr:
         The ``n`` that was solved for, echoed back.
     signal_coefficient:
-        ``A = sum_i w_i Ptilde1_i`` (Hz per unit contrast). Analytically equal
-        to ``B2`` (both are ``sum_i Ptilde1_i^2 / v0_i``), but computed by a
-        different summation, so the two agree to rounding, not bit for bit.
+        ``A = sum_i w_i Ptilde1_i`` (Hz per unit contrast). Equal to ``B2`` only
+        when continuum filtering is bypassed; with a filter active
+        ``u0 = H^T w0 != w0`` and the two are different quantities (``A/B2``
+        runs to 1.6 on the structured probe). Never assert them equal.
     photon_var_zero_contrast:
-        ``B2 = sum_i w_i^2 v0_i`` (Hz): the photon variance rate with no planet.
+        ``B2 = sum_i u0_i^2 v0_i`` (Hz), ``u0 = H^T w``: the H-propagated photon
+        variance rate with no planet.
     planet_selfnoise_coefficient:
-        ``C2 = sum_i w_i^2 P1_i`` (Hz per unit contrast): the planet's own shot
+        ``C2 = sum_i u0_i^2 P1_i`` (Hz per unit contrast): the planet's own shot
         noise, the term that makes the condition quadratic rather than linear.
     systematic_var_counts:
         ``V_sys`` (counts^2). Independent of ``c`` in both regimes, which is
@@ -902,7 +933,7 @@ def ccf_contrast_at_target_snr(
 
     Detection mode, per section 6 of
     ``docs/superpowers/specs/2026-08-07-hdc-ccf-design.md``: instead of scoring
-    a known planet, invert the matched filter to ask how faint a planet the
+    a known planet, invert the photon-weighted CCF to ask how faint a planet the
     same observation would still detect at ``target_snr``. That is what a CCF
     contrast curve is made of.
 
@@ -914,8 +945,8 @@ def ccf_contrast_at_target_snr(
 
     ```text
     A  = sum_i w_i Ptilde1_i     [Hz per unit contrast]
-    B2 = sum_i w_i^2 v0_i        [Hz]
-    C2 = sum_i w_i^2 P1_i        [Hz per unit contrast]
+    B2 = sum_i u0_i^2 v0_i       [Hz],  u0 = H^T w  (H-propagated, not w^2)
+    C2 = sum_i u0_i^2 P1_i       [Hz per unit contrast]
     B_w = sum_i w_i Ltilde_i     [Hz]
 
     SNR^2(c) = c^2 A^2 t^2 / (t B2 + c t C2 + V_sys)

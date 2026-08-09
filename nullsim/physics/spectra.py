@@ -291,11 +291,14 @@ def resample_flux_conserving(
 
     which is quadratic in ``s``. Linearly interpolating the cumulative integral
     instead -- the obvious shortcut, and what this used to do -- is exact only
-    when a bin edge lands on a source sample, and errs by up to a third
-    otherwise: on a tent ``[0, 1, 0]`` over ``x = [0, 1, 2]``, the bin
-    ``[0.5, 1.5]`` holds 0.75 of flux and linear interpolation of the
-    cumulative returns 0.5. Bin means therefore reproduce the piecewise-linear
-    source integral exactly, edge placement notwithstanding.
+    when a bin edge lands on a source sample. Its error is **unbounded** as the
+    bin shrinks inside a cell, not capped at any fixed fraction: for ``f(x) = x``
+    on ``[0, 1]`` the bin ``[0, 0.1]`` has mean 0.05 and the interpolated
+    cumulative returns 0.5, a factor of ten, and the ratio diverges as the bin
+    fraction goes to zero. The concrete case that motivated the fix is milder:
+    on a tent ``[0, 1, 0]`` over ``x = [0, 1, 2]``, the bin ``[0.5, 1.5]`` holds
+    0.75 of flux and the shortcut returns 0.5. Bin means now reproduce the
+    piecewise-linear source integral exactly, edge placement notwithstanding.
     """
     wavelength = np.asarray(wavelength_um, dtype=np.float64)
     source = np.asarray(values, dtype=np.float64)
