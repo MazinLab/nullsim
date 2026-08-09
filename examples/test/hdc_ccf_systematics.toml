@@ -1,7 +1,7 @@
 # Systematics-dominated companion to `hdc_ccf_smoke.toml`: the case where
 # cross-correlation actually buys something. The smoke config is photon
 # limited, and there the matched filter LOSES to the broadband band SNR
-# (ccf_snr 69.90 against band 387.41) -- correctly, because it throws away
+# (ccf_snr 70.22 against band 387.41) -- correctly, because it throws away
 # most of the planet's photons to isolate the lines. Here the leaked
 # starlight carries a quasi-static instability. It costs the band a factor
 # 125 and the CCF a factor 2.2, and that asymmetry is the whole point.
@@ -31,12 +31,12 @@
 # large but not absurd. A config wanting the averaging branch would have to
 # argue for both numbers.
 #
-# Achieved at 3600 s (run 20260809-125851, ~2 s wall clock):
+# Achieved at 3600 s (run 20260809-150200, ~2 s wall clock):
 #
 #   spectro band SNR       3.11   (S = 4.84e7, B = 1.56e10 counts,
 #                                  systematic_var = 2.43e14 counts^2)
-#   ccf_snr               32.04   -> HDC wins by 10.3x
-#   ccf_snr_photon_limited 69.90
+#   ccf_snr               31.29   -> HDC wins by 10.1x
+#   ccf_snr_photon_limited 70.22
 #   ccf_systematic_var / ccf_photon_var = 1.860e4 / 4946 = 3.76
 #   ccf_systematic_rejection = 0.025
 #

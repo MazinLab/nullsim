@@ -355,6 +355,15 @@ class HdcCcfStage(BaseStage):
             "template_weights_per_channel": budget.template_weights.astype(
                 np.float64, copy=True
             ),
+            # Needed to reproduce the statistic from published fields: the
+            # filter runs blockwise on the admitted islands, so w and v alone
+            # are not enough. V_ph = t * sum_i u_i^2 v_i with u published here.
+            "ccf_admitted_mask_per_channel": budget.admitted_mask.astype(
+                bool, copy=True
+            ),
+            "noise_weights_per_channel": budget.noise_weights.astype(
+                np.float64, copy=True
+            ),
             "snr_vs_resolving_power": snr_vs_r.astype(np.float64, copy=True),
             "snr_vs_resolving_power_photon_limited": (
                 snr_vs_r_photon_limited.astype(np.float64, copy=True)
@@ -457,7 +466,10 @@ class HdcCcfStage(BaseStage):
                 "variance-weighted template mean -- the closed form of the "
                 "C_y-pseudoinverse optimum, since null(H) is exactly the "
                 "constant mode. Being a cosine under one inner product, it is "
-                "maximized at the true radial velocity. It is a LOCALIZATION "
+                "maximized where the template best matches the OBSERVED "
+                "spectrum, which is the true radial velocity only when the "
+                "filtered leak projection is negligible (a smooth leak); a "
+                "structured leak can move the peak. It is a LOCALIZATION "
                 "diagnostic and is NOT ccf_snr_photon_limited: whitening "
                 "undoes the continuum filter's suppression of smooth leak "
                 "structure, which the fixed-template detection statistic keeps "
@@ -543,8 +555,11 @@ _CCF_MODEL = (
     "starlight = leak fraction (static leak + realized floor) x stellar flux "
     "x telluric shape at zero radial velocity. Both are renormalized so their "
     "band integrals equal the DETECTED band totals behind the spectrograph "
-    "(see detection_budget_source), then continuum filtered by a running "
-    "median before the template-weighted sum. Telluric absorption enters as a "
+    "(see detection_budget_source), then continuum filtered by a linear "
+    "boxcar high-pass (identity minus a normalized boxcar smoother, applied "
+    "blockwise on each contiguous run of admitted channels so it never bridges "
+    "a telluric gap) before the template-weighted sum. Telluric absorption "
+    "enters as a "
     "unit-band-mean SHAPE, not an absolute transmission, because the upstream "
     "rates already carry a band-averaged atmospheric transmission from "
     "atmosphere.kolmogorov; the template supplies only the line structure that "

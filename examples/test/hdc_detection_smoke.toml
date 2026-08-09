@@ -36,17 +36,19 @@
 # compares two curves describing the same observation. An explicit value that
 # disagreed would be refused rather than reconciled.
 #
-# Achieved (run 20260809-134320, ~3.6 s wall clock), at every anchor:
+# Achieved (run 20260809-150204, ~3.6 s wall clock), at every anchor:
 #
-#   ccf_contrast_gain     28.183   with the two knobs below
-#   ccf_contrast_gain      0.618   with them removed (photon limited)
+#   ccf_contrast_gain     28.199   with the two knobs below
+#   ccf_contrast_gain      0.626   with them removed (photon limited)
 #
 # The switch costs the broadband curve a factor 62.5 at 10 mas (2.43e-6 ->
-# 1.52e-4) and the CCF curve only a factor 1.37 (3.92e-6 -> 5.38e-6). That
+# 1.52e-4) and the CCF curve only a factor 1.39 (3.88e-6 -> 5.38e-6). That
 # asymmetry is the entire result.
 #
 # Both gains moved by 3.8x in the wave C stage-accounting pass (7.483 ->
-# 28.183 and 0.163 -> 0.618): `performance.hdc` now normalizes its
+# 28.183 and 0.163 -> 0.618), then by a further 0.06% when the continuum
+# filter became blockwise over telluric islands (28.183 -> 28.199 and
+# 0.618 -> 0.626): `performance.hdc` now normalizes its
 # unit-contrast planet against the PHYSICAL stellar rate rather than the
 # MKID-saturation-capped readout total, and at J = 5 this four-mode chain
 # saturates the bright ports by 3.804x. The CCF contrasts here are therefore

@@ -79,11 +79,37 @@ one smoother application each. `H^T = I - S^T` follows. No dense `n x n` matrix
 is ever built; `continuum_filter` and `continuum_filter_adjoint` are the two
 calls, and a test pins the adjoint against the dense transpose at `1e-14`.
 
-*`S` preserves constants exactly.* `S 1 = diag(1/c) K 1 = diag(1/c) c = 1`, at
+*`S` preserves constants exactly.* `S 1 = diag(1/c) M 1 = diag(1/c) c = 1`, at
 the array edges as well as the interior, because `c` is precisely the in-array
 fraction of each window. So `H 1 = 0` everywhere and a flat stellar continuum
 is annihilated with no edge residual. (A ramp is killed only in the interior;
 the edge residual is second order in the slope.)
+
+### Blockwise over islands
+
+`H` is not built on the full channel grid. It is built on each **island** -- a
+maximal run of consecutive *admitted* raw channels -- and is therefore block
+diagonal, with `H 1 = 0` holding per island rather than globally.
+
+That is forced by wavelength adjacency. Two admitted segments either side of a
+telluric band are not neighbours, and a filter that smooths across the gap
+invents continuum that is not there. Compacting the admitted channels into one
+vector, as an earlier round did, took two flat segments `[10,10,10]` and
+`[100,100,100]` separated by six masked channels and had the width-3 boxcar
+infer a continuum of `[10,10,40,70,100,100]`, manufacturing residuals of `+-30`
+and a detection SNR of 2.22 in a spectrum containing no line at all. Filtered
+per island each flat segment annihilates exactly, and both statistics report
+zero. This is reachable in practice: the Maunakea stage fixture masks 88 of 550
+channels, including an interior 11-channel gap.
+
+An island narrower than the filter width just gets its own renormalized boxcar,
+and a one-channel island gets `H = 0` -- correct, since one sample cannot
+separate a line from a continuum.
+
+Consequences worth holding onto: `null(H)` is spanned by the per-island
+indicators, not by the single global constant, so the RV optimum subtracts a
+per-island weighted mean; and masking changes the island structure, which is
+part of why masking is not monotonic in SNR.
 
 ### Why not a running median
 
@@ -144,10 +170,16 @@ Var(X) = w^T H diag(v t) H^T w = t * sum_i u_i^2 v_i,     u = H^T w.
 This is the correction the review forced. The raw diagonal `t sum_i w_i^2 v_i`
 is the variance of `w . N`, not of `w . (H N)`, and the two differ by however
 much the filter correlates the channels -- 23% on the width-3 line comb the MC
-test pins, and it grows as the filter narrows. Note that `u` is generally
-nonzero on telluric-masked channels even though `w` is zero there: masking a
-channel out of the *sum* does not stop the filter pulling that channel's
-photons into its neighbours, and the propagated variance says so.
+test pins, and it grows as the filter narrows.
+
+All of this lives on the admitted sub-vector. `w`, `u` and the sums run over
+admitted channels only, and `u` is zero off that set by construction, because
+`H` is built blockwise on the islands and never reaches a masked channel. An
+earlier version of this note said the opposite -- that `u` is nonzero on masked
+channels because the filter pulls their photons into their neighbours. That was
+a true description of the code at the time and a statement that the masking
+semantics were wrong: a telluric-masked channel carries no usable data, so the
+statistic must not read it. See the masking section.
 
 Only when filtering is bypassed does `u = w`, and then `V_ph = S` identically:
 
@@ -188,7 +220,10 @@ deliver is a leak estimate with its own errors, and the gain collapses with the
 knowledge. Adopting it is a design decision about which assumption to make, not
 a bug fix, so the module keeps the honest fixed-template statistic and labels
 it as such. Everything published -- module docstring, stage model strings --
-says "photon-weighted CCF", never "matched filter" unqualified.
+says "photon-weighted CCF" for the *detection* statistic. The RV scan is a
+different object and keeps the plain term: its weights really are optimal for
+`C_y`, so "whitened matched filter" is accurate there, and the asymmetry in
+naming is the point rather than an oversight.
 
 Two limits follow directly and are both pinned.
 
@@ -401,8 +436,17 @@ CCF(rv) = <Ttilde(rv), y>_{C_y^+} / sqrt(<Ttilde(rv), Ttilde(rv)>_{C_y^+}),
 ```
 
 is a cosine under a single inner product, so Cauchy-Schwarz bounds it by
-`sqrt(<y, y>_{C_y^+})` with equality only when `Ttilde(rv)` is parallel to `y`.
-The peak is at the true radial velocity, by construction.
+`sqrt(<y, y>_{C_y^+})`, with equality when `Ttilde(rv)` is parallel to `y`.
+
+**The peak is not therefore at the true radial velocity.** Equality is with
+`y`, the *observed* spectrum -- planet plus leak -- not with the planet
+template, so the scan finds the template best matching the observation. That is
+the true velocity only when the filtered leak projection is negligible, which
+needs the leak smooth enough for `H` to annihilate it. Structured leak breaks
+it outright: on a twelve-channel probe the true velocity scores `-5.99` against
+`9.80` for a four-channel shift. Earlier rounds of this note asserted the
+guarantee unconditionally; it is conditional on a smooth leak, and that
+condition is a property of the instrument, not of the algebra.
 
 ### The pseudoinverse is closed form here
 
@@ -530,51 +574,56 @@ template, not of the planet.
 ### Solving it without overflowing
 
 Evaluating that root literally does not survive contact with realistic input
-ranges. `A^2 t^2` overflows for `A ~ 1e150`, raises `OverflowError` outright at
-`t = 1e160`, and flushes to zero for rates around `1e-200` — all of which are
-representable float64 inputs whose exact roots are perfectly ordinary numbers.
-The implementation therefore substitutes `c = c0 x` with the photon-limited
-root
+ranges. `A^2 t^2` overflows for `A ~ 1e150`, raises `OverflowError` at
+`t = 1e160`, and flushes to zero for rates around `1e-200` — all representable
+float64 inputs whose exact roots are perfectly ordinary numbers. Worse, the
+coefficients `A`, `B2` and `C2` over/underflow while they are being
+*accumulated*, before any root formula sees them.
 
-```text
-c0 = n / sqrt(A t),
-```
+Four devices, each answering a specific failure:
 
-reducing the quadratic to
+- **Weights in log space.** `w = ptilde/v0` is formed as
+  `sign(ptilde) exp(log|ptilde| - log v0 - max)`, so the exponent argument is
+  never positive and `|w| <= 1` no matter how far `v0` spans. Linear scaling
+  cannot do this: `5e-324` against `1e308` is a span of `1e631`, and a
+  geometric mean only halves the *exponent* span, leaving `1e315` — still
+  outside float64. Negligible channels underflow to zero, which is their
+  correct weight.
+- **Scales carried analytically.** With `alpha = max|P1|`,
+  `beta = max v0` and `kappa = alpha exp(max log w)`,
+  `A = kappa alpha A''`, `B2 = kappa^2 beta B2''`, `C2 = kappa^2 alpha C2''`,
+  `B_w = kappa beta B_w''`. `kappa` cancels out of the root entirely.
+- **The gain stays factored.** Both `P` and `sqrt(Q)` carry
+  `g = n/(alpha A'')`, and `hypot` is homogeneous, so `g` factors out of the
+  whole root. It is never formed on its own: it overflows for
+  `alpha ~ 1e-308` and underflows for a subnormal target, on roots that are
+  representable either way. The multiply happens before the divide by `alpha`,
+  and the target multiplies the bracket before anything divides it, so a
+  subnormal `n` keeps its bits.
+- **The systematic enters as `sqrt(V_sys)/t`, never as `V_sys`.** The `t`
+  cancels analytically -- `eps |B_w|` without fringe tracking,
+  `eps |B_w| / sqrt(2 f t)` with -- so squaring `eps B_w t` only to take its
+  square root again was a pure overflow hazard. It rejected `eps = 1`,
+  `B_w ~ 1`, `t = 1e200` on a root that is *t-independent*.
 
-```text
-x^2 - p x - q = 0,   p = c0 C2 / A,   q = B2/A + V_sys/(A t),
-```
+Plus two shape rules on the root itself: it is
+`0.5 P + hypot(P/2, sqrt(Q))`, algebraically the same as
+`0.5 (P + sqrt(P^2 + 4Q))` but never forming `2 sqrt(Q)`, which overflows at
+`sqrt(Q) ~ 9.2e307` on a finite root; and `n` never appears squared inside a
+single product, since a `1e-200` target would flush `n^2` to zero and return a
+contrast of 0.
 
-which removes the `A t` and `A^2` products. It is *not* true that the reduced
-coefficients then sit near unity — `p` and `q` each still span the dynamic
-range of the inputs, and `q` overflows on its own whenever a large `V_sys`
-meets a small `A`. What actually keeps the arithmetic in range is that every
-surviving term enters through a square root, which halves its exponent:
+Reported diagnostics (`A`, `B2`, `C2`, `V_sys`) are a separate matter: they are
+grouped so the cancelling factors meet first and use `*` rather than `**`,
+because float `*` saturates to `inf` while `**` raises. A diagnostic that
+saturates must never abort a root that is representable, so none of them feeds
+the root.
 
-- The coefficients themselves are accumulated on normalized arrays. Three
-  scales -- `alpha = max|P1|`, `beta = sqrt(min v0 * max v0)`, and
-  `gamma = max|ptilde/vv|` -- keep `p`, `vv` and `w` all `O(1)`, and the scales
-  come back out analytically (`A = kappa alpha A''`, `B2 = kappa^2 beta B2''`,
-  `C2 = kappa^2 alpha C2''`, `V_sys = (kappa beta)^2 V_sys''` with
-  `kappa = (alpha/beta) gamma`, which cancels from the root). Without this,
-  `P1 ~ 1e-200` against a `1e100` leak flushes `A` to zero, `P1 ~ 1e200`
-  overflows `C2`, and a `1e-200` leak overflows `w^2` while `B2` is being
-  built -- all on inputs whose roots are ordinary numbers.
-  `beta` is the *geometric* mean rather than the maximum on purpose: the
-  maximum drives the small end subnormal when `v0` spans more than `~1e300`
-  (`1e-10` against `1e308` is reachable) and silently yields NaN.
-- `q` is never materialized. Only `sqrt(q)` is needed, and every factor in it
-  enters at half exponent; the systematic term is grouped as
-  `sqrt(V_sys)/(sqrt(A) sqrt(t))`, never `sqrt(V_sys/(A t))`, because `V_sys/A`
-  alone overflows for `A ~ 1e-150` against `V_sys ~ 1e300`. Likewise `B2/A` is
-  never formed (`B2 ~ 1e126` against `A ~ 1e-191` is reachable now that the
-  covariance fix broke `A = B2`).
-- The root is `0.5 P + hypot(P/2, sqrt(Q))`, algebraically the same as
-  `0.5 (P + sqrt(P^2 + 4Q))` but never forming `2 sqrt(Q)`, which overflows at
-  `sqrt(Q) ~ 9.2e307` on a root that is itself finite.
-- `n` never appears squared inside a single product: a `1e-200` target snr
-  would flush `n^2` to zero and return a contrast of 0.
+Pinned values, each independently verified: `25` exactly for the `1e-200`-leak
+case, `8.373669637337405e96` and `2.754554230312972e-99` for the two extreme
+magnitudes, `5e160` across `t` from `1e140` to `1e200` in the
+systematics-dominated regime, `9.225286e307` for the doubling probe, and a
+subnormal root near `1e-323` for a subnormal target.
 
 Finally the returned root is checked finite and positive, and raises with the
 full coefficient set in the message if it is not.
