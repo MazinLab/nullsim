@@ -393,11 +393,15 @@ def _annotate_rv_contamination(ax: plt.Axes, payload: dict[str, Any]) -> None:
     if not isinstance(grade, str) or grade == "reliable":
         return
     margin = _finite_scalar(payload.get("rv_scan_margin_sigma"))
-    shift = _finite_scalar(payload.get("rv_scan_max_off_truth_leak_shift_sigma"))
+    worst = _finite_scalar(payload.get("rv_scan_worst_case_margin_sigma"))
     detail = ""
-    if margin is not None and shift is not None:
+    if margin is not None and worst is not None:
+        # The worst-case margin IS the verdict, so it is the number shown. The
+        # per-trial shifts feed into it coherently and do not subtract term by
+        # term, so displaying one of them beside the grade invited the reader
+        # to check an arithmetic that is not the one performed.
         detail = (
-            f"\nmargin {margin:.3g} sigma vs leak shift up to {shift:.3g} sigma"
+            f"\nmargin {margin:.3g} sigma, worst case {worst:.3g} sigma"
         )
     ax.text(
         0.5,

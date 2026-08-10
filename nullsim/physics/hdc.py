@@ -569,6 +569,27 @@ def _scaled_product(
     return _materialize(_split_scaled(factors, divisors, exponent2))
 
 
+def _split_weighted_square_sum(
+    weights: NDArray[np.float64], values: NDArray[np.float64]
+) -> _Split:
+    """``sum_i weights_i^2 values_i`` as a `_Split`, squaring inside the split.
+
+    Squaring the weights as plain floats first loses real contributions: a
+    filter with entries at ``1e-162`` squares to ``1e-324``, which is subnormal
+    and rounds catastrophically, so a term that should carry 0.5% of the sum
+    disappears. Splitting first doubles the exponent as an integer instead,
+    where nothing is lost.
+    """
+    weight_mantissa, weight_exponent = np.frexp(
+        np.asarray(weights, dtype=np.float64)
+    )
+    value_mantissa, value_exponent = np.frexp(np.asarray(values, dtype=np.float64))
+    return _sum_split(
+        weight_mantissa * weight_mantissa * value_mantissa,
+        2 * weight_exponent + value_exponent,
+    )
+
+
 def _split_dot(
     weights: NDArray[np.float64], values: NDArray[np.float64]
 ) -> _Split:
@@ -1370,6 +1391,20 @@ def ccf_rv_scan(
 
     scores = np.zeros(rv_array.size, dtype=np.float64)
     shifts = np.zeros(rv_array.size, dtype=np.float64)
+    # Validate before anything can return early. A fully masked observation
+    # used to short-circuit past this, so a NaN residual came back as a clean
+    # zero scan instead of an error.
+    residual_full: NDArray[np.float64] | None = None
+    if residual_leak_rate_hz_per_channel is not None:
+        residual_full = _validate_rate_arrays(
+            residual_leak_rate_hz_per_channel=residual_leak_rate_hz_per_channel
+        )["residual_leak_rate_hz_per_channel"]
+        if residual_full.size != data_channels.n_channels:
+            raise ValueError(
+                "residual_leak_rate_hz_per_channel must have one entry per "
+                f"channel, got {residual_full.size} for "
+                f"{data_channels.n_channels}"
+            )
     analysis = _RvAnalysis.build(
         data_channels,
         continuum_filter_width_channels=continuum_filter_width_channels,
@@ -1380,6 +1415,7 @@ def ccf_rv_scan(
         rv_grid_kms=rv_array,
         scores=scores,
         residual_leak_score_shift=shifts,
+        residual_leak_modeled=residual_leak_rate_hz_per_channel is not None,
     )
     if analysis is None:
         return empty
@@ -1387,17 +1423,7 @@ def ccf_rv_scan(
     observed = (data_channels.planet_rate_hz + data_channels.leak_rate_hz)[
         analysis.admitted
     ]
-    residual: NDArray[np.float64] | None = None
-    if residual_leak_rate_hz_per_channel is not None:
-        residual = _validate_rate_arrays(
-            residual_leak_rate_hz_per_channel=residual_leak_rate_hz_per_channel
-        )["residual_leak_rate_hz_per_channel"]
-        if residual.size != data_channels.n_channels:
-            raise ValueError(
-                "residual_leak_rate_hz_per_channel must have one entry per "
-                f"channel, got {residual.size} for {data_channels.n_channels}"
-            )
-        residual = residual[analysis.admitted]
+    residual = None if residual_full is None else residual_full[analysis.admitted]
     if float(np.max(np.abs(observed))) <= 0.0 and residual is None:
         return empty
     sqrt_time = _split(math.sqrt(integration_time_s))
@@ -1416,7 +1442,9 @@ def ccf_rv_scan(
         # channel was 1e308 times noisier, and the score collapsed to 0 on a
         # perfectly representable answer.
         norm = _split_sqrt(
-            _split_dot(filter_vector * filter_vector, analysis.variance_admitted)
+            _split_weighted_square_sum(
+                filter_vector, analysis.variance_admitted
+            )
         )
         if norm[0] <= 0.0:
             continue
@@ -1435,6 +1463,7 @@ def ccf_rv_scan(
         rv_grid_kms=rv_array,
         scores=scores,
         residual_leak_score_shift=shifts,
+        residual_leak_modeled=residual is not None,
     )
 
 
@@ -1453,10 +1482,12 @@ class RvLocalization:
         largest such contribution over all other trials, both in sigma. The
         second is the one a truth-only diagnostic cannot see.
     worst_case_margin_sigma:
-        ``margin - |shift at truth| - max off-truth |shift|``: the margin that
-        survives if the residual happens to push the truth down and its best
-        competitor up at the same time. Positive means no realization of the
-        modeled residual can move the argmax.
+        The margin that survives the modeled residual, evaluated **coherently**:
+        the residual is one signed vector, so the two realizations to check are
+        ``+d`` and ``-d``, and within each one every trial moves together. See
+        `RvScan.localization` for why the term-by-term bound
+        ``margin - |d_truth| - max|d_j|`` over-rejects. Positive means no
+        realization of the modeled residual can move the argmax.
     valid, grade:
         ``grade`` is ``reliable`` when the worst case still peaks at the truth,
         ``marginal`` when the unperturbed scan does but the residual could
@@ -1485,26 +1516,49 @@ class RvScan:
 
     ``scores`` is what `ccf_vs_rv` returns. ``residual_leak_score_shift`` is the
     contribution an unsubtracted leak makes to each trial's score, in the same
-    sigma units, and is all zeros when no residual was supplied.
+    sigma units, and is all zeros when no residual was supplied --
+    ``residual_leak_modeled`` distinguishes that case from a residual that was
+    modeled and came out zero, which `localization` needs: "nothing was
+    modeled" must not grade as "nothing can go wrong".
     """
 
     rv_grid_kms: NDArray[np.float64]
     scores: NDArray[np.float64]
     residual_leak_score_shift: NDArray[np.float64]
+    residual_leak_modeled: bool = False
 
     def localization(self, truth_rv_kms: float) -> RvLocalization:
         """Grade the argmax against the modeled residual, over the whole grid.
 
         The comparison is between two quantities in the same units: the score
-        margin the truth enjoys over its best competitor, and the largest score
-        change the residual leak can produce. Both are grid-wide, so no
-        dimensionless cut has to be invented and none is -- the verdict is
-        simply whether the margin survives the worst alignment of the modeled
-        perturbation.
+        margin the truth enjoys over its best competitor, and the score changes
+        the residual leak produces. Both are grid-wide, so no dimensionless cut
+        has to be invented and none is -- the verdict is simply whether the
+        margin survives the modeled perturbation.
 
-        ``truth_rv_kms`` is matched to the nearest grid point; a scan whose grid
-        does not contain the true velocity cannot be graded any better than
-        that.
+        **The residual is one signed vector, and the margin is evaluated
+        coherently.** Its realization is ``+d`` or ``-d`` (a fluctuation has a
+        sign, but which one is unknown), and within either realization every
+        trial moves together. So the worst case is
+
+        ```text
+        worst = min over sign in {+1, -1} of
+                    [ (s_truth + sign*d_truth) - max_j (s_j + sign*d_j) ],
+        ```
+
+        not ``margin - |d_truth| - max_j |d_j|``. The two differ whenever the
+        residual pushes the truth and its competitor the same way, which is the
+        common case: scores ``[10, 7]`` with shifts ``[5, 3]`` has coherent
+        margins of 5 and 1, both safe, where the term-by-term bound reports
+        ``-5`` and rejects a scan nothing can overturn. The bound was
+        conservative, never optimistic, so this only removes false rejections.
+
+        ``truth_rv_kms`` must be **on the grid**. A scan whose trials straddle
+        the true velocity has not evaluated the truth at all, and calling the
+        nearest trial "the truth" would grade a statement about a different
+        velocity; that returns ``not evaluated`` instead. A tolerance of
+        ``1e-9`` of the grid spacing absorbs the rounding in an evenly spaced
+        grid whose centre is the truth.
         """
         empty = RvLocalization(
             margin_sigma=math.nan,
@@ -1514,15 +1568,28 @@ class RvScan:
             valid=False,
             grade="not evaluated",
         )
-        if self.scores.size < 2:
+        # No residual model is not the same as a zero residual: an all-zero
+        # shift array would otherwise grade "reliable" on the strength of a
+        # perturbation nobody supplied.
+        if self.scores.size < 2 or not self.residual_leak_modeled:
             return empty
-        truth = int(np.argmin(np.abs(self.rv_grid_kms - float(truth_rv_kms))))
+        distance = np.abs(self.rv_grid_kms - float(truth_rv_kms))
+        truth = int(np.argmin(distance))
+        spacing = float(np.min(np.diff(np.sort(self.rv_grid_kms))))
+        if float(distance[truth]) > 1e-9 * max(spacing, abs(float(truth_rv_kms))):
+            return empty
         off_truth = np.ones(self.scores.size, dtype=bool)
         off_truth[truth] = False
         margin = float(self.scores[truth] - np.max(self.scores[off_truth]))
         shift_truth = float(abs(self.residual_leak_score_shift[truth]))
         shift_off = float(np.max(np.abs(self.residual_leak_score_shift[off_truth])))
-        worst_case = margin - shift_truth - shift_off
+        worst_case = math.inf
+        for sign in (1.0, -1.0):
+            perturbed = self.scores + sign * self.residual_leak_score_shift
+            worst_case = min(
+                worst_case,
+                float(perturbed[truth] - np.max(perturbed[off_truth])),
+            )
         if not math.isfinite(margin):
             return empty
         if margin <= 0.0:
@@ -1580,17 +1647,11 @@ def rv_leak_contamination(
     filter is blind to): a score with no planet content in it cannot localize
     anything.
     """
-    analysis = _RvAnalysis.build(
-        data_channels,
-        continuum_filter_width_channels=continuum_filter_width_channels,
-        telluric_transmission_per_channel=telluric_transmission_per_channel,
-        telluric_mask_threshold=telluric_mask_threshold,
-    )
-    if analysis is None:
-        return math.inf
-    # Finite and non-negative, like every other rate this module takes: a NaN
-    # leak returned 0.0 (read as "no contamination") and a negative one returned
-    # a plausible number, both of which are worse than an exception.
+    # Validate FIRST. Finite and non-negative, like every other rate this
+    # module takes: a NaN leak returned 0.0 (read as "no contamination") and a
+    # negative one returned a plausible number. Both used to slip through
+    # whenever the analysis set came out empty, because that returned inf
+    # before validation was ever reached.
     validated = _validate_rate_arrays(
         trial_planet_rate_hz=trial_planet_rate_hz,
         leak_rate_hz_per_channel=leak_rate_hz_per_channel,
@@ -1602,6 +1663,14 @@ def rv_leak_contamination(
             "trial_planet_rate_hz must have one entry per channel, got "
             f"{template.size} for {data_channels.n_channels} channels"
         )
+    analysis = _RvAnalysis.build(
+        data_channels,
+        continuum_filter_width_channels=continuum_filter_width_channels,
+        telluric_transmission_per_channel=telluric_transmission_per_channel,
+        telluric_mask_threshold=telluric_mask_threshold,
+    )
+    if analysis is None:
+        return math.inf
     filter_vector = analysis.filter_vector(template[analysis.admitted])
     if filter_vector is None:
         return math.inf

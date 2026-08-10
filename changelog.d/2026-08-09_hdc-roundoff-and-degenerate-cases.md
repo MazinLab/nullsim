@@ -28,14 +28,18 @@ earned, and made the radial-velocity scan say when its peak is meaningless.
   likewise no longer returns `NaN` for a variance span wider than float64's
   exponent range.
 
-New payload keys on `characterization.hdc_ccf`: `rv_leak_contamination` and
-`rv_leak_contamination_effective` (how much of the RV score a leak could
-contribute, relative to the planet), `rv_scan_localization_grade` /
-`rv_scan_localization_valid` (graded at stated conventional cuts), and
-`ccf_island_channel_counts` / `ccf_island_self_subtraction_factors` (per-island
-retention, which the global `self_subtraction_factor` averages over a
-factor-of-8 spread). The `hdc_ccf` plot annotates its RV panel when the
-localization grade is not `reliable`. Rejected payloads now publish every array
+New payload keys on `characterization.hdc_ccf`: `rv_leak_score_shift_sigma`
+(what the modeled residual leak does to every trial's score),
+`rv_scan_margin_sigma`, `rv_scan_leak_shift_at_truth_sigma`,
+`rv_scan_max_off_truth_leak_shift_sigma` and `rv_scan_worst_case_margin_sigma`,
+the verdict `rv_scan_localization_grade_modeled_leak` /
+`rv_scan_localization_valid_modeled_leak`, the descriptive
+`rv_leak_contamination`, and `ccf_island_channel_counts` /
+`ccf_island_self_subtraction_factors` (per-island retention, which the global
+`self_subtraction_factor` is *not* an average of -- it is
+`sum(S_k)/sqrt(sum(V_k) sum(U_k))` and can sit below every island factor). The
+`hdc_ccf` plot annotates its RV panel with the margin and the worst case
+whenever the grade is not `reliable`. Rejected payloads now publish every array
 key an accepted payload does, so the schema no longer depends on whether the
 upstream optimizer converged.
 
@@ -45,12 +49,14 @@ after. The fixes are confined to degenerate and extreme-magnitude inputs.
 
 **RV localization is now graded over the whole scan.** The first version of the
 verdict evaluated the leak's projection at the true velocity only, which cannot
-validate an argmax: a leak orthogonal to the filter at the truth can be strongly
-aligned with the filter a few trials away, and on such a probe the truth-trial
-contamination reads 3e-6 while the modeled residual moves the peak four
-channels. `ccf_rv_scan` now returns each trial's score shift under a supplied
-residual leak, and the verdict compares the truth's score margin against the
-largest shift anywhere on the grid — two quantities in sigma, so no
-dimensionless cut is involved. The payload keys carry `_modeled_leak` in their
+validate an argmax: a leak can be far better aligned with the filter a few
+trials away than with the filter at the truth, and on such a probe the residual
+shifts the truth's score by 0.061 sigma against 1.343 sigma four channels away
+— moving the peak — while the truth-only ratio reads a clean 0.031. `ccf_rv_scan` now returns each trial's score shift under a supplied
+residual leak, and the verdict compares the truth's score margin against what
+that residual does to the grid, coherently: the residual is one signed vector,
+so the two realizations checked are `+d` and `-d` and every trial moves
+together within each. Two quantities in sigma, so no dimensionless cut is
+involved. The payload keys carry `_modeled_leak` in their
 names because the scope really is that narrow: a static subtraction error or a
 template mismatch moves the peak without moving the flag.

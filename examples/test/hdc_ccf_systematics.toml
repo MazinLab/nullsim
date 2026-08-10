@@ -31,7 +31,7 @@
 # large but not absurd. A config wanting the averaging branch would have to
 # argue for both numbers.
 #
-# Achieved at 3600 s (run 20260809-172338, ~2 s wall clock):
+# Achieved at 3600 s (run 20260809-181500, ~2 s wall clock):
 #
 #   spectro band SNR       3.11   (S = 4.84e7, B = 1.56e10 counts,
 #                                  systematic_var = 2.43e14 counts^2)
@@ -39,15 +39,19 @@
 #   ccf_snr_photon_limited 70.22
 #   ccf_systematic_var / ccf_photon_var = 1.976e4 / 4895 = 4.04
 #   ccf_systematic_rejection = 0.026
-#   RV localization "marginal": score margin 0.640 sigma against a modeled
-#     residual-leak shift of up to 56.1 sigma (rv_leak_contamination 357.7)
+#   RV localization "reliable": score margin 0.640 sigma, worst-case margin
+#     0.491 sigma under the modeled residual leak (rv_leak_contamination 357.7)
 #
-# That last line is a verdict about the RV scan only, and it is the honest one:
-# with a 1e-3 instability on a leak this bright, an unsubtracted residual moves
-# every trial's score by tens of sigma, so the scan's argmax is not a velocity
-# measurement here even though the DETECTION statistic is unaffected (the two
-# use different filters -- see the physics note). The photon-limited smoke
-# companion, with eps = 0, grades "reliable" on the same 0.640 sigma margin.
+# That last line is a verdict about the RV scan only, and the interesting part
+# is how it survives. A 1e-3 instability on a leak this bright shifts EVERY
+# trial's score by tens of sigma -- 55.07 at the truth, up to 56.15 elsewhere --
+# but almost entirely in common mode, so the ordering barely moves and 0.491
+# sigma of the margin survives. Scoring those two shifts as independently
+# signed, which an earlier version of the verdict did, reported a worst case of
+# -110.6 and called the scan unusable; the residual is one signed vector and
+# has to be evaluated coherently. The photon-limited smoke companion, with
+# eps = 0, grades "reliable" on the same 0.640 sigma margin with no shift at
+# all.
 #
 # The header read 3.76 for the variance ratio until round 4; that number
 # predates the covariance and blockwise-island fixes and was never refreshed.

@@ -645,23 +645,43 @@ quantities of the same kind:
 
 ```text
 margin            = score(truth) - max_{rv != truth} score(rv),
-worst_case_margin = margin - |shift(truth)| - max_{rv != truth} |shift(rv)|,
+worst_case_margin = min over sign in {+1, -1} of
+                      [ (s_truth + sign d_truth) - max_j (s_j + sign d_j) ],
 ```
 
 and grades `reliable` when `worst_case_margin > 0`, `marginal` when the
 unperturbed scan peaks at the truth but the residual could overturn it,
-`unreliable` when `margin <= 0`. No dimensionless cut appears anywhere: the
+`unreliable` when `margin <= 0`. The truth must be *on* the grid: a scan whose
+trials straddle the true velocity has not evaluated it, and grading the nearest
+trial would be a verdict about a different velocity, so that returns
+`not evaluated` -- as does a scan built with no residual model at all, whose
+all-zero shifts would otherwise grade `reliable` on a perturbation nobody
+supplied. `characterization.hdc_ccf` inserts the scene velocity into its scan
+grid so an even `rv_scan_points` cannot straddle it. No dimensionless cut
+appears anywhere: the
 criterion is one sigma quantity against another, so there is nothing to
 calibrate.
 
 **Why it has to be grid-wide.** A single projection at the true velocity is not
-a statement about an argmax. Build a positive leak orthogonal to the truth's
-filter but aligned with the filter four channels away -- the note's regression
-does exactly that, projecting the shift-`+4` filter off the truth filter -- and
-the truth-trial contamination is `3e-6`, clean under any threshold, while the
-same modeled residual lifts the `+4` trial by `1.34` sigma against a margin of
-`0.43` and moves the argmax. The round-4 verdict, computed at the truth alone,
-graded that case `reliable`.
+a statement about an argmax. The regression builds a positive leak by
+projecting the shift-`+4` filter off the truth's filter, which *targets*
+orthogonality at the truth but does not achieve it exactly: changing the sky to
+carry that leak changes the variance, and with it both filters, so the
+construction is iterated and lands on a leak that is merely much better aligned
+four channels away than at the truth. That is enough. The residual shifts the
+truth's score by `0.061` sigma and the `+4` trial's by `1.343`, against a margin
+of `0.432`, and the argmax moves. The truth-only ratio there is `31.4` raw and
+`0.031` after the `eps` scaling -- comfortably inside the cut the round-4
+verdict used, which duly graded the case `reliable`.
+
+The coherent worst-case margin is `-0.161` sigma, not the `-0.972` a
+term-by-term bound would report: the residual is one signed vector, so the two
+realizations to check are `+d` and `-d`, and within each every trial moves
+together. Combining `|d_truth|` with `max_j |d_j|` assumes a sign pattern that
+cannot occur and rejects scans nothing can overturn -- scores `[10, 7]` with
+shifts `[5, 3]` has coherent margins of 5 and 1, both safe, where the bound
+reports `-5`. The bound was conservative, never optimistic, so correcting it
+removes false rejections only.
 
 **What it does not cover.** Only the residual actually passed in. In
 `characterization.hdc_ccf` that is `eps_systematic * L`, static, with no

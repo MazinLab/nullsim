@@ -518,9 +518,9 @@ class HdcCcfStage(BaseStage):
                 "true radial velocity only when the leak's contribution to the "
                 "score is small; a structured leak can move the peak, by "
                 "-5.99 at the truth against 9.80 four channels away on the "
-                "physics-side counterexample. Read rv_leak_contamination and "
-                "rv_scan_localization_valid before reading the argmax as a "
-                "velocity. It is a LOCALIZATION diagnostic and is NOT "
+                "physics-side counterexample. Read "
+                "rv_scan_localization_valid_modeled_leak and the margin fields "
+                "before reading the argmax as a velocity. It is a LOCALIZATION diagnostic and is NOT "
                 "ccf_snr_photon_limited: whitening undoes the continuum "
                 "filter's suppression of smooth leak structure, which the "
                 "fixed-template detection statistic keeps on purpose. The two "
@@ -553,10 +553,13 @@ class HdcCcfStage(BaseStage):
                 "An independent static subtraction error, a template mismatch "
                 "or a detector systematic moves the peak with eps_systematic = "
                 "0 and grades clean here. A truth-only projection would be "
-                "worse still: a leak orthogonal to the filter at the true "
-                "velocity can align with the filter a few trials away, giving "
-                "a contamination of 3e-6 at the truth on a probe whose argmax "
-                "the same residual moves by four channels. "
+                "worse still: a leak can be far better aligned with the "
+                "filter a few trials away than with the filter at the true "
+                "velocity, and on the physics-side probe that ratio (0.061 "
+                "sigma at the truth against 1.343 sigma four channels away) "
+                "moves the argmax while the truth-only ratio, 31.4 raw and "
+                "0.031 after the eps scaling, cleared the cut that verdict "
+                "used. "
                 "rv_leak_contamination is that truth-only ratio, kept as a "
                 "descriptive scalar and deliberately not used as the verdict."
             ),
@@ -1501,6 +1504,14 @@ def _ccf_vs_rv(
         planet_rv_kms + float(params.rv_scan_halfwidth_kms),
         int(params.rv_scan_points),
     )
+    # The scene velocity has to BE on the grid, not near it. An even
+    # rv_scan_points gives a symmetric linspace that straddles it -- at 61
+    # points nothing straddles, but at 60 the nearest trial to a 30 km/s planet
+    # is 22.1 km/s, and grading that trial as "the truth" would be a verdict
+    # about a different velocity. Inserting it is cheaper than refusing to
+    # scan, and costs one extra trial only when the grid missed it.
+    if not np.any(rv_grid == planet_rv_kms):
+        rv_grid = np.sort(np.append(rv_grid, planet_rv_kms))
     # The leaked starlight mean is measured on the bright port and removed
     # before cross-correlation (standard HDC practice, and already implicit in
     # matched_filter_ccf, whose signal term uses the planet alone). Its shot

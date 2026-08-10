@@ -369,10 +369,13 @@ def test_rv_panel_warns_with_the_numbers_the_verdict_was_computed_from() -> None
     """
 
     payload = _payload()
+    # Four values that cannot be confused for one another, so the panel cannot
+    # pass by showing the wrong one: the raw ratio, the margin, a per-trial
+    # shift, and the worst-case margin the verdict is actually computed from.
     payload["rv_leak_contamination"] = 358.0
     payload["rv_scan_margin_sigma"] = 0.43
     payload["rv_scan_max_off_truth_leak_shift_sigma"] = 1.34
-    payload["rv_scan_worst_case_margin_sigma"] = -0.97
+    payload["rv_scan_worst_case_margin_sigma"] = -0.62
     payload["rv_scan_localization_grade_modeled_leak"] = "marginal"
     fig = plot_hdc_ccf(payload)
     texts = [t.get_text() for t in fig.axes[3].texts]
@@ -380,9 +383,12 @@ def test_rv_panel_warns_with_the_numbers_the_verdict_was_computed_from() -> None
     assert len(warning) == 1
     assert "marginal" in warning[0]
     assert "0.43" in warning[0]
-    assert "1.34" in warning[0]
-    # The raw contamination ratio must not be the number beside the verdict.
+    # The verdict is the worst-case margin, so that is the number shown.
+    assert "-0.62" in warning[0]
+    # Neither the raw ratio nor a single per-trial shift: the shifts enter the
+    # verdict coherently, they are not subtracted term by term.
     assert "358" not in warning[0]
+    assert "1.34" not in warning[0]
     plt.close(fig)
 
     payload["rv_scan_localization_grade_modeled_leak"] = "reliable"

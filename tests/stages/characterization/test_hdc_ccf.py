@@ -1074,18 +1074,28 @@ def test_rv_localization_verdict_is_a_grid_wide_margin_comparison(
     assert float(
         payload["rv_scan_max_off_truth_leak_shift_sigma"]
     ) == pytest.approx(shift_off)
-    assert float(payload["rv_scan_worst_case_margin_sigma"]) == pytest.approx(
-        margin - shift_truth - shift_off
+    # Coherent, not term by term: the residual is one signed vector, so the
+    # realizations to check are +d and -d and every trial moves together
+    # inside each. The term-by-term bound would read
+    # margin - shift_truth - shift_off, which over-rejects.
+    coherent = min(
+        float(
+            (scores + sign * shifts)[truth]
+            - (scores + sign * shifts)[off_truth].max()
+        )
+        for sign in (1.0, -1.0)
     )
+    assert float(payload["rv_scan_worst_case_margin_sigma"]) == pytest.approx(
+        coherent
+    )
+    assert coherent >= margin - shift_truth - shift_off
 
     grade = payload["rv_scan_localization_grade_modeled_leak"]
     assert grade in ("reliable", "marginal", "unreliable")
     assert payload["rv_scan_localization_valid_modeled_leak"] is (
         grade == "reliable"
     )
-    assert (grade == "reliable") is (
-        margin > 0.0 and margin - shift_truth - shift_off > 0.0
-    )
+    assert (grade == "reliable") is (margin > 0.0 and coherent > 0.0)
 
     # The shifts are the modeled residual, so they scale with eps_systematic:
     # a config with no null instability has nothing to be contaminated by.
@@ -1117,3 +1127,29 @@ def test_island_diagnostics_expose_what_the_global_factor_averages_over(
     assert np.all(factors >= 0.0)
     # A one-channel island cannot separate line from continuum, ever.
     assert np.all(factors[counts == 1] == 0.0)
+
+
+def test_rv_scan_grid_contains_the_scene_velocity(tmp_path: Path) -> None:
+    """The verdict is about the scene velocity, so the scan has to evaluate it.
+
+    A symmetric linspace with an even point count straddles the centre, and
+    grading the nearest trial would be a verdict about a different velocity.
+    The stage inserts the scene velocity rather than refusing to scan, so an
+    even ``rv_scan_points`` costs one extra trial and still grades.
+    """
+
+    for points, expected in ((21, 21), (20, 21)):
+        payload = _stage(
+            _context(tmp_path), rv_scan_points=points
+        ).apply(_state()).results.components["characterization.hdc_ccf"]
+        grid = np.asarray(payload["snr_vs_rv_kms"], dtype=np.float64)
+        truth = float(payload["planet_radial_velocity_kms"])
+        assert grid.size == expected
+        assert np.count_nonzero(grid == truth) == 1
+        assert np.all(np.diff(grid) > 0.0)
+        # Graded, not skipped, in both cases.
+        assert payload["rv_scan_localization_grade_modeled_leak"] in (
+            "reliable",
+            "marginal",
+            "unreliable",
+        )
