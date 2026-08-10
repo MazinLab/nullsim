@@ -9,6 +9,7 @@ from nullsim.physics.hdc import (
     build_channel_edges,
     continuum_filter_adjoint,
     ccf_contrast_at_target_snr,
+    ccf_rv_scan,
     ccf_vs_rv,
     channelize,
     continuum_filter,
@@ -1719,10 +1720,11 @@ def test_solver_survives_a_target_snr_that_underflows_the_bracket():
 
 
 def test_island_retention_is_published_per_island():
-    # The global self-subtraction factor is a photon-weighted average over
-    # islands and hides a crippled short one behind healthy long ones. A
-    # 30-channel comb, a 3-channel island and a singleton, under width 15:
-    # 0.890 / 0.632 / 0.0 against a global 0.801.
+    # Retention differs island by island and the global factor does not stand
+    # in for it. A 30-channel comb, a 3-channel island and a singleton, under
+    # width 15: 0.890 / 0.632 / 0.0 against a global 0.801. (The ordering here
+    # is not a rule -- see the shipped systematics config, where the 17-channel
+    # island retains 0.556 against 0.066 for the 382-channel one.)
     n = 40
     planet = np.zeros(n)
     planet[0:30:5] = 5.0
@@ -1801,3 +1803,316 @@ def test_rv_leak_contamination_flags_the_case_that_moves_the_peak():
         for shift in range(n)
     ]
     assert int(np.argmax(scores)) != 0  # the truth does not win
+
+
+# --- Round 5: grid-wide RV localization, exponent edges, input validation ----
+
+
+def _rv_localization_probe():
+    """A leak orthogonal to the truth filter but aligned with the +4 trial.
+
+    Deterministic, no RNG: the leak is built by projecting the shift-+4 filter
+    off the truth filter, so `a(truth) . L` is zero by construction (both
+    filters are zero-sum, so adding a constant offset to keep the leak positive
+    changes nothing) while `a(+4) . L` is large. This is the case a truth-only
+    contamination check cannot see.
+    """
+    n, width = 16, 5
+    truth = np.zeros(n)
+    truth[[3, 7, 11]] = 0.4
+    shifts = np.arange(-6.0, 7.0)
+
+    def channels(planet, sky):
+        edges = build_channel_edges(1.0, 1.4, float(n) / np.log(1.4))[: n + 1]
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        return ChannelSpectra(
+            centers, edges, planet, np.zeros(n), sky, np.zeros(n)
+        )
+
+    def whitened_filter(template, variance):
+        inverse = 1.0 / variance
+        offset = float(np.sum(inverse * template)) / float(np.sum(inverse))
+        return inverse * (template - offset)
+
+    sky = np.full(n, 400.0)
+    for _ in range(6):
+        variance = truth + sky
+        at_truth = whitened_filter(truth, variance)
+        at_shift = whitened_filter(np.roll(truth, 4), variance)
+        direction = at_shift - (at_shift @ at_truth) / (at_truth @ at_truth) * at_truth
+        direction = direction / np.max(np.abs(direction))
+        sky = 400.0 + 300.0 * direction
+    assert np.all(sky > 0.0)  # a leak spectrum has to be a rate
+    return n, width, truth, shifts, sky, channels
+
+
+def test_rv_localization_grades_the_whole_grid_not_the_truth_trial():
+    # The round-4 verdict evaluated the leak projection at the true velocity
+    # only. On this probe that projection is ~1e-6 -- "reliable" under any
+    # truth-only cut -- and yet injecting exactly the modeled residual moves
+    # the argmax four channels. A projection at one trial cannot validate an
+    # argmax over a grid.
+    n, width, truth, shifts, sky, channels = _rv_localization_probe()
+    eps, time_s = 1e-3, 3600.0
+    data = channels(truth, sky)
+
+    scan = ccf_rv_scan(
+        lambda rv: channels(np.roll(truth, int(rv)), sky),
+        shifts,
+        data_channels=data,
+        continuum_filter_width_channels=width,
+        integration_time_s=time_s,
+        residual_leak_rate_hz_per_channel=eps * sky,
+    )
+    localization = scan.localization(0.0)
+
+    # What the truth-only diagnostic sees, and why it is not enough.
+    truth_only = rv_leak_contamination(
+        truth,
+        data_channels=data,
+        leak_rate_hz_per_channel=sky,
+        continuum_filter_width_channels=width,
+    )
+    assert eps * truth_only < 0.1  # would have graded "reliable"
+
+    # The unperturbed scan does peak at the truth...
+    assert shifts[int(np.argmax(scan.scores))] == 0.0
+    assert localization.margin_sigma == pytest.approx(0.4316963224, rel=1e-6)
+    # ...but the residual can lift a competitor by three times that margin.
+    assert localization.max_off_truth_shift_sigma == pytest.approx(
+        1.3427461330, rel=1e-6
+    )
+    assert localization.worst_case_margin_sigma < 0.0
+    assert localization.grade == "marginal"
+    assert localization.valid is False
+
+    # And the realized perturbation does move the argmax, not merely the bound.
+    perturbed = scan.scores + scan.residual_leak_score_shift
+    assert shifts[int(np.argmax(perturbed))] == 4.0
+
+
+def test_rv_localization_grades_reliable_when_the_margin_survives():
+    # Same probe with a planet ten times brighter: the margin grows with the
+    # signal while the leak shift does not, so the verdict flips to reliable.
+    n, width, truth, shifts, sky, channels = _rv_localization_probe()
+    bright = truth * 25.0
+    data = channels(bright, sky)
+    scan = ccf_rv_scan(
+        lambda rv: channels(np.roll(bright, int(rv)), sky),
+        shifts,
+        data_channels=data,
+        continuum_filter_width_channels=width,
+        integration_time_s=3600.0,
+        residual_leak_rate_hz_per_channel=1e-3 * sky,
+    )
+    localization = scan.localization(0.0)
+    assert localization.margin_sigma > localization.max_off_truth_shift_sigma
+    assert localization.worst_case_margin_sigma > 0.0
+    assert localization.grade == "reliable"
+    assert localization.valid is True
+
+    # No residual model at all is "not graded", not "graded clean": the shifts
+    # are zero, so the criterion would pass vacuously.
+    plain = ccf_rv_scan(
+        lambda rv: channels(np.roll(bright, int(rv)), sky),
+        shifts,
+        data_channels=data,
+        continuum_filter_width_channels=width,
+        integration_time_s=3600.0,
+    )
+    assert np.all(plain.residual_leak_score_shift == 0.0)
+    assert plain.scores == pytest.approx(scan.scores, rel=1e-12)
+
+
+def test_rv_localization_reports_unreliable_when_the_peak_is_already_wrong():
+    # A margin that is negative before any residual is applied cannot be
+    # rescued by leak stability, and must not be graded on the residual.
+    n, width, truth, shifts, sky, channels = _rv_localization_probe()
+    data = channels(np.roll(truth, 4), sky)  # the planet is NOT at rv = 0
+    scan = ccf_rv_scan(
+        lambda rv: channels(np.roll(truth, int(rv)), sky),
+        shifts,
+        data_channels=data,
+        continuum_filter_width_channels=width,
+        integration_time_s=3600.0,
+        residual_leak_rate_hz_per_channel=1e-3 * sky,
+    )
+    localization = scan.localization(0.0)
+    assert localization.margin_sigma < 0.0
+    assert localization.grade == "unreliable"
+    assert localization.valid is False
+
+
+def test_ccf_vs_rv_still_returns_the_scan_scores_unchanged():
+    # ccf_rv_scan is the primitive; ccf_vs_rv is its scores. Pinned so the
+    # refactor cannot silently change the public function's meaning.
+    n = 12
+    rng = np.random.default_rng(11)
+    planet = rng.uniform(0.0, 4.0, n)
+    leak = rng.uniform(10.0, 40.0, n)
+    data = _channels(planet, leak)
+    kwargs = dict(
+        data_channels=data,
+        continuum_filter_width_channels=5,
+        integration_time_s=120.0,
+    )
+    grid = np.arange(-3.0, 4.0)
+    scores = ccf_vs_rv(
+        lambda rv: _channels(np.roll(planet, int(rv)), leak), grid, **kwargs
+    )
+    scan = ccf_rv_scan(
+        lambda rv: _channels(np.roll(planet, int(rv)), leak), grid, **kwargs
+    )
+    assert scores == pytest.approx(scan.scores, rel=0.0, abs=0.0)
+    assert scan.rv_grid_kms == pytest.approx(grid)
+
+
+def test_solver_survives_a_systematic_term_that_overflows_its_own_scale():
+    # Two bypassed channels at P1 = L = 1e308 with eps = 1: beta * eps |B_w''|
+    # is 2e308, so the constant term of the reduced quadratic left float64
+    # while the answer did not. B_w = A here, so the systematics-dominated root
+    # is exactly n eps B_w / A = 5.
+    for magnitude, expected in ((8e307, 4.999999999999999), (1e308, 5.0)):
+        solution = ccf_contrast_at_target_snr(
+            np.full(2, magnitude),
+            np.full(2, magnitude),
+            np.zeros(2),
+            np.zeros(2),
+            **_solver_kwargs(
+                integration_time_s=1e200,
+                target_snr=5.0,
+                eps_systematic=1.0,
+                with_fringe_tracking=False,
+                continuum_filter_width_channels=0,
+            ),
+        )
+        assert solution.contrast_at_target_snr == pytest.approx(expected, rel=1e-12)
+    # A and V_sys genuinely do not fit in float64 at 1e308; reporting inf is
+    # the honest label, and it must not block the root.
+    assert not math.isfinite(solution.signal_coefficient)
+    assert not math.isfinite(solution.systematic_var_counts)
+
+
+def test_solver_reports_a_representable_systematic_variance():
+    # V_sys was squared in NORMALIZED units and scaled afterwards, so a budget
+    # whose physical V_sys is 1e-200 reported inf: (eps B_w'' t)^2 = 1e400
+    # before the 1e-300 planet scale could come back in.
+    solution = ccf_contrast_at_target_snr(
+        np.array([1e-300]),
+        np.array([1.0]),
+        np.zeros(1),
+        np.zeros(1),
+        **_solver_kwargs(
+            integration_time_s=1e200,
+            target_snr=5.0,
+            eps_systematic=1.0,
+            with_fringe_tracking=False,
+            continuum_filter_width_channels=0,
+        ),
+    )
+    # B_w = w L = P1 = 1e-300, so V_sys = (eps B_w t)^2 = (1e-300 * 1e200)^2.
+    assert solution.systematic_var_counts == pytest.approx(1e-200, rel=1e-12)
+    # Systematics-dominated root: c = n eps B_w / A, with A = P1^2/L = 1e-600
+    # unrepresentable, so the root is formed as n eps L / P1.
+    assert solution.contrast_at_target_snr == pytest.approx(5e300, rel=1e-12)
+
+
+def test_ccf_vs_rv_normalizes_the_variance_against_the_filter_support():
+    # Three subnormal-variance channels and one at 1e308. The filter lives
+    # entirely on the subnormal ones, but the variances were divided by the
+    # GLOBAL maximum before being summed, which flushed the supporting
+    # channels to zero and returned a score of 0 on a representable answer.
+    quantum = 5e-324  # the smallest positive double; subnormal steps are exact
+    n = 4
+    sky = np.array([4.0 * quantum, 4.0 * quantum, 4.0 * quantum, 1e308])
+    planet = np.array([quantum, 2.0 * quantum, 0.0, 0.0])
+    edges = build_channel_edges(1.0, 1.4, float(n) / np.log(1.4))[: n + 1]
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    data = ChannelSpectra(centers, edges, planet, np.zeros(n), sky, np.zeros(n))
+    template = np.array([1.0, 2.0, 0.0, 0.0])
+    trial = ChannelSpectra(
+        centers, edges, template, np.zeros(n), sky, np.zeros(n)
+    )
+    (got,) = ccf_vs_rv(
+        lambda _rv: trial,
+        [0.0],
+        data_channels=data,
+        continuum_filter_width_channels=5,
+        integration_time_s=1.0,
+    )
+
+    # Independent reference from the documented closed form. 1/v overflows at
+    # these magnitudes, so every sum is taken against v_min/v (which is at most
+    # 1) and the single 1/sqrt(v_min) is applied at the end -- the same
+    # regrouping discipline the implementation uses, done by hand.
+    variance = data.total_rate_hz()
+    smallest = float(np.min(variance))
+    relative = smallest / variance
+    offset = float(np.sum(relative * template)) / float(np.sum(relative))
+    residual = template - offset
+    observed = data.planet_rate_hz + data.leak_rate_hz
+    numerator = float(np.sum(residual * observed * relative))
+    norm = math.sqrt(float(np.sum(residual * residual * relative)))
+    expected = numerator / norm / math.sqrt(smallest)
+    assert np.isfinite(got)
+    assert got != 0.0
+    assert got == pytest.approx(expected, rel=1e-12)
+
+
+def test_rv_leak_contamination_rejects_unusable_rates():
+    # A NaN leak returned 0.0 -- read as "no contamination" -- and a negative
+    # one returned a plausible number. Both are worse than an exception.
+    data = _channels(np.array([1.0, 2.0, 1.0]), np.full(3, 10.0))
+    template = np.array([1.0, 2.0, 1.0])
+    with pytest.raises(ValueError, match="must be finite"):
+        rv_leak_contamination(
+            template,
+            data_channels=data,
+            leak_rate_hz_per_channel=np.array([np.nan, 1.0, 1.0]),
+            continuum_filter_width_channels=3,
+        )
+    with pytest.raises(ValueError, match="must be non-negative"):
+        rv_leak_contamination(
+            template,
+            data_channels=data,
+            leak_rate_hz_per_channel=np.array([-5.0, 1.0, 1.0]),
+            continuum_filter_width_channels=3,
+        )
+    with pytest.raises(ValueError, match="must be finite"):
+        rv_leak_contamination(
+            np.array([np.inf, 2.0, 1.0]),
+            data_channels=data,
+            leak_rate_hz_per_channel=np.full(3, 1.0),
+            continuum_filter_width_channels=3,
+        )
+
+
+def test_global_self_subtraction_can_sit_below_every_island_factor():
+    # The global factor is sum(S_k) / sqrt(sum(V_k) sum(U_k)), not a mean of
+    # the island factors: unbalanced islands (one carrying the noise, another
+    # the unfiltered signal power) put it below all of them.
+    planet = np.array(
+        [
+            0.017102, 0.13923, 0.236774, 0.008216, 0.102644, 0.187768,
+            0.0, 0.0, 0.0, 0.0,
+            0.026826, 0.082441, 0.257675, 0.400838, 0.544786, 0.645635,
+        ]
+    )
+    n = planet.size
+    telluric = np.ones(n)
+    telluric[6:10] = 0.0
+    budget = matched_filter_ccf(
+        _channels(planet, np.full(n, 1.0913846874025053)),
+        integration_time_s=3600.0,
+        eps_systematic=0.0,
+        servo_bw_hz=100.0,
+        with_fringe_tracking=True,
+        continuum_filter_width_channels=5,
+        telluric_transmission_per_channel=telluric,
+        telluric_mask_threshold=0.5,
+    )
+    factors = budget.island_self_subtraction_factors
+    assert factors.size == 2
+    assert factors == pytest.approx([0.5940275580, 0.4800833995], rel=1e-9)
+    assert budget.self_subtraction_factor == pytest.approx(0.3444407985, rel=1e-9)
+    assert budget.self_subtraction_factor < factors.min()

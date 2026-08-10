@@ -378,24 +378,32 @@ def _plot_snr_vs_rv(ax: plt.Axes, payload: dict[str, Any]) -> None:
 def _annotate_rv_contamination(ax: plt.Axes, payload: dict[str, Any]) -> None:
     """Say on the panel when the peak is not evidence about the velocity.
 
-    The scan peaks where the template matches the *observation*, so a leak the
-    continuum filter cannot remove moves the peak. A rendered curve with a
-    labelled peak reads as a measurement whether or not it is one, which is
-    exactly the failure this annotation exists to prevent.
+    The scan peaks where the template matches the *observation*, so a residual
+    leak the continuum filter cannot remove moves the peak. A rendered curve
+    with a labelled peak reads as a measurement whether or not it is one, which
+    is exactly the failure this annotation exists to prevent.
+
+    The numbers shown are the ones the verdict is computed from -- the score
+    margin and the largest leak-induced score shift, both in sigma. Showing
+    ``rv_leak_contamination`` here instead would put a number beside a verdict
+    that was not computed from it; it is a truth-only ratio and the verdict is
+    grid-wide.
     """
-    grade = payload.get("rv_scan_localization_grade")
+    grade = payload.get("rv_scan_localization_grade_modeled_leak")
     if not isinstance(grade, str) or grade == "reliable":
         return
-    contamination = payload.get("rv_leak_contamination")
+    margin = _finite_scalar(payload.get("rv_scan_margin_sigma"))
+    shift = _finite_scalar(payload.get("rv_scan_max_off_truth_leak_shift_sigma"))
     detail = ""
-    if isinstance(contamination, (int, float)) and np.isfinite(contamination):
-        detail = f" (|a.L|/|a.P| = {float(contamination):.3g})"
-    elif contamination == float("inf"):
-        detail = " (no planet content in the filter)"
+    if margin is not None and shift is not None:
+        detail = (
+            f"\nmargin {margin:.3g} sigma vs leak shift up to {shift:.3g} sigma"
+        )
     ax.text(
         0.5,
         0.02,
-        f"RV localization {grade}{detail}:\npeak may not be the true velocity",
+        f"RV localization {grade} under the modeled leak:"
+        f"\npeak may not be the true velocity{detail}",
         transform=ax.transAxes,
         ha="center",
         va="bottom",

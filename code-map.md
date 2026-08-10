@@ -252,7 +252,7 @@ pinning rationale live in `tests/physics/notes/*.md`.
 | `spectroscopy.py` | Spectro-port SNR, max resolving power, AWG spectrograph model. |
 | `mkid.py` | MKID resolving power and energy-response matrix primitives. |
 | `spectra.py` | Template spectrum loading, constant-R grids, Doppler shift, resolving-power convolution, flux-conserving resampling. |
-| `hdc.py` | High dispersion coronagraphy matched-filter CCF budget: channelization, template weights, self-subtraction (global and per island), RV scan with its `rv_leak_contamination` validity diagnostic, and the inverse solve `ccf_contrast_at_target_snr` (faintest contrast reaching a target SNR). |
+| `hdc.py` | High dispersion coronagraphy matched-filter CCF budget: channelization, template weights, self-subtraction (global and per island), the RV scan (`ccf_rv_scan`) with its grid-wide localization verdict under a modeled residual leak, and the inverse solve `ccf_contrast_at_target_snr` (faintest contrast reaching a target SNR). |
 | `pdi.py` | Polarimetric differential imaging SNR primitives. |
 | `characterization.py` | Known-position chip optimization for spectro mode. |
 | `characterization_torch.py` | Torch autograd-Jacobian helper for characterization optimization. |

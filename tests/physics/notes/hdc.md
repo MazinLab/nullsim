@@ -372,15 +372,13 @@ upper bound is proven**. Do not clamp the value, range-validate it into
 reports above 1 that is a result to look at, not a value to squash. What is now
 retracted is the assertion that above-1 is expected for absorption templates.
 
-### Per island, because the global number hides the bad one
+### Per island, because the global number is a different quantity
 
 `H` is block diagonal over islands, so the signal and the propagated variance
 are both island sums and each island's retention is a well-defined number on its
-own. `island_channel_counts` and `island_self_subtraction_factors` publish them,
-and the reason is that the global factor is a photon-weighted average that a
-long healthy island dominates. Measured on a 40-channel probe (a 30-channel comb
-against a flat 100 Hz leak, a 3-channel island, a 1-channel island, telluric
-gaps between them, width 15):
+own. `island_channel_counts` and `island_self_subtraction_factors` publish them.
+Measured on a 40-channel probe (a 30-channel comb against a flat 100 Hz leak, a
+3-channel island, a 1-channel island, telluric gaps between them, width 15):
 
 | island | channels | retention |
 |---|---|---|
@@ -408,10 +406,29 @@ because that planet template is smooth on the scale of 15 channels and only the
 short island is spared.
 
 The point of publishing per island is not a rule of thumb; it is that a single
-photon-weighted average over islands with a factor-of-8 spread in retention is
-not a description of anything, and a config whose signal lives on the island
-that retains 0.066 is in a different situation from one whose signal lives on
-the island that retains 0.556.
+number covering islands with a factor-of-8 spread in retention is not a
+description of anything, and a config whose signal lives on the island that
+retains 0.066 is in a different situation from one whose signal lives on the
+island that retains 0.556.
+
+**And the global factor is not an average of the island factors.** Writing
+`S_k`, `V_k`, `U_k` for the island sums of filtered signal, propagated variance
+and unfiltered `sum P^2/v`, the island factor is `S_k / sqrt(V_k U_k)` while the
+global one is
+
+```text
+self_subtraction_factor = sum_k S_k / sqrt( (sum_k V_k) (sum_k U_k) ),
+```
+
+one ratio of three sums. Cauchy-Schwarz gives
+`sqrt(sum V sum U) >= sum sqrt(V_k U_k)`, so the global value is at most the
+`sqrt(V_k U_k)`-weighted mean of the island factors, with equality only when
+`V_k / U_k` is constant across islands. When the islands are unbalanced -- one
+carrying the noise, another carrying the unfiltered signal power -- the global
+value falls **below every island factor**: a two-island probe with factors 0.594
+and 0.480 reports a global 0.344. Earlier text here (and in the dataclass
+docstring) called the global number an average of the island ones; it is not,
+and the direction of the error is not bounded by the island range.
 
 ### A filtered template that is only roundoff
 
@@ -610,13 +627,53 @@ its fixed-template weights and with them the boxcar's leak suppression, at the
 cost of not being optimal; the localization statistic takes the optimum for the
 covariance the data actually has, at the cost of the suppression. What it does
 not buy is a guarantee that the peak sits at the true velocity -- see above, and
-`-5.99` against `9.80`. The scan is a diagnostic to be read alongside
-`rv_leak_contamination`, which is `|a . L| / |a . P|` at the trial velocity: the
-term that can move the peak, in units of the term that should set it.
-`characterization.hdc_ccf` publishes it, grades it against the leak its
-bright-port subtraction is assumed to leave behind (`eps_systematic` times the
-leak, taken static), and the `hdc_ccf` plot annotates the RV panel when the
-grade is not `reliable`.
+`-5.99` against `9.80`. What the scan needs beside it is a statement about
+whether *this* observation's peak can be trusted, which is the next section.
+
+### Grading the argmax: a margin, over the whole grid
+
+`ccf_rv_scan` takes an optional `residual_leak_rate_hz_per_channel` -- the part
+of the leak a pipeline's own subtraction cannot remove -- and returns, beside
+the scores, that residual's contribution to *every* trial's score,
+
+```text
+shift(rv) = sqrt(t) (a(rv) . L_res) / sqrt(a(rv)^T diag(v) a(rv)),
+```
+
+in the same sigma units. `RvScan.localization(truth)` then compares two
+quantities of the same kind:
+
+```text
+margin            = score(truth) - max_{rv != truth} score(rv),
+worst_case_margin = margin - |shift(truth)| - max_{rv != truth} |shift(rv)|,
+```
+
+and grades `reliable` when `worst_case_margin > 0`, `marginal` when the
+unperturbed scan peaks at the truth but the residual could overturn it,
+`unreliable` when `margin <= 0`. No dimensionless cut appears anywhere: the
+criterion is one sigma quantity against another, so there is nothing to
+calibrate.
+
+**Why it has to be grid-wide.** A single projection at the true velocity is not
+a statement about an argmax. Build a positive leak orthogonal to the truth's
+filter but aligned with the filter four channels away -- the note's regression
+does exactly that, projecting the shift-`+4` filter off the truth filter -- and
+the truth-trial contamination is `3e-6`, clean under any threshold, while the
+same modeled residual lifts the `+4` trial by `1.34` sigma against a margin of
+`0.43` and moves the argmax. The round-4 verdict, computed at the truth alone,
+graded that case `reliable`.
+
+**What it does not cover.** Only the residual actually passed in. In
+`characterization.hdc_ccf` that is `eps_systematic * L`, static, with no
+averaging credit -- the same amplitude the stage charges as `V_sys`. An
+independent static subtraction error, a template mismatch, or a detector
+systematic moves the peak with `eps_systematic = 0` and grades clean. The
+payload keys are named `rv_scan_localization_valid_modeled_leak` and
+`..._grade_modeled_leak` so that scope is impossible to miss, and the
+`hdc_ccf` plot annotates the RV panel with the margin and the shift whenever
+the grade is not `reliable`. `rv_leak_contamination`, the truth-trial ratio
+`|a . L| / |a . P|`, is still published as a descriptive scalar and is
+deliberately not the verdict input.
 
 The two statistics are **not comparable in either direction**, and an earlier
 version of this note claimed both that the RV score sits above
@@ -727,6 +784,20 @@ Four devices, each answering a specific failure:
   `eps |B_w| / sqrt(2 f t)` with -- so squaring `eps B_w t` only to take its
   square root again was a pure overflow hazard. It rejected `eps = 1`,
   `B_w ~ 1`, `t = 1e200` on a root that is *t-independent*.
+- **The reduced coefficients themselves are `(mantissa, exponent)` pairs.**
+  `P` and `sqrt(Q)` are formed, added and hypot-ed without being materialized,
+  because either can leave float64 while the root stays ordinary: two bypassed
+  channels at `P1 = L = 1e308` with `eps = 1` put the systematic half of
+  `sqrt(Q)` at `beta eps |B_w''| = 2e308`, and the answer is
+  `c = n eps B_w / A = 5` exactly (4.999999999999999 at 8e307, where the sums
+  still fit). `A` and `V_sys` are reported as `inf` there, correctly -- they
+  genuinely do not fit -- and that no longer blocks the root.
+- **`V_sys` is squared in physical units, not normalized ones.** Squaring
+  `eps B_w'' t` first and applying `(kappa beta)^2` afterwards overflows on a
+  budget whose answer is tiny: `P1 = 1e-300` against a unit leak at `t = 1e200`
+  has `(eps B_w'' t)^2 = 1e400` normalized, while the physical
+  `V_sys = (1e-300 * 1e200)^2 = 1e-200`. The amplitude is assembled in
+  exponent form and squared there.
 
 Plus two shape rules on the root itself: it is
 `0.5 P + hypot(P/2, sqrt(Q))`, algebraically the same as

@@ -963,15 +963,56 @@ def test_accepted_spectro_solution_is_marked_accepted(
     assert float(payload["ccf_snr"]) > 0.0
 
 
-def test_payload_array_schema_does_not_depend_on_acceptance(
+ACCEPTED_ONLY_SCALAR_KEYS: tuple[str, ...] = (
+    "analysis_grid_resolving_power",
+    "ccf_model",
+    "content_resolving_power",
+    "continuum_filter_width_res_elements",
+    "detection_budget_source",
+    "eps_systematic_used",
+    "grid_oversampling",
+    "integration_time_s",
+    "observed_band_um",
+    "planet_radial_velocity_kms",
+    "planet_template_provenance",
+    "planet_template_sha256",
+    "resolving_power_source",
+    "rv_scan_localization_model",
+    "servo_bw_hz_used",
+    "snr_vs_resolving_power_model",
+    "snr_vs_rv_model",
+    "star_template_provenance",
+    "star_template_sha256",
+    "systematic_branch_source",
+    "target_snr",
+    "telluric_mask_threshold",
+    "telluric_template_provenance",
+    "telluric_template_sha256",
+    "with_fringe_tracking",
+)
+"""Keys an accepted payload has and a rejected one deliberately does not.
+
+Every one describes a quantity the rejected path never computed (a resolving
+power, a template it never read) or prose about a model it never ran. Pinned
+as a list because for a payload the schema IS the behavior: a consumer reads
+keys, so a key appearing or disappearing is a contract change and should have
+to be written down here.
+"""
+
+
+def test_payload_schema_does_not_depend_on_acceptance(
     payload: dict[str, object], tmp_path: Path
 ) -> None:
-    """A rejected retune must publish the same keys, not a smaller payload.
+    """A rejected retune publishes the same arrays, emptied -- not fewer keys.
 
     A consumer decides what to read from the payload schema, and the schema
-    cannot depend on whether the optimizer happened to converge: two published
+    cannot depend on whether the optimizer happened to converge: published
     per-channel arrays existed only on the accepted path, so a plot iterating
-    them raised on rejection instead of drawing a hole.
+    them raised on rejection instead of drawing a hole. The contract asserted
+    here in both directions is: every accepted array key exists on the rejected
+    path as an empty array of the same dtype kind; the rejected path adds
+    nothing of its own; and the scalar keys it omits are exactly the pinned
+    list above.
     """
 
     rejected = _stage(_context(tmp_path)).apply(
@@ -981,54 +1022,89 @@ def test_payload_array_schema_does_not_depend_on_acceptance(
     accepted_arrays = {
         key for key, value in payload.items() if isinstance(value, np.ndarray)
     }
-    missing = sorted(accepted_arrays - set(rejected))
-    assert missing == []
+    assert sorted(accepted_arrays - set(rejected)) == []
     for key in sorted(accepted_arrays):
         empty = rejected[key]
-        assert isinstance(empty, np.ndarray)
-        assert empty.size == 0
+        assert isinstance(empty, np.ndarray), key
+        assert empty.size == 0, key
         assert empty.dtype.kind == np.asarray(payload[key]).dtype.kind, key
 
-    # Every scalar the accepted payload carries is there too, so a table writer
-    # gets a column either way.
-    for key in ("rv_leak_contamination", "rv_scan_localization_grade"):
-        assert key in rejected
+    # Reverse direction: rejection may not invent keys an accepted run lacks.
+    assert sorted(set(rejected) - set(payload)) == []
+
+    # And the scalars it does omit are exactly the documented set.
+    assert sorted(set(payload) - set(rejected)) == sorted(
+        ACCEPTED_ONLY_SCALAR_KEYS
+    )
+
     assert np.isnan(float(rejected["rv_leak_contamination"]))
-    assert rejected["rv_scan_localization_valid"] is False
+    assert np.isnan(float(rejected["rv_scan_worst_case_margin_sigma"]))
+    assert rejected["rv_scan_localization_valid_modeled_leak"] is False
+    assert rejected["rv_scan_localization_grade_modeled_leak"] == "not evaluated"
 
 
-def test_rv_scan_publishes_its_leak_contamination_and_a_verdict(
+def test_rv_localization_verdict_is_a_grid_wide_margin_comparison(
     payload: dict[str, object],
 ) -> None:
-    """The scan's argmax is only evidence when the leak term is small.
+    """The verdict compares two sigma quantities over the whole scan.
 
-    Nothing in the code stops a reader taking the peak as a radial-velocity
-    measurement, so the payload has to say when that reading is unsupported.
+    A projection at the true velocity alone cannot validate an argmax: a leak
+    orthogonal to the filter at the truth can align with the filter a few
+    trials away. So the published verdict has to be a function of every trial's
+    shift, and it has to be reproducible from the published fields.
     """
 
-    contamination = float(payload["rv_leak_contamination"])
-    effective = float(payload["rv_leak_contamination_effective"])
-    assert contamination >= 0.0
-    # The observation the scan sees has had the leak mean removed, so what can
-    # actually shift the peak is the eps_systematic fraction the null
-    # instability leaves behind -- not the whole leak.
-    assert effective == pytest.approx(
-        contamination * float(payload["eps_systematic_used"])
+    shifts = np.asarray(payload["rv_leak_score_shift_sigma"], dtype=np.float64)
+    scores = np.asarray(payload["snr_vs_rv"], dtype=np.float64)
+    grid = np.asarray(payload["snr_vs_rv_kms"], dtype=np.float64)
+    assert shifts.shape == scores.shape == grid.shape
+    assert shifts.size > 1
+
+    truth = int(np.argmin(np.abs(grid - float(payload["planet_radial_velocity_kms"]))))
+    off_truth = np.ones(scores.size, dtype=bool)
+    off_truth[truth] = False
+    margin = float(scores[truth] - scores[off_truth].max())
+    shift_truth = float(abs(shifts[truth]))
+    shift_off = float(np.abs(shifts[off_truth]).max())
+
+    assert float(payload["rv_scan_margin_sigma"]) == pytest.approx(margin)
+    assert float(payload["rv_scan_leak_shift_at_truth_sigma"]) == pytest.approx(
+        shift_truth
     )
-    assert effective <= contamination
-    grade = payload["rv_scan_localization_grade"]
+    assert float(
+        payload["rv_scan_max_off_truth_leak_shift_sigma"]
+    ) == pytest.approx(shift_off)
+    assert float(payload["rv_scan_worst_case_margin_sigma"]) == pytest.approx(
+        margin - shift_truth - shift_off
+    )
+
+    grade = payload["rv_scan_localization_grade_modeled_leak"]
     assert grade in ("reliable", "marginal", "unreliable")
-    # The verdict is exactly "the effective contamination cleared the stated
-    # cut", not an independent judgement.
-    assert payload["rv_scan_localization_valid"] is (effective < 0.1)
-    assert (grade == "reliable") is (effective < 0.1)
-    assert "CONVENTIONS" in str(payload["rv_leak_contamination_model"])
+    assert payload["rv_scan_localization_valid_modeled_leak"] is (
+        grade == "reliable"
+    )
+    assert (grade == "reliable") is (
+        margin > 0.0 and margin - shift_truth - shift_off > 0.0
+    )
+
+    # The shifts are the modeled residual, so they scale with eps_systematic:
+    # a config with no null instability has nothing to be contaminated by.
+    if float(payload["eps_systematic_used"]) == 0.0:
+        assert np.all(shifts == 0.0)
+
+    # The verdict's scope is stated where it cannot be missed.
+    model = str(payload["rv_scan_localization_model"])
+    assert "eps_systematic * L" in model
+    assert "static subtraction error" in model
+    # The truth-only ratio is published but explicitly not the verdict.
+    assert float(payload["rv_leak_contamination"]) >= 0.0
+    assert "deliberately not used as the verdict" in model
 
 
 def test_island_diagnostics_expose_what_the_global_factor_averages_over(
     payload: dict[str, object],
 ) -> None:
-    """Per-island retention, because one crippled island hides in the mean."""
+    """Per-island retention: the global factor is a different quantity."""
 
     counts = np.asarray(payload["ccf_island_channel_counts"], dtype=np.int64)
     factors = np.asarray(

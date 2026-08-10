@@ -358,25 +358,34 @@ def test_hdc_ccf_plot_renders_when_upstream_cannot_be_identified(
     )
 
 
-def test_rv_panel_warns_when_the_peak_is_not_a_velocity_measurement() -> None:
+def test_rv_panel_warns_with_the_numbers_the_verdict_was_computed_from() -> None:
     """A labelled peak reads as a measurement whether or not it is one.
 
-    The scan maximizes the match to the OBSERVED spectrum, so a leak the
-    continuum filter cannot remove moves the peak. When the stage grades the
-    localization as anything but reliable, the panel has to say so on its face.
+    The scan maximizes the match to the OBSERVED spectrum, so a residual leak
+    moves the peak. When the stage grades the localization as anything but
+    reliable the panel has to say so on its face -- and it has to show the
+    margin and the leak shift, the two sigma quantities the verdict compares,
+    not the truth-only contamination ratio, which is a different number.
     """
 
     payload = _payload()
-    payload["rv_leak_contamination"] = 3.5
-    payload["rv_leak_contamination_effective"] = 3.5
-    payload["rv_scan_localization_grade"] = "unreliable"
+    payload["rv_leak_contamination"] = 358.0
+    payload["rv_scan_margin_sigma"] = 0.43
+    payload["rv_scan_max_off_truth_leak_shift_sigma"] = 1.34
+    payload["rv_scan_worst_case_margin_sigma"] = -0.97
+    payload["rv_scan_localization_grade_modeled_leak"] = "marginal"
     fig = plot_hdc_ccf(payload)
     texts = [t.get_text() for t in fig.axes[3].texts]
-    assert any("unreliable" in t for t in texts)
-    assert any("3.5" in t for t in texts)
+    warning = [t for t in texts if "may not be the true velocity" in t]
+    assert len(warning) == 1
+    assert "marginal" in warning[0]
+    assert "0.43" in warning[0]
+    assert "1.34" in warning[0]
+    # The raw contamination ratio must not be the number beside the verdict.
+    assert "358" not in warning[0]
     plt.close(fig)
 
-    payload["rv_scan_localization_grade"] = "reliable"
+    payload["rv_scan_localization_grade_modeled_leak"] = "reliable"
     fig = plot_hdc_ccf(payload)
     assert not [
         t for t in fig.axes[3].texts if "may not be the true velocity" in t.get_text()

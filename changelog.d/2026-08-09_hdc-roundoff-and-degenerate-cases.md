@@ -42,3 +42,15 @@ upstream optimizer converged.
 No shipped configuration's headline numbers moved: `hdc_ccf_smoke`,
 `hdc_ccf_systematics` and `hdc_detection_smoke` are bit-identical before and
 after. The fixes are confined to degenerate and extreme-magnitude inputs.
+
+**RV localization is now graded over the whole scan.** The first version of the
+verdict evaluated the leak's projection at the true velocity only, which cannot
+validate an argmax: a leak orthogonal to the filter at the truth can be strongly
+aligned with the filter a few trials away, and on such a probe the truth-trial
+contamination reads 3e-6 while the modeled residual moves the peak four
+channels. `ccf_rv_scan` now returns each trial's score shift under a supplied
+residual leak, and the verdict compares the truth's score margin against the
+largest shift anywhere on the grid — two quantities in sigma, so no
+dimensionless cut is involved. The payload keys carry `_modeled_leak` in their
+names because the scope really is that narrow: a static subtraction error or a
+template mismatch moves the peak without moving the flag.

@@ -80,8 +80,10 @@ from pydantic import Field as PydanticField
 
 from nullsim.physics.hdc import (
     ChannelSpectra,
+    RvLocalization,
+    RvScan,
     build_channel_edges,
-    ccf_vs_rv,
+    ccf_rv_scan,
     channelize,
     matched_filter_ccf,
     rv_leak_contamination,
@@ -294,13 +296,14 @@ class HdcCcfStage(BaseStage):
             planet_rv_kms=planet_rv_kms,
             mf_kwargs=mf_kwargs,
         )
-        rv_grid_kms, snr_vs_rv, rv_leak_contamination_value = _ccf_vs_rv(
+        rv_scan, rv_localization, rv_leak_contamination_value = _ccf_vs_rv(
             params=params,
             planet_rv_kms=planet_rv_kms,
             channels=channels,
             channel_builder=channel_builder,
             resolving_power=resolving_power,
             mf_kwargs=mf_kwargs,
+            eps_systematic=eps_systematic,
         )
 
         component_name = unique_component_name(
@@ -370,33 +373,41 @@ class HdcCcfStage(BaseStage):
                 snr_vs_r_photon_limited.astype(np.float64, copy=True)
             ),
             "snr_vs_resolving_power_r": r_scan.astype(np.float64, copy=True),
-            "snr_vs_rv": snr_vs_rv.astype(np.float64, copy=True),
-            "snr_vs_rv_kms": rv_grid_kms.astype(np.float64, copy=True),
+            "snr_vs_rv": rv_scan.scores.astype(np.float64, copy=True),
+            "snr_vs_rv_kms": rv_scan.rv_grid_kms.astype(np.float64, copy=True),
+            # What the modeled residual leak does to EVERY trial's score, in
+            # the same sigma units as snr_vs_rv. The verdict below is a
+            # comparison between this array and the score margin; a projection
+            # at the true velocity alone cannot validate an argmax.
+            "rv_leak_score_shift_sigma": (
+                rv_scan.residual_leak_score_shift.astype(np.float64, copy=True)
+            ),
+            "rv_scan_margin_sigma": float(rv_localization.margin_sigma),
+            "rv_scan_leak_shift_at_truth_sigma": float(
+                rv_localization.shift_at_truth_sigma
+            ),
+            "rv_scan_max_off_truth_leak_shift_sigma": float(
+                rv_localization.max_off_truth_shift_sigma
+            ),
+            "rv_scan_worst_case_margin_sigma": float(
+                rv_localization.worst_case_margin_sigma
+            ),
+            # Named for its scope: the verdict covers the eps_systematic * L
+            # residual and nothing else. A static subtraction error, a template
+            # mismatch or a detector systematic moves the peak without moving
+            # this flag.
+            "rv_scan_localization_valid_modeled_leak": bool(
+                rv_localization.valid
+            ),
+            "rv_scan_localization_grade_modeled_leak": rv_localization.grade,
             # |a . L| / |a . P| for the whitened RV filter at the scene
-            # velocity: the term that can move the scan's peak, over the term
-            # that should set it. NaN when no scan was run.
+            # velocity. Descriptive only -- NOT the verdict input, which is the
+            # grid-wide margin comparison above. NaN when no scan was run.
             "rv_leak_contamination": float(rv_leak_contamination_value),
-            # The same ratio against the leak the observation actually retains.
-            # The scan runs on a bright-port-subtracted spectrum, so what is
-            # left is the null instability the rest of this stage already
-            # charges: a fraction eps_systematic of the leak, taken static (the
-            # no-fringe-tracking worst case). The verdict is graded on this,
-            # not on the raw ratio, because the raw ratio is the contamination
-            # of a subtraction that was never assumed to fail completely.
-            "rv_leak_contamination_effective": (
-                eps_systematic * float(rv_leak_contamination_value)
-            ),
-            "rv_scan_localization_valid": _rv_localization_valid(
-                eps_systematic * float(rv_leak_contamination_value)
-            ),
-            "rv_scan_localization_grade": _rv_localization_grade(
-                eps_systematic * float(rv_leak_contamination_value)
-            ),
             # Per admitted island, in ascending wavelength. The global
-            # self_subtraction_factor is a photon-weighted average over
-            # islands whose retention can differ by a factor of 8 in either
-            # direction, so it describes none of them; a one-channel island
-            # retains nothing at all.
+            # self_subtraction_factor is not an average of these -- it is
+            # sum(S_k) / sqrt(sum(V_k) sum(U_k)), which can sit below every
+            # island factor; a one-channel island retains nothing at all.
             "ccf_island_channel_counts": budget.island_channel_counts.astype(
                 np.int64, copy=True
             ),
@@ -517,31 +528,37 @@ class HdcCcfStage(BaseStage):
                 "other -- a planet flat in total against its leak scores 1e-15 "
                 "here while detection reads 0.258."
             ),
-            "rv_leak_contamination_model": (
-                "|a . L| / |a . P_template| for the whitened RV filter a at the "
-                "scene radial velocity: the leak's contribution to the score's "
-                "numerator over the planet's, i.e. the size of the term that "
-                "can shift the peak in units of the term that should set it. "
-                "The scan itself runs on a leak-mean-subtracted observation "
-                "(bright-port monitoring, standard HDC practice), so "
-                "rv_leak_contamination is the contamination at 100% "
-                "subtraction error -- an upper bound, and it is routinely "
-                "above 1 without meaning anything is wrong. "
-                "rv_leak_contamination_effective multiplies it by "
-                "eps_systematic, the fractional leak instability this stage "
-                "already charges as V_sys, which is the leak the subtraction "
-                "cannot remove; it is taken static, the no-fringe-tracking "
-                "worst case, with no averaging credit. "
-                "rv_scan_localization_grade cuts the EFFECTIVE value at 0.1 "
-                "('reliable') and 1.0 ('unreliable'), and "
-                "rv_scan_localization_valid is the grade being 'reliable'. "
-                "Those two cuts are CONVENTIONS, not derived bounds: no "
-                "theorem places the peak at the true velocity below either of "
-                "them. What they exist to catch is the physics-side "
-                "counterexample, true RV -5.99 against 9.80 four channels "
-                "away. "
-                "inf means the filter carries no planet content at all and the "
-                "scan localizes nothing; NaN means no scan was run."
+            "rv_scan_localization_model": (
+                "Verdict on whether the RV scan's argmax survives the leak "
+                "this stage models, evaluated over the WHOLE grid rather than "
+                "at one trial. The scan is rerun with a residual leak of "
+                "eps_systematic * L -- the part of the leak a bright-port mean "
+                "subtraction cannot remove, taken static with no averaging "
+                "credit, the same amplitude charged as V_sys -- and each "
+                "trial's score shift is recorded in sigma "
+                "(rv_leak_score_shift_sigma). The comparison is then between "
+                "two quantities in the same units: rv_scan_margin_sigma, the "
+                "truth's score over its best competitor, against "
+                "rv_scan_leak_shift_at_truth_sigma + "
+                "rv_scan_max_off_truth_leak_shift_sigma, the worst alignment "
+                "of that residual (truth pushed down, a competitor pushed up). "
+                "rv_scan_worst_case_margin_sigma is the difference. Grades: "
+                "'reliable' when the worst case still peaks at the truth, "
+                "'marginal' when the unperturbed scan does but the residual "
+                "could overturn it, 'unreliable' when the peak is already "
+                "elsewhere, 'not evaluated' with no scan. No dimensionless cut "
+                "is involved -- the criterion is a comparison of two sigma "
+                "quantities -- but the SCOPE is narrow and the key names say "
+                "so: only the modeled eps_systematic * L residual is covered. "
+                "An independent static subtraction error, a template mismatch "
+                "or a detector systematic moves the peak with eps_systematic = "
+                "0 and grades clean here. A truth-only projection would be "
+                "worse still: a leak orthogonal to the filter at the true "
+                "velocity can align with the filter a few trials away, giving "
+                "a contamination of 3e-6 at the truth on a probe whose argmax "
+                "the same residual moves by four channels. "
+                "rv_leak_contamination is that truth-only ratio, kept as a "
+                "descriptive scalar and deliberately not used as the verdict."
             ),
             "source_model": (
                 "nullsim characterization.hdc_ccf: nullsim.physics.hdc "
@@ -651,31 +668,6 @@ _CCF_MODEL = (
 )
 
 
-# Cuts on |a . L| / |a . P|, the leak's share of the RV score's numerator.
-# Conventions, not derived bounds: below 0.1 the leak term is a 10% perturbation
-# on the term that sets the peak, which left the peak at the true velocity in
-# every probe we ran, but no theorem says it must. At or above 1 the leak can
-# dominate the numerator outright and the peak location is not evidence.
-_RV_CONTAMINATION_RELIABLE = 0.1
-_RV_CONTAMINATION_UNRELIABLE = 1.0
-
-
-def _rv_localization_grade(contamination: float) -> str:
-    """``reliable`` / ``marginal`` / ``unreliable`` / ``not evaluated``."""
-    if not math.isfinite(contamination):
-        return "unreliable" if contamination == math.inf else "not evaluated"
-    if contamination < _RV_CONTAMINATION_RELIABLE:
-        return "reliable"
-    if contamination < _RV_CONTAMINATION_UNRELIABLE:
-        return "marginal"
-    return "unreliable"
-
-
-def _rv_localization_valid(contamination: float) -> bool:
-    """True only for the ``reliable`` grade: the argmax is worth reading."""
-    return _rv_localization_grade(contamination) == "reliable"
-
-
 _REJECTED_NAN_KEYS: tuple[str, ...] = (
     "ccf_snr",
     "ccf_snr_photon_limited",
@@ -688,7 +680,10 @@ _REJECTED_NAN_KEYS: tuple[str, ...] = (
     "n_effective_channels",
     "n_effective_lines",
     "rv_leak_contamination",
-    "rv_leak_contamination_effective",
+    "rv_scan_margin_sigma",
+    "rv_scan_leak_shift_at_truth_sigma",
+    "rv_scan_max_off_truth_leak_shift_sigma",
+    "rv_scan_worst_case_margin_sigma",
     "telluric_masked_fraction",
     "integration_time_for_target_snr_s",
     "resolving_power_used",
@@ -722,6 +717,7 @@ _REJECTED_EMPTY_ARRAY_KEYS: dict[str, np.dtype[Any]] = {
     "snr_vs_resolving_power_r": np.dtype(np.float64),
     "snr_vs_rv": np.dtype(np.float64),
     "snr_vs_rv_kms": np.dtype(np.float64),
+    "rv_leak_score_shift_sigma": np.dtype(np.float64),
     "coarse_wavelength_um": np.dtype(np.float64),
     "coarse_bin_width_um": np.dtype(np.float64),
     "coarse_stellar_rate_hz": np.dtype(np.float64),
@@ -755,8 +751,8 @@ def _rejected_payload(
         {
             "n_channels": 0,
             "n_channels_used": 0,
-            "rv_scan_localization_valid": False,
-            "rv_scan_localization_grade": "not evaluated",
+            "rv_scan_localization_valid_modeled_leak": False,
+            "rv_scan_localization_grade_modeled_leak": "not evaluated",
             "upstream_spectro_component": spectro_name,
             "spectro_solution_accepted": False,
             "invalidity_reason": acceptance.reason,
@@ -1474,21 +1470,31 @@ def _ccf_vs_rv(
     channel_builder: _ChannelBuilder,
     resolving_power: float,
     mf_kwargs: dict[str, Any],
-) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
-    """The RV scan, its velocity grid, and the leak contamination of its peak.
+    eps_systematic: float,
+) -> tuple[RvScan, RvLocalization, float]:
+    """The RV scan, its localization verdict, and the leak contamination ratio.
+
+    The verdict is a statement about the **whole grid**, not about one trial.
+    The scan is run with a residual leak of ``eps_systematic * L`` -- the part
+    of the leak the bright-port mean subtraction cannot remove, taken static
+    (the no-fringe-tracking worst case, no averaging credit) -- and
+    `RvScan.localization` compares the truth's score margin over its best
+    competitor against the largest score change that residual can produce
+    anywhere on the grid. A leak orthogonal to the filter at the true velocity
+    can be strongly aligned with the filter a few trials away, so a projection
+    evaluated at the truth alone cannot validate an argmax.
 
     The third return value is `nullsim.physics.hdc.rv_leak_contamination` at the
-    scene radial velocity: the size of the term that can move the peak off the
-    true velocity, relative to the planet term that should set it. The scan
-    correlates against a leak-subtracted observation (see below), so this is the
-    contamination at 100% subtraction error -- an upper bound, not a prediction.
+    scene velocity, kept as a descriptive scalar only: it is NOT what the
+    verdict is computed from.
     """
+    empty_scan = RvScan(
+        rv_grid_kms=np.empty(0, dtype=np.float64),
+        scores=np.empty(0, dtype=np.float64),
+        residual_leak_score_shift=np.empty(0, dtype=np.float64),
+    )
     if params.rv_scan_points <= 1:
-        return (
-            np.empty(0, dtype=np.float64),
-            np.empty(0, dtype=np.float64),
-            float("nan"),
-        )
+        return empty_scan, empty_scan.localization(planet_rv_kms), float("nan")
 
     rv_grid = np.linspace(
         planet_rv_kms - float(params.rv_scan_halfwidth_kms),
@@ -1511,23 +1517,35 @@ def _ccf_vs_rv(
     def trial(rv_kms: float) -> ChannelSpectra:
         return channel_builder.channels(resolving_power, rv_kms, planet_only=True)
 
-    scan = ccf_vs_rv(trial, rv_grid, data_channels=data_channels, **mf_kwargs)
+    # The residual the bright-port subtraction leaves behind, in the same model
+    # the rest of this stage prices as V_sys: a fraction eps_systematic of the
+    # leak, static, with no averaging credit.
+    scan = ccf_rv_scan(
+        trial,
+        rv_grid,
+        data_channels=data_channels,
+        residual_leak_rate_hz_per_channel=(
+            float(eps_systematic) * channels.leak_rate_hz
+        ),
+        **mf_kwargs,
+    )
+    filter_kwargs = {
+        key: value
+        for key, value in mf_kwargs.items()
+        if key
+        in (
+            "continuum_filter_width_channels",
+            "telluric_transmission_per_channel",
+            "telluric_mask_threshold",
+        )
+    }
     contamination = rv_leak_contamination(
         trial(planet_rv_kms).planet_rate_hz,
         data_channels=data_channels,
         leak_rate_hz_per_channel=channels.leak_rate_hz,
-        **{
-            key: value
-            for key, value in mf_kwargs.items()
-            if key
-            in (
-                "continuum_filter_width_channels",
-                "telluric_transmission_per_channel",
-                "telluric_mask_threshold",
-            )
-        },
+        **filter_kwargs,
     )
-    return rv_grid, scan, contamination
+    return scan, scan.localization(planet_rv_kms), contamination
 
 
 def _find_spectro_component(

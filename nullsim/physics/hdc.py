@@ -138,8 +138,11 @@ __all__ = [
     "CcfBudget",
     "CcfContrastSolution",
     "ChannelSpectra",
+    "RvLocalization",
+    "RvScan",
     "build_channel_edges",
     "ccf_contrast_at_target_snr",
+    "ccf_rv_scan",
     "ccf_vs_rv",
     "channelize",
     "continuum_filter",
@@ -311,14 +314,24 @@ class CcfBudget:
         diagonal, so signal and propagated variance are both island sums and
         each island's retention stands alone). A one-channel island reports
         0.0, because a single sample cannot separate line from continuum.
-        Beyond that the spread is large and *not* monotone in island length --
-        an island shorter than the filter width has its boxcar renormalized
+
+        Beyond that the spread is large and *not* monotone in island length.
+        An island shorter than the filter width has its boxcar renormalized
         over the whole block, so the filter removes only the island mean and
-        can retain more than a long island does. Measured on the shipped
-        systematics config: islands of 382/196/17 channels retain
-        0.066/0.167/0.556 against a global 0.078. A photon-weighted average
-        over that spread describes none of them, which is why both arrays are
-        published.
+        can retain more than a long island does: on the shipped systematics
+        config, islands of 382/196/17 channels retain 0.066/0.167/**0.556**.
+
+        **The global factor is not an average of these.** It is
+        ``sum_k S_k / sqrt(sum_k V_k * sum_k U_k)`` -- one ratio of three
+        sums -- whereas each island factor is ``S_k / sqrt(V_k U_k)``. By
+        Cauchy-Schwarz ``sqrt(sum V sum U) >= sum sqrt(V_k U_k)``, so the
+        global value is at most the ``sqrt(V_k U_k)``-weighted mean of the
+        island factors, with equality only when ``V_k / U_k`` is the same on
+        every island. When it is not, the global value can fall **below every
+        island factor**: islands of 0.594 and 0.480 give a global 0.344. That
+        is not a bug in either number; they answer different questions, and it
+        is the reason both are published rather than one being derivable from
+        the other.
     """
 
     ccf_snr: float
@@ -403,24 +416,46 @@ def channelize(
     return bin_means * np.diff(edges)
 
 
-def _scaled_product(
+_Split = tuple[float, int]
+"""A number as ``(mantissa, exponent2)``, meaning ``mantissa * 2**exponent2``.
+
+Values in this module span the whole float64 exponent range and beyond -- a
+`1e308` leak, a `5e-324` variance, a `1e200` exposure squared. Carrying the
+power of two as an integer beside a mantissa in ``[0.5, 1)`` lets products,
+quotients, squares and square roots be formed without any intermediate
+over/underflowing, and materialized once at the end where a value that genuinely
+does not fit becomes ``inf`` or ``0``.
+
+Base two rather than logarithms because `math.frexp` is exact, whereas
+``exp(sum(log x))`` carries an absolute error in the log that becomes a relative
+error of ``|log x| * eps`` -- 1e-13 at these magnitudes.
+"""
+
+
+def _split(value: float) -> _Split:
+    """One float as ``(mantissa, exponent2)``; 0, inf and NaN keep exponent 0."""
+    if value == 0.0 or not math.isfinite(value):
+        return value, 0
+    return math.frexp(value)
+
+
+def _materialize(split: _Split) -> float:
+    """``mantissa * 2**exponent2`` as a float, saturating rather than raising."""
+    mantissa, exponent = split
+    if mantissa == 0.0 or not math.isfinite(mantissa):
+        return mantissa
+    try:
+        return math.ldexp(mantissa, exponent)
+    except OverflowError:
+        return math.copysign(math.inf, mantissa)
+
+
+def _split_scaled(
     factors: Sequence[float],
     divisors: Sequence[float] = (),
     exponent2: int = 0,
-) -> float:
-    """``prod(factors) / prod(divisors) * 2**exponent2``, materialized once.
-
-    Every factor is split by `math.frexp` into a mantissa in ``[0.5, 1)`` and an
-    integer power of two, so the running product cannot over- or underflow
-    however extreme the individual factors are. Only the closing `math.ldexp`
-    can, and by then the value genuinely is not representable.
-
-    Exponent bookkeeping rather than logarithms: the split is exact, whereas
-    ``exp(sum(log(x)))`` carries an absolute error in the log that becomes a
-    relative error of ``|log x| * eps`` in the result -- 1e-13 at the magnitudes
-    this module has to survive. Zero, infinity and NaN short-circuit, since
-    ``frexp`` has nothing useful to say about them.
-    """
+) -> _Split:
+    """``prod(factors) / prod(divisors) * 2**exponent2`` as a `_Split`."""
     mantissa = 1.0
     exponent = int(exponent2)
     for value in factors:
@@ -434,7 +469,7 @@ def _scaled_product(
         exponent += extra
     for value in divisors:
         if value == 0.0:
-            return math.copysign(math.inf, mantissa) if mantissa else math.nan
+            return (math.copysign(math.inf, mantissa) if mantissa else math.nan), 0
         if not math.isfinite(value):
             mantissa /= value
             continue
@@ -443,12 +478,111 @@ def _scaled_product(
         exponent -= split_exponent
         mantissa, extra = math.frexp(mantissa)
         exponent += extra
+    return mantissa, exponent
+
+
+def _split_combine(
+    numerators: Sequence[_Split], denominators: Sequence[_Split] = ()
+) -> _Split:
+    """Multiply and divide `_Split` values without materializing any of them."""
+    mantissa = 1.0
+    exponent = 0
+    for split_mantissa, split_exponent in numerators:
+        mantissa *= split_mantissa
+        exponent += split_exponent
+        if mantissa == 0.0 or not math.isfinite(mantissa):
+            return mantissa, 0
+        mantissa, extra = math.frexp(mantissa)
+        exponent += extra
+    for split_mantissa, split_exponent in denominators:
+        if split_mantissa == 0.0:
+            return (math.copysign(math.inf, mantissa) if mantissa else math.nan), 0
+        mantissa /= split_mantissa
+        exponent -= split_exponent
+        if mantissa == 0.0 or not math.isfinite(mantissa):
+            return mantissa, 0
+        mantissa, extra = math.frexp(mantissa)
+        exponent += extra
+    return mantissa, exponent
+
+
+def _split_square(split: _Split) -> _Split:
+    """``x^2``, which halves the reachable range if formed as a plain float."""
+    mantissa, exponent = split
     if mantissa == 0.0 or not math.isfinite(mantissa):
-        return mantissa
-    try:
-        return math.ldexp(mantissa, exponent)
-    except OverflowError:
-        return math.copysign(math.inf, mantissa)
+        return mantissa * mantissa, 0
+    squared, extra = math.frexp(mantissa * mantissa)
+    return squared, 2 * exponent + extra
+
+
+def _split_sqrt(split: _Split) -> _Split:
+    """``sqrt(x)`` for ``x >= 0``, halving the exponent exactly."""
+    mantissa, exponent = split
+    if mantissa == 0.0 or not math.isfinite(mantissa):
+        return math.sqrt(mantissa) if mantissa >= 0.0 else math.nan, 0
+    if exponent % 2:
+        # An odd exponent cannot be halved as an integer; move one power of two
+        # into the mantissa, which stays comfortably in range at [0.25, 2).
+        mantissa, exponent = mantissa * 2.0, exponent - 1
+    root, extra = math.frexp(math.sqrt(mantissa))
+    return root, exponent // 2 + extra
+
+
+def _split_add(left: _Split, right: _Split) -> _Split:
+    """``a + b`` with the larger exponent factored out of both."""
+    reference = max(left[1], right[1])
+    return _split_scaled(
+        (
+            _materialize((left[0], left[1] - reference))
+            + _materialize((right[0], right[1] - reference)),
+        ),
+        exponent2=reference,
+    )
+
+
+def _split_hypot(left: _Split, right: _Split) -> _Split:
+    """``hypot(a, b)`` with the larger exponent factored out of both."""
+    reference = max(left[1], right[1])
+    return _split_scaled(
+        (
+            math.hypot(
+                _materialize((left[0], left[1] - reference)),
+                _materialize((right[0], right[1] - reference)),
+            ),
+        ),
+        exponent2=reference,
+    )
+
+
+def _scaled_product(
+    factors: Sequence[float],
+    divisors: Sequence[float] = (),
+    exponent2: int = 0,
+) -> float:
+    """``prod(factors) / prod(divisors) * 2**exponent2``, materialized once.
+
+    Every factor is split into a mantissa and a power of two, so the running
+    product cannot over- or underflow however extreme the individual factors
+    are. Only the closing `math.ldexp` can, and by then the value genuinely is
+    not representable.
+    """
+    return _materialize(_split_scaled(factors, divisors, exponent2))
+
+
+def _split_dot(
+    weights: NDArray[np.float64], values: NDArray[np.float64]
+) -> _Split:
+    """``sum_i weights_i values_i`` as a `_Split`.
+
+    ``weights`` is expected to be O(1) (the filter vector is normalized);
+    ``values`` are raw rates and may span the entire exponent range, so they are
+    summed against their own largest exponent rather than a global scale. That
+    distinction is the whole point: dividing by a global maximum flushes the
+    channels that actually carry the filter's support to zero when some other
+    channel is 1e308 times larger.
+    """
+    mantissa, exponent = np.frexp(np.asarray(values, dtype=np.float64))
+    return _sum_split(np.asarray(weights, dtype=np.float64) * mantissa, exponent)
 
 
 def _reciprocal_split(
@@ -986,10 +1120,12 @@ def matched_filter_ccf(
     sq_sum = float(np.sum(admitted_weights * admitted_weights))
     n_effective_channels = abs_sum * abs_sum / sq_sum if sq_sum > 0.0 else 0.0
 
-    # Per island, because the global factor averages a crippled narrow island
-    # against healthy wide ones and hides it. H is block diagonal, so the
-    # signal and the propagated variance are both sums over islands and each
-    # island's retention is well defined on its own.
+    # Per island. H is block diagonal, so the signal and the propagated
+    # variance are both sums over islands and each island's retention is well
+    # defined on its own -- and the global factor, being one ratio of three
+    # sums rather than a mean of these, can sit below every one of them
+    # (islands 0.594 and 0.480 give a global 0.344). Neither number substitutes
+    # for the other.
     island_channel_counts = np.array(
         [block.stop - block.start for block in islands], dtype=np.intp
     )
@@ -1181,23 +1317,90 @@ def ccf_vs_rv(
     if not math.isfinite(integration_time_s) or integration_time_s < 0.0:
         raise ValueError("integration_time_s must be finite and non-negative")
 
+    return ccf_rv_scan(
+        channels_at_trial_rv_fn,
+        rv_array,
+        data_channels=data_channels,
+        continuum_filter_width_channels=continuum_filter_width_channels,
+        telluric_transmission_per_channel=telluric_transmission_per_channel,
+        telluric_mask_threshold=telluric_mask_threshold,
+        integration_time_s=integration_time_s,
+    ).scores
+
+
+def ccf_rv_scan(
+    channels_at_trial_rv_fn: Callable[[float], ChannelSpectra],
+    rv_grid_kms: Sequence[float] | NDArray[np.float64],
+    *,
+    data_channels: ChannelSpectra,
+    continuum_filter_width_channels: int,
+    telluric_transmission_per_channel: NDArray[np.float64] | None = None,
+    telluric_mask_threshold: float = 0.0,
+    integration_time_s: float = 1.0,
+    residual_leak_rate_hz_per_channel: NDArray[np.float64] | None = None,
+    **_ignored: object,
+) -> RvScan:
+    """`ccf_vs_rv`, plus what a residual leak would do to every trial's score.
+
+    Same statistic and the same filter; see `ccf_vs_rv` for both. The addition
+    is ``residual_leak_rate_hz_per_channel``: an unsubtracted leak component the
+    observation is assumed to still carry (for a pipeline that removes a
+    bright-port-measured mean, the part that measurement cannot remove). Its
+    contribution to each trial's score,
+
+    ```text
+    shift(rv) = sqrt(t) * (a(rv) . L_res) / sqrt(a(rv)^T diag(v) a(rv)),
+    ```
+
+    is returned alongside the scores in the *same sigma units*, one entry per
+    trial. That is the quantity a localization claim has to survive, and it has
+    to be evaluated on the whole grid: a leak orthogonal to the filter at the
+    true velocity can be strongly aligned with the filter three trials away, so
+    a projection computed at the truth alone says nothing about the argmax. See
+    `RvScan.localization`.
+    """
+    rv_array = np.atleast_1d(np.asarray(rv_grid_kms, dtype=np.float64))
+    if rv_array.ndim != 1:
+        raise ValueError(f"rv_grid_kms must be 1-D, got shape {rv_array.shape}")
+    if not np.all(np.isfinite(rv_array)):
+        raise ValueError("rv_grid_kms must be finite")
+    integration_time_s = float(integration_time_s)
+    if not math.isfinite(integration_time_s) or integration_time_s < 0.0:
+        raise ValueError("integration_time_s must be finite and non-negative")
+
+    scores = np.zeros(rv_array.size, dtype=np.float64)
+    shifts = np.zeros(rv_array.size, dtype=np.float64)
     analysis = _RvAnalysis.build(
         data_channels,
         continuum_filter_width_channels=continuum_filter_width_channels,
         telluric_transmission_per_channel=telluric_transmission_per_channel,
         telluric_mask_threshold=telluric_mask_threshold,
     )
-    values = np.zeros(rv_array.size, dtype=np.float64)
+    empty = RvScan(
+        rv_grid_kms=rv_array,
+        scores=scores,
+        residual_leak_score_shift=shifts,
+    )
     if analysis is None:
-        return values
+        return empty
 
     observed = (data_channels.planet_rate_hz + data_channels.leak_rate_hz)[
         analysis.admitted
     ]
-    observed_scale = float(np.max(np.abs(observed)))
-    if observed_scale <= 0.0:
-        return values
-    sqrt_time = math.sqrt(integration_time_s)
+    residual: NDArray[np.float64] | None = None
+    if residual_leak_rate_hz_per_channel is not None:
+        residual = _validate_rate_arrays(
+            residual_leak_rate_hz_per_channel=residual_leak_rate_hz_per_channel
+        )["residual_leak_rate_hz_per_channel"]
+        if residual.size != data_channels.n_channels:
+            raise ValueError(
+                "residual_leak_rate_hz_per_channel must have one entry per "
+                f"channel, got {residual.size} for {data_channels.n_channels}"
+            )
+        residual = residual[analysis.admitted]
+    if float(np.max(np.abs(observed))) <= 0.0 and residual is None:
+        return empty
+    sqrt_time = _split(math.sqrt(integration_time_s))
 
     for index, rv in enumerate(rv_array):
         trial = channels_at_trial_rv_fn(float(rv))
@@ -1207,27 +1410,135 @@ def ccf_vs_rv(
         )
         if filter_vector is None:
             continue
-        # Normalize the variance and the observation inside their sums: at
-        # v ~ 1e308 the plain sum of f^2 v overflows and the score collapses to
-        # -0.0 on a representable answer.
-        norm = math.sqrt(
-            float(
-                np.sum(
-                    filter_vector
-                    * filter_vector
-                    * (analysis.variance_admitted / analysis.variance_max)
-                )
+        # Var(a . N) = t sum_i a_i^2 v_i, summed against its OWN largest
+        # exponent. Dividing the variances by a global maximum flushed the
+        # channels carrying the filter's support to zero whenever some other
+        # channel was 1e308 times noisier, and the score collapsed to 0 on a
+        # perfectly representable answer.
+        norm = _split_sqrt(
+            _split_dot(filter_vector * filter_vector, analysis.variance_admitted)
+        )
+        if norm[0] <= 0.0:
+            continue
+        scores[index] = _materialize(
+            _split_combine(
+                (sqrt_time, _split_dot(filter_vector, observed)), (norm,)
             )
         )
-        if norm <= 0.0:
-            continue
-        numerator = float(np.sum(filter_vector * (observed / observed_scale)))
-        values[index] = (
-            sqrt_time
-            * (observed_scale / math.sqrt(analysis.variance_max))
-            * (numerator / norm)
+        if residual is not None:
+            shifts[index] = _materialize(
+                _split_combine(
+                    (sqrt_time, _split_dot(filter_vector, residual)), (norm,)
+                )
+            )
+    return RvScan(
+        rv_grid_kms=rv_array,
+        scores=scores,
+        residual_leak_score_shift=shifts,
+    )
+
+
+@dataclass(frozen=True, eq=False)
+class RvLocalization:
+    """Whether a residual leak could move the RV scan's peak off the truth.
+
+    Attributes
+    ----------
+    margin_sigma:
+        ``score(truth) - max(score off truth)``. Positive means the unperturbed
+        scan already peaks at the true velocity; negative means it does not, and
+        no amount of leak stability will fix that.
+    shift_at_truth_sigma, max_off_truth_shift_sigma:
+        The residual leak's contribution to the truth trial's score, and the
+        largest such contribution over all other trials, both in sigma. The
+        second is the one a truth-only diagnostic cannot see.
+    worst_case_margin_sigma:
+        ``margin - |shift at truth| - max off-truth |shift|``: the margin that
+        survives if the residual happens to push the truth down and its best
+        competitor up at the same time. Positive means no realization of the
+        modeled residual can move the argmax.
+    valid, grade:
+        ``grade`` is ``reliable`` when the worst case still peaks at the truth,
+        ``marginal`` when the unperturbed scan does but the residual could
+        overturn it, ``unreliable`` when the peak is already elsewhere, and
+        ``not evaluated`` when there was no scan or no residual model.
+        ``valid`` is ``grade == "reliable"``.
+
+    **Scope, and it is narrow.** This is a verdict about *one* modeled
+    perturbation -- the residual leak passed to `ccf_rv_scan`. Any contamination
+    outside that model (a static subtraction error, a template mismatch, a
+    detector systematic) is invisible to it and will grade clean. The name says
+    ``modeled_leak`` wherever it is published for that reason.
+    """
+
+    margin_sigma: float
+    shift_at_truth_sigma: float
+    max_off_truth_shift_sigma: float
+    worst_case_margin_sigma: float
+    valid: bool
+    grade: str
+
+
+@dataclass(frozen=True, eq=False)
+class RvScan:
+    """A radial-velocity scan and the residual-leak shift of each trial's score.
+
+    ``scores`` is what `ccf_vs_rv` returns. ``residual_leak_score_shift`` is the
+    contribution an unsubtracted leak makes to each trial's score, in the same
+    sigma units, and is all zeros when no residual was supplied.
+    """
+
+    rv_grid_kms: NDArray[np.float64]
+    scores: NDArray[np.float64]
+    residual_leak_score_shift: NDArray[np.float64]
+
+    def localization(self, truth_rv_kms: float) -> RvLocalization:
+        """Grade the argmax against the modeled residual, over the whole grid.
+
+        The comparison is between two quantities in the same units: the score
+        margin the truth enjoys over its best competitor, and the largest score
+        change the residual leak can produce. Both are grid-wide, so no
+        dimensionless cut has to be invented and none is -- the verdict is
+        simply whether the margin survives the worst alignment of the modeled
+        perturbation.
+
+        ``truth_rv_kms`` is matched to the nearest grid point; a scan whose grid
+        does not contain the true velocity cannot be graded any better than
+        that.
+        """
+        empty = RvLocalization(
+            margin_sigma=math.nan,
+            shift_at_truth_sigma=math.nan,
+            max_off_truth_shift_sigma=math.nan,
+            worst_case_margin_sigma=math.nan,
+            valid=False,
+            grade="not evaluated",
         )
-    return values
+        if self.scores.size < 2:
+            return empty
+        truth = int(np.argmin(np.abs(self.rv_grid_kms - float(truth_rv_kms))))
+        off_truth = np.ones(self.scores.size, dtype=bool)
+        off_truth[truth] = False
+        margin = float(self.scores[truth] - np.max(self.scores[off_truth]))
+        shift_truth = float(abs(self.residual_leak_score_shift[truth]))
+        shift_off = float(np.max(np.abs(self.residual_leak_score_shift[off_truth])))
+        worst_case = margin - shift_truth - shift_off
+        if not math.isfinite(margin):
+            return empty
+        if margin <= 0.0:
+            grade = "unreliable"
+        elif worst_case > 0.0:
+            grade = "reliable"
+        else:
+            grade = "marginal"
+        return RvLocalization(
+            margin_sigma=margin,
+            shift_at_truth_sigma=shift_truth,
+            max_off_truth_shift_sigma=shift_off,
+            worst_case_margin_sigma=worst_case,
+            valid=grade == "reliable",
+            grade=grade,
+        )
 
 
 def rv_leak_contamination(
@@ -1277,17 +1588,19 @@ def rv_leak_contamination(
     )
     if analysis is None:
         return math.inf
-    template = np.asarray(trial_planet_rate_hz, dtype=np.float64)
-    if template.shape != (data_channels.n_channels,):
+    # Finite and non-negative, like every other rate this module takes: a NaN
+    # leak returned 0.0 (read as "no contamination") and a negative one returned
+    # a plausible number, both of which are worse than an exception.
+    validated = _validate_rate_arrays(
+        trial_planet_rate_hz=trial_planet_rate_hz,
+        leak_rate_hz_per_channel=leak_rate_hz_per_channel,
+    )
+    template = validated["trial_planet_rate_hz"]
+    leak = validated["leak_rate_hz_per_channel"]
+    if template.size != data_channels.n_channels:
         raise ValueError(
-            "trial_planet_rate_hz must have one entry per channel, got shape "
-            f"{template.shape} for {data_channels.n_channels} channels"
-        )
-    leak = np.asarray(leak_rate_hz_per_channel, dtype=np.float64)
-    if leak.shape != template.shape:
-        raise ValueError(
-            "leak_rate_hz_per_channel must have one entry per channel, got "
-            f"shape {leak.shape} for {data_channels.n_channels} channels"
+            "trial_planet_rate_hz must have one entry per channel, got "
+            f"{template.size} for {data_channels.n_channels} channels"
         )
     filter_vector = analysis.filter_vector(template[analysis.admitted])
     if filter_vector is None:
@@ -1833,23 +2146,16 @@ def ccf_contrast_at_target_snr(
     # per regime instead:
     #     no fringe tracking:  sqrt(V_sys)/t = eps |B_w|
     #     fringe tracking:     sqrt(V_sys)/t = eps |B_w| / sqrt(2 f t)
-    leak_magnitude = eps_systematic * abs(normalized_leak_projection)
+    leak_magnitude = _split_scaled(
+        (eps_systematic, abs(normalized_leak_projection))
+    )
     if with_fringe_tracking:
-        systematic_root_over_time = leak_magnitude / math.sqrt(
-            2.0 * servo_bw_hz * integration_time_s
+        systematic_root_over_time = _split_combine(
+            (leak_magnitude,),
+            (_split_sqrt(_split_scaled((2.0, servo_bw_hz, integration_time_s))),),
         )
     else:
         systematic_root_over_time = leak_magnitude
-    try:
-        normalized_systematic = _systematic_variance_counts(
-            normalized_leak_projection,
-            integration_time_s,
-            eps_systematic,
-            servo_bw_hz,
-            with_fringe_tracking,
-        )
-    except OverflowError:
-        normalized_systematic = math.inf
 
     # kappa = alpha * 2^G is the physical weight scale, and it can overflow on
     # its own while every reported quantity is representable: P1 = 1e-300
@@ -1878,16 +2184,26 @@ def ccf_contrast_at_target_snr(
         (normalized_selfnoise, scale_planet, scale_planet, scale_planet),
         exponent2=2 * weight_scale_exponent,
     )
-    systematic_var_counts = _scaled_product(
-        (
-            normalized_systematic,
-            scale_planet,
-            scale_planet,
-            scale_rate,
-            scale_rate,
-        ),
-        exponent2=2 * weight_scale_exponent,
+    # V_sys is built from the PHYSICAL B_w, squared in exponent form. Squaring
+    # the normalized value first and applying the scales afterwards overflows on
+    # a budget whose answer is small: P1 = 1e-300 against a unit leak at
+    # t = 1e200 has (eps B_w'' t)^2 = 1e400 in normalized units, while the
+    # physical V_sys is (1e-300 * 1e200)^2 = 1e-200.
+    leak_projection = _split_scaled(
+        (normalized_leak_projection, scale_planet, scale_rate),
+        exponent2=weight_scale_exponent,
     )
+    systematic_amplitude = _split_combine(
+        (_split(eps_systematic), leak_projection, _split(integration_time_s))
+    )
+    if with_fringe_tracking:
+        # V_sys = eps^2 B_w^2 t / (2 f): the same amplitude with sqrt(t/(2 f t))
+        # folded in, i.e. divided by sqrt(2 f t).
+        systematic_amplitude = _split_combine(
+            (systematic_amplitude,),
+            (_split_sqrt(_split_scaled((2.0, servo_bw_hz, integration_time_s))),),
+        )
+    systematic_var_counts = _materialize(_split_square(systematic_amplitude))
 
     # Solve the normalized quadratic. Substituting the scale relations above
     # into (A^2 t^2) c^2 - (n^2 t C2) c - n^2 (t B2 + V_sys) = 0 and dividing
@@ -1909,20 +2225,31 @@ def ccf_contrast_at_target_snr(
     # for n = 1e-163 against a 3.2e-172 bracket whose quotient by alpha = 1e-278
     # is an ordinary 3.2e-57 -- so the closing product is assembled with
     # exponent bookkeeping and materialized once.
-    sqrt_time = math.sqrt(integration_time_s)
-    linear_term = (
-        target_snr * normalized_selfnoise / normalized_signal / integration_time_s
+    #
+    # P and sqrt(Q) are themselves carried as (mantissa, exponent) pairs rather
+    # than as floats. Either can leave float64 while the root stays ordinary:
+    # two channels at P1 = L = 1e308 with eps = 1 put the systematic half of
+    # sqrt(Q) at beta * eps |B_w''| = 2e308, and the answer is c = n B_w/A = 5.
+    linear_term = _split_scaled(
+        (target_snr, normalized_selfnoise),
+        (normalized_signal, integration_time_s),
     )
-    constant_term = math.hypot(
-        math.sqrt(scale_rate) * math.sqrt(normalized_photon_var) / sqrt_time,
-        scale_rate * systematic_root_over_time,
+    constant_term = _split_hypot(
+        _split_sqrt(
+            _split_scaled((scale_rate, normalized_photon_var), (integration_time_s,))
+        ),
+        _split_combine((_split(scale_rate), systematic_root_over_time)),
     )
     # 0.5 (P + sqrt(P^2 + 4Q)) == 0.5 P + hypot(P/2, sqrt(Q)). Written this way
     # nothing is squared and 2*sqrt(Q) is never formed, either of which would
     # overflow before the root does.
-    bracket = 0.5 * linear_term + math.hypot(0.5 * linear_term, constant_term)
-    contrast = _scaled_product(
-        (target_snr, bracket), (normalized_signal, scale_planet)
+    half_linear = (0.5 * linear_term[0], linear_term[1])
+    bracket = _split_add(half_linear, _split_hypot(half_linear, constant_term))
+    contrast = _materialize(
+        _split_combine(
+            (_split(target_snr), bracket),
+            (_split(normalized_signal), _split(scale_planet)),
+        )
     )
     if not math.isfinite(contrast) or contrast <= 0.0:
         raise ValueError(
