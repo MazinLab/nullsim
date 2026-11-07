@@ -1148,7 +1148,8 @@ def _find_ao_piston_rms_per_sub_m(state: SimulationState) -> float:
 
     ft_piston_nm: float = 0.0
     ft_prefix = "fringe_tracking.closed_loop_residual"
-    for name, component in state.opd_budget.components.items():
+    # Newest wins, matching _find_fringe_tracking_common_split_nm.
+    for name, component in reversed(tuple(state.opd_budget.components.items())):
         if name.startswith(ft_prefix):
             rms_nm = getattr(component, "rms_opd_nm", None)
             if rms_nm is not None and float(rms_nm) > 0.0:
@@ -1861,10 +1862,19 @@ def _resolve_scintillation_index(
     )
     open_loop_bandwidth_hz = 0.5 / float(residual.tau_scint_s)
     mode = str(getattr(params, "auto_amplitude_servo_mode", "closed_loop"))
-    if mode == "closed_loop":
+    # amplitude_servo_residual_sigma_i caps the closed-loop residual at the
+    # open-loop scintillation (the servo can always do nothing). A capped
+    # residual is open-loop scintillation, so it carries the open-loop
+    # bandwidth 0.5/tau_scint, not the servo bandwidth.
+    capped = residual.sigma_I_residual >= residual.sigma_I_open
+    if mode == "closed_loop" and not capped:
         injected_sigma_I = float(residual.sigma_I_residual)
         injected_source = "closed_loop_residual"
         injected_bandwidth_hz = float(residual.servo_bandwidth_hz)
+    elif mode == "closed_loop":
+        injected_sigma_I = float(residual.sigma_I_open)
+        injected_source = "closed_loop_capped_at_open_loop"
+        injected_bandwidth_hz = float(open_loop_bandwidth_hz)
     elif mode == "open_loop":
         injected_sigma_I = float(residual.sigma_I_open)
         injected_source = "open_loop_scintillation"
@@ -1977,7 +1987,7 @@ def _central_obstruction_ratio(state: SimulationState, default: float = 0.0) -> 
     smoke tests).
     """
 
-    for payload in state.geometry.components.values():
+    for payload in reversed(tuple(state.geometry.components.values())):
         if not isinstance(payload, dict):
             continue
         value = payload.get("central_obstruction_ratio")
@@ -2705,7 +2715,9 @@ def _pupil_modes_mode_area_and_diameter_m(
         if area_array is not None or diameter_array is not None:
             return area_array, diameter_array
 
-    for payload in state.geometry.components.values():
+    # Newest first: the oldest component is the telescope primary, which a
+    # later pupil_modes or AO stage subdivides (review 2026-11-07 Issue 1).
+    for payload in reversed(tuple(state.geometry.components.values())):
         if not isinstance(payload, dict):
             continue
         area_m2 = _positive_finite_payload_float(payload, "mode_area_m2")
@@ -2944,6 +2956,81 @@ def _planet_input_transport_scales(
     )
 
 
+def _static_field_factors(
+    *,
+    state: SimulationState,
+    n_arms: int,
+    n_wl: int,
+    n_chip_modes: int,
+    mode_group_indices: NDArray[np.intp] | None,
+    design_index: int | None,
+) -> tuple[NDArray[np.complex128] | None, tuple[str, ...]]:
+    """Product of the upstream per-mode static field factors, per chip arm.
+
+    Transport stages publish their per-mode GVD phase and
+    ``polarization.pm_fiber`` its per-mode, per-arm Jones J00 as a field
+    component ``static_field_factor`` of shape ``(n_modes, n_wl, n_pol)``
+    (review 2026-11-07 Issue 10, row 47). The deployed chip sees them; the
+    fields this stage rebuilds from coupling and area do not, so they are
+    multiplied in here, as the delay-line chromatic phase is replayed.
+    Factors published before ``injection.mode_splitter`` are mapped to the
+    chip inputs through the splitter's physical-mode indices; a length-one
+    polarization axis applies to every arm.
+
+    With a per-arm input phase trim (``design_index`` set), the chip
+    cancels each mode's design-bin phase, so each factor is taken relative
+    to its own phase in that bin.
+
+    Returns ``(factors, sources)`` with ``factors`` of shape
+    ``(n_arms, n_wl, n_chip_modes)``, or ``(None, ())`` without any factor.
+    """
+
+    total: NDArray[np.complex128] | None = None
+    sources: list[str] = []
+    for name, payload in state.field.components.items():
+        if not isinstance(payload, Mapping) or "static_field_factor" not in payload:
+            continue
+        factor = np.asarray(payload["static_field_factor"], dtype=np.complex128)
+        if factor.ndim != 3 or factor.shape[1] != n_wl:
+            raise ValueError(
+                f"sensitivity.detection_curve: field component {name!r} "
+                f"static_field_factor has shape {factor.shape}; expected "
+                f"(n_modes, {n_wl}, n_pol)."
+            )
+        if factor.shape[0] != n_chip_modes:
+            if mode_group_indices is None or factor.shape[0] <= int(
+                np.max(mode_group_indices)
+            ):
+                raise ValueError(
+                    f"sensitivity.detection_curve: field component {name!r} "
+                    f"static_field_factor covers {factor.shape[0]} modes, which "
+                    f"neither match the {n_chip_modes} chip inputs nor map "
+                    "through an injection.mode_splitter."
+                )
+            factor = factor[mode_group_indices]
+        n_pol = factor.shape[2]
+        if n_pol != n_arms:
+            if n_pol == 1:
+                factor = np.broadcast_to(factor, (n_chip_modes, n_wl, n_arms))
+            elif n_arms == 1 and np.allclose(factor, factor[:, :, :1]):
+                factor = factor[:, :, :1]
+            else:
+                raise ValueError(
+                    f"sensitivity.detection_curve: field component {name!r} "
+                    f"carries {n_pol} polarization-dependent factors but the "
+                    f"chip deploys {n_arms} arm(s); use "
+                    "deployment_mode = 'per_pol_arm'."
+                )
+        total = factor.copy() if total is None else total * factor
+        sources.append(f"field.{name}")
+    if total is None:
+        return None, ()
+    if design_index is not None:
+        design_phase = total[:, design_index, :] / np.abs(total[:, design_index, :])
+        total = total * np.conj(design_phase)[:, np.newaxis, :]
+    return np.transpose(total, (2, 1, 0)).copy(), tuple(sources)
+
+
 def _photon_wavelength_weights(
     state: SimulationState,
     wavelength_grid_um: NDArray[np.float64],
@@ -3012,6 +3099,8 @@ def _detector_stellar_and_static_leakage_rates_hz(
     stage can publish a realized leakage rate on the same normalization the
     SNR pipeline uses. Returns ``(total_stellar_rate_hz, static_chip_leakage_hz)``
     where ``total_stellar_rate_hz`` is the bright + dark + spectro port total
+    of the detector's uncapped rates (``port_rates`` only for detectors that
+    publish no uncapped rates, which do not saturate)
     and ``static_chip_leakage_hz`` is the detector dark-port total (the static
     chip null seen by the detector stage, before the AO / disk / setpoint
     realization the sensitivity MC adds).
@@ -3023,7 +3112,12 @@ def _detector_stellar_and_static_leakage_rates_hz(
     detector = _find_detector_component(state)
     if detector is None:
         return None, None
-    port_rates_hz = np.asarray(detector["port_rates"], dtype=np.float64)
+    # Physical (pre-saturation) rates: saturation is a readout limit, not a
+    # statement about the stellar flux (review 2026-11-07 Issue 9).
+    port_rates_hz = np.asarray(
+        detector.get("uncapped_port_rates", detector["port_rates"]),
+        dtype=np.float64,
+    )
     port_labels = tuple(str(label) for label in detector["port_labels"])
     if port_rates_hz.shape != (len(port_labels),):
         return None, None
@@ -3573,6 +3667,34 @@ class DetectionCurve(BaseStage):
         split_indices = splitter_physical_indices(state, unitary_stacks[0].shape[1])
         if split_indices is not None:
             mode_group_indices, mode_group_source = split_indices
+        static_field_factors, static_field_factor_sources = _static_field_factors(
+            state=state,
+            n_arms=int(unitary_stacks.shape[0]),
+            n_wl=len(wavelengths_m),
+            n_chip_modes=n_modes,
+            mode_group_indices=mode_group_indices,
+            design_index=(
+                int(chip_payload.get(
+                    "phase_reference_wavelength_index",
+                    np.argmin(np.abs(wavelengths_m - float(chip_payload["wl_design_um"]) * 1e-6)),
+                ))
+                if input_phase_correction_applied
+                else None
+            ),
+        )
+        if static_field_factors is None:
+            planet_scales_per_arm: tuple[NDArray[np.complex128] | None, ...] = (
+                (planet_transport_scales,) * int(unitary_stacks.shape[0])
+            )
+        else:
+            delay_scales = (
+                np.ones((1, len(wavelengths_m), n_modes), dtype=np.complex128)
+                if planet_transport_scales is None
+                else planet_transport_scales
+            )
+            planet_scales_per_arm = tuple(
+                delay_scales * arm_factor[np.newaxis] for arm_factor in static_field_factors
+            )
         # The planet sees the same piston as the star (review 2026-11-07
         # row 36): average its dark power over the MC's piston covariance.
         mode_piston_covariance_m2 = _mode_piston_covariance_m2(
@@ -3597,11 +3719,13 @@ class DetectionCurve(BaseStage):
                         ),
                         separations_rad=seps_rad,
                         n_pa_samples=params.n_pa_samples,
-                        input_transport_scales=planet_transport_scales,
+                        input_transport_scales=arm_scales,
                         wavelength_weights=wavelength_weights,
                         piston_covariance_m2=mode_piston_covariance_m2,
                     )
-                    for arm_stack in unitary_stacks
+                    for arm_stack, arm_scales in zip(
+                        unitary_stacks, planet_scales_per_arm, strict=True,
+                    )
                 ],
                 axis=0,
             )
@@ -3640,6 +3764,20 @@ class DetectionCurve(BaseStage):
             n_azimuths=int(params.n_azimuths),
             n_apertures=n_delay_apertures,
         )
+        if static_field_factors is None:
+            stellar_fields_per_arm = (per_az_field,) * int(unitary_stacks.shape[0])
+        else:
+            per_az_field_wl = (
+                per_az_field
+                if per_az_field.ndim == 3
+                else np.broadcast_to(
+                    per_az_field[:, np.newaxis, :],
+                    (per_az_field.shape[0], len(wavelengths_m), n_modes),
+                )
+            )
+            stellar_fields_per_arm = tuple(
+                per_az_field_wl * arm_factor[np.newaxis] for arm_factor in static_field_factors
+            )
         # Phase 1 (KILO transport.py L1739): n_realizations_per_azimuth
         # is the per-azimuth budget; if unset, the back-compat alias
         # n_mc_realizations is divided across the n_azimuths slots so
@@ -3658,7 +3796,6 @@ class DetectionCurve(BaseStage):
             or float(params.fiber_phase_noise_rms_rad) > 0.0
         )
         mc_kwargs: dict[str, Any] = {
-            "stellar_field": per_az_field,
             "dark_indices": dark_indices,
             "ao_piston_opd_rms_per_sub_m": sigma_OPD_m,
             "ao_piston_opd_covariance_m2": piston_covariance_m2,
@@ -3673,8 +3810,12 @@ class DetectionCurve(BaseStage):
 
         def run_mc(**overrides: Any) -> tuple[tuple[RealizedNullResult, ...], RealizedNullResult]:
             per_arm = tuple(
-                realized_null_depth_mc(u_stack=arm_stack, **{**mc_kwargs, **overrides})
-                for arm_stack in unitary_stacks
+                realized_null_depth_mc(
+                    u_stack=arm_stack, stellar_field=arm_field, **{**mc_kwargs, **overrides},
+                )
+                for arm_stack, arm_field in zip(
+                    unitary_stacks, stellar_fields_per_arm, strict=True,
+                )
             )
             return per_arm, _combine_realized_null_results(
                 per_arm, unitary_arm_weights, wavelength_weights,
@@ -3687,11 +3828,13 @@ class DetectionCurve(BaseStage):
             mc_per_arm = tuple(
                 _ideal_realized_null_for_stack(
                     u_stack=arm_stack,
-                    stellar_field=per_az_field,
+                    stellar_field=arm_field,
                     dark_indices=dark_indices,
                     wavelength_weights=wavelength_weights,
                 )
-                for arm_stack in unitary_stacks
+                for arm_stack, arm_field in zip(
+                    unitary_stacks, stellar_fields_per_arm, strict=True,
+                )
             )
             mc = _combine_realized_null_results(
                 mc_per_arm, unitary_arm_weights, wavelength_weights,
@@ -4002,6 +4145,7 @@ class DetectionCurve(BaseStage):
                 )
             ),
             "planet_delay_transport_applied": planet_transport_scales is not None,
+            "static_field_factor_sources": static_field_factor_sources,
             "wavelengths_m": tuple(float(w) for w in wavelengths_m),
             "photon_wavelength_weights": tuple(float(w) for w in wavelength_weights),
             "photon_wavelength_weights_source": wavelength_weights_source,

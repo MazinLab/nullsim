@@ -152,6 +152,15 @@ class SMF28Transport(BaseStage):
             wavelength_grid_um=wavelength_grid_um,
             common_phase_rad=common_phase_rad,
             dispersion_phase_rad=dispersion_phase_rad,
+        ).add_component(
+            unique_component_name(
+                self.type_name, state.field.components, self.context.instance_id,
+            ),
+            _static_field_factor_payload(
+                dispersion_phase_rad=dispersion_phase_rad,
+                field_shape=field_amplitudes.shape,
+                wavelength_grid_um=wavelength_grid_um,
+            ),
         )
         source_model = _attenuation_source_model(params)
         throughput = _updated_throughput(
@@ -482,6 +491,34 @@ def _updated_field(
         amplitudes=transported_amplitudes,
         wavelength_grid_um=wavelength_grid_um,
     )
+
+
+def _static_field_factor_payload(
+    *,
+    dispersion_phase_rad: NDArray[np.float64],
+    field_shape: tuple[int, ...],
+    wavelength_grid_um: tuple[float, ...],
+) -> dict[str, object]:
+    """Per-mode static field factor this stage applied, for field rebuilders.
+
+    ``sensitivity.detection_curve`` rebuilds its stellar and planet fields
+    from coupling and area, so it multiplies them by this factor to see the
+    same per-mode GVD phase the deployed chip sees (review 2026-11-07
+    Issue 10). The common-mode phase is the same for every mode at each
+    wavelength, a global phase the chip cannot see, so it is left out.
+    """
+
+    factor = np.exp(1j * dispersion_phase_rad.T)[:, :, np.newaxis]
+    return {
+        "static_field_factor": np.broadcast_to(factor, field_shape).astype(
+            np.complex128, copy=True,
+        ),
+        "wavelength_grid_um": wavelength_grid_um,
+        "source_model": (
+            "Per-mode GVD phase exp(i phi_disp[mode, wl]) from the stage's "
+            "length-mismatch draw, shape (n_modes, n_wl, n_pol)."
+        ),
+    }
 
 
 def _updated_throughput(

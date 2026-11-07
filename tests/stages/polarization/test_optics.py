@@ -193,3 +193,25 @@ def test_pm_fiber_requires_two_pbs_arms(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="n_pol=2"):
         stage.apply(state)
+
+
+def test_pm_fiber_publishes_per_mode_arm_j00_as_static_field_factor(
+    tmp_path: Path,
+) -> None:
+    """Sensitivity rebuilds fields; it needs the J00 the field carried (row 47)."""
+
+    amplitudes = np.ones((4, 2, 2), dtype=np.complex128)
+    state = _state_from_amplitudes(amplitudes)
+    stage = PMFiberJones(
+        {"fiber_length_m": 30.0, "slow_axis_alignment_rms_rad": 0.3, "seed": 7},
+        _context(tmp_path, "pm"),
+    )
+
+    result = stage.apply(state)
+
+    factor = result.field.components["polarization.pm_fiber"]["static_field_factor"]
+    np.testing.assert_allclose(factor, result.field.amplitudes, rtol=0, atol=1e-15)
+    jones = result.results.components["polarization.pm_fiber"]
+    np.testing.assert_allclose(factor[:, 0, 0], jones["jones_matrices_arm_a"][:, 0, 0])
+    np.testing.assert_allclose(factor[:, 0, 1], jones["jones_matrices_arm_b"][:, 0, 0])
+    assert np.ptp(np.abs(factor[:, 0, 0])) > 0.0

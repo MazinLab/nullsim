@@ -293,3 +293,25 @@ def test_opd_components_stack_in_quadrature(tmp_path: Path) -> None:
     assert result.opd_budget.total_rms_opd_nm == pytest.approx(
         math.sqrt(3.0**2 + dispersion_opd_nm**2),
     )
+
+
+def test_smf28_publishes_per_mode_dispersion_as_static_field_factor(
+    tmp_path: Path,
+) -> None:
+    """The factor is the per-mode GVD phase the field received (Issue 10)."""
+
+    state = _state((1.15, 1.25, 1.35), n_modes=3)
+    stage = _stage(
+        _context(tmp_path), length_matching_error_m=1.0e-3, phi_rms_rad=0.0,
+    )
+
+    result = stage.apply(state)
+
+    factor = result.field.components["transport.smf28"]["static_field_factor"]
+    assert factor.shape == (3, 3, 1)
+    np.testing.assert_allclose(factor, result.field.amplitudes, rtol=0, atol=1e-15)
+    np.testing.assert_allclose(np.abs(factor), 1.0, rtol=1e-15)
+    # Mode 0 is the length reference; the center bin is the expansion point.
+    np.testing.assert_allclose(factor[0], 1.0, atol=1e-15)
+    np.testing.assert_allclose(factor[:, 1, 0], 1.0, atol=1e-15)
+    assert np.max(np.abs(np.angle(factor))) > 0.0

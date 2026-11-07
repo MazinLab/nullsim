@@ -326,6 +326,16 @@ class PMFiberJones(BaseStage):
                 "cross_pol_leakage_power": float(leakage_power),
                 "seed": seed,
                 "arm_seeds": (seed_a, seed_b),
+                # Per-mode, per-arm J00 this stage multiplied into the field,
+                # shape (n_modes, n_wl, 2), for stages that rebuild fields
+                # (review 2026-11-07 row 47).
+                "static_field_factor": np.broadcast_to(
+                    np.stack(
+                        [jones_matrices_a[:, 0, 0], jones_matrices_b[:, 0, 0]],
+                        axis=-1,
+                    )[:, np.newaxis, :],
+                    field_amplitudes.shape,
+                ).astype(np.complex128, copy=True),
                 "source_model": (
                     "Independent NAYRA PM-fiber Jones draws per PBS arm; each "
                     "arm keeps its same-axis chip-coupled component and treats "

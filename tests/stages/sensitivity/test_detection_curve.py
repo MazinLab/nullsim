@@ -1955,11 +1955,15 @@ def test_detection_curve_auto_amplitude_servo_derives_sigma_i_and_f_eff(
     diagnostics = payload["effective_systematic_bandwidth_diagnostics"]
     assert diagnostics["piston_leakage_variance"] == pytest.approx(v_phi, rel=1e-10)
     assert diagnostics["amplitude_leakage_variance"] == pytest.approx(v_I, rel=1e-10)
+    # At 1e6 photons/s the 5 kHz servo is photon-noise limited, so the
+    # residual is capped at open loop and carries the open-loop bandwidth
+    # 0.5/tau_scint, not the servo's (review 2026-11-07 Issue 5).
+    assert expected_residual.sigma_I_residual == expected_residual.sigma_I_open
     expected_f_eff = effective_systematic_bandwidth_hz(
         piston_leakage_variance=v_phi,
         amplitude_leakage_variance=v_I,
         f_piston_hz=f_piston_hz,
-        f_amp_hz=amp_bw_hz,
+        f_amp_hz=0.5 / expected_residual.tau_scint_s,
     )
     assert payload["effective_systematic_bandwidth_hz"] == pytest.approx(
         expected_f_eff, rel=1.0e-10
@@ -2637,3 +2641,310 @@ def test_auto_setpoint_trim_requires_detector_component(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="auto_setpoint_trim"):
         stage.apply(state)
+
+
+# --- review 2026-11-07 package B: geometry fallbacks, amplitude bandwidth,
+# --- physical stellar rate, newest FT residual, static field factors.
+
+
+def _primary_then_pupil_modes_state(
+    *, mode_diameters_m: np.ndarray | None,
+) -> tuple[SimulationState, float, float]:
+    """8 m primary component followed by a pupil_modes component (HWO)."""
+
+    n_modes = 4
+    state = _keck_like_state(
+        n_modes=n_modes,
+        wavelengths_um=(1.25,),
+        n_apertures=1,
+        positions=np.zeros((n_modes, 2)),
+        strehl=1.0,
+        piston_opd_nm_total=0.0,
+    )
+    primary_area_m2 = math.pi * 4.0 ** 2
+    mode_diameter_m = 1.12
+    mode_area_m2 = math.pi * (mode_diameter_m / 2.0) ** 2
+    pupil_modes: dict[str, object] = {
+        "mode_diameter_m": mode_diameter_m,
+        "mode_area_m2": mode_area_m2,
+    }
+    if mode_diameters_m is not None:
+        pupil_modes["mode_diameters_m"] = mode_diameters_m
+        pupil_modes["mode_areas_m2"] = math.pi * (mode_diameters_m / 2.0) ** 2
+    geometry = replace(
+        state.geometry,
+        diameter_m=8.0,
+        area_m2=primary_area_m2,
+        components={
+            "fixed_aperture": {
+                "mode_diameter_m": 8.0,
+                "mode_area_m2": primary_area_m2,
+                "mode_diameters_m": np.array([8.0]),
+                "mode_areas_m2": np.array([primary_area_m2]),
+            },
+            "pupil_modes": pupil_modes,
+        },
+    )
+    return replace(state, geometry=geometry), mode_diameter_m, mode_area_m2
+
+
+@pytest.mark.parametrize("with_vectors", [True, False])
+def test_detection_curve_takes_pupil_mode_size_not_primary(
+    tmp_path: Path, with_vectors: bool,
+) -> None:
+    """Issue 1: the 8 m primary published first must never size the modes."""
+
+    from nullsim.outputs.plots._chip_field_inputs import mode_areas_m2, mode_diameters_m
+
+    vector = np.array([1.10, 1.12, 1.14, 1.16]) if with_vectors else None
+    state, mode_diameter_m, mode_area_m2 = _primary_then_pupil_modes_state(
+        mode_diameters_m=vector,
+    )
+    expected_d = vector if with_vectors else np.full(4, mode_diameter_m)
+    expected_a = (
+        math.pi * (vector / 2.0) ** 2 if with_vectors else np.full(4, mode_area_m2)
+    )
+    stage = DetectionCurve(
+        params={
+            "n_bright_ports": 1,
+            "n_dark_ports": 3,
+            "separations_mas": (1.0,),
+            "n_mc_realizations": 0,
+        },
+        context=_context(tmp_path),
+    )
+
+    payload = stage.apply(state).results.components["sensitivity.detection_curve"]
+
+    np.testing.assert_allclose(payload["sub_diameters_m"], expected_d, rtol=1e-15)
+    np.testing.assert_allclose(payload["sub_areas_m2"], expected_a, rtol=1e-15)
+    # The plot helpers fall back to the same sizes without a sensitivity payload.
+    np.testing.assert_allclose(mode_diameters_m(state, 4, None), expected_d, rtol=1e-15)
+    if with_vectors:
+        np.testing.assert_allclose(mode_areas_m2(state, 4, None), expected_a, rtol=1e-15)
+
+
+@pytest.mark.parametrize("photon_rate_per_sub_hz", [1.0e6, 1.0e10])
+def test_detection_curve_capped_amplitude_residual_carries_open_loop_bandwidth(
+    tmp_path: Path, photon_rate_per_sub_hz: float,
+) -> None:
+    """Issue 5: a residual capped at open loop is open-loop scintillation."""
+
+    from nullsim.physics.scintillation import amplitude_servo_residual_sigma_i
+
+    n_modes = 4
+    state = _keck_like_state(
+        n_modes=n_modes,
+        u_stack=np.eye(n_modes, dtype=np.complex128)[:, :, np.newaxis],
+        wavelengths_um=(1.25,),
+        positions=np.zeros((n_modes, 2)),
+        strehl=0.93,
+        piston_opd_nm_total=1.35,
+    )
+    servo_bandwidth_hz = 5.0e3
+    stage = DetectionCurve(
+        params={
+            "n_bright_ports": 1,
+            "n_dark_ports": n_modes - 1,
+            "separations_mas": (1.0,),
+            "n_realizations_per_azimuth": 0,
+            "auto_amplitude_servo_residual": True,
+            "auto_amp_servo_bandwidth_hz": servo_bandwidth_hz,
+            "auto_amp_servo_photon_rate_per_sub_hz": photon_rate_per_sub_hz,
+            "auto_f_piston_hz": 100.0,
+        },
+        context=_context(tmp_path),
+    )
+
+    payload = stage.apply(state).results.components["sensitivity.detection_curve"]
+
+    expected = amplitude_servo_residual_sigma_i(
+        wavelength_m=1.25e-6,
+        sub_diameter_m=float(payload["sub_diameters_m"][0]),
+        servo_bandwidth_hz=servo_bandwidth_hz,
+        photon_rate_per_sub_hz=photon_rate_per_sub_hz,
+    )
+    capped = expected.sigma_I_residual >= expected.sigma_I_open
+    # 1e6 photons/s leaves the 5 kHz servo photon limited; 1e10 does not.
+    assert capped == (photon_rate_per_sub_hz < 1.0e8)
+    diagnostics = payload["amplitude_servo_residual"]
+    assert diagnostics["injected_amplitude_bandwidth_hz"] == pytest.approx(
+        0.5 / expected.tau_scint_s if capped else servo_bandwidth_hz, rel=1e-12,
+    )
+    assert diagnostics["sigma_I_injected_source"] == (
+        "closed_loop_capped_at_open_loop" if capped else "closed_loop_residual"
+    )
+
+
+def test_detection_curve_normalizes_leakage_to_uncapped_stellar_rate(
+    tmp_path: Path,
+) -> None:
+    """Issue 9: saturation is a readout limit; the star sends uncapped photons."""
+
+    state = _state_with_detector_component(
+        bright_rate_hz=5.0e4, dark_rate_hz_per_port=2.0e3, spectro_rate_hz=5.0e2,
+    )
+    components = dict(state.results.components)
+    uncapped = np.array([1.0e8, 1.0e8, 2.0e3, 2.0e3, 5.0e2])
+    components["detector.mkid"] = {
+        **components["detector.mkid"],
+        "uncapped_port_rates": uncapped,
+    }
+    state = replace(state, results=Results(components=components))
+    stage = DetectionCurve(
+        params={
+            "n_bright_ports": 2,
+            "n_dark_ports": 2,
+            "separations_mas": (1.0, 10.0, 100.0),
+            "n_mc_realizations": 0,
+        },
+        context=_context(tmp_path),
+    )
+
+    payload = stage.apply(state).results.components["sensitivity.detection_curve"]
+
+    assert payload["leakage_rate_hz_effective"] == pytest.approx(
+        float(payload["effective_null_with_disk"]) * float(np.sum(uncapped))
+    )
+
+
+def test_find_ao_piston_takes_newest_fringe_tracking_residual() -> None:
+    """Issue 25: newest wins, as in _find_fringe_tracking_common_split_nm."""
+
+    from nullsim.stages.sensitivity.detection_curve import (
+        _find_ao_piston_rms_per_sub_m,
+    )
+
+    state = SimulationState.empty({"wavelength_grid_um": (1.25,)})
+    budget = OPDBudget(
+        components={
+            "fringe_tracking.closed_loop_residual": OPDComponent(
+                rms_opd_nm=10.0, reduction_stage="ft",
+            ),
+            "fringe_tracking.closed_loop_residual.second": OPDComponent(
+                rms_opd_nm=3.0, reduction_stage="ft",
+            ),
+        },
+    )
+    state = replace(state, opd_budget=budget)
+
+    assert _find_ao_piston_rms_per_sub_m(state) == pytest.approx(3.0e-9)
+
+
+def _hadamard_state_with_static_factor(
+    factor: np.ndarray, *, per_pol_arm: bool,
+) -> SimulationState:
+    """Two modes, bright = sum and dark = difference, at zero baseline."""
+
+    wavelengths_um = (1.20, 1.25, 1.30)
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=np.complex128) / math.sqrt(2.0)
+    u_stack = np.repeat(hadamard[:, :, np.newaxis], len(wavelengths_um), axis=2)
+    state = _keck_like_state(
+        n_modes=2,
+        wavelengths_um=wavelengths_um,
+        star_diameter_mas=0.0,
+        n_apertures=1,
+        u_stack=u_stack,
+        positions=np.zeros((2, 2)),
+        strehl=1.0,
+        piston_opd_nm_total=0.0,
+    )
+    n_pol = 2 if per_pol_arm else 1
+    field = Field(
+        amplitudes=np.ones((2, len(wavelengths_um), n_pol), dtype=np.complex128),
+        wavelength_grid_um=wavelengths_um,
+        components={"upstream": {"static_field_factor": factor}},
+    )
+    components = dict(state.results.components)
+    if per_pol_arm:
+        components["chip.kernel_mzi_mesh.test"] = {
+            **components["chip.kernel_mzi_mesh.test"],
+            "deployment_mode": "per_pol_arm",
+            "chip_channel_labels": ("A", "B"),
+            "input_phase_correction": np.ones((2, 2), dtype=np.complex128),
+            "u_stack_per_arm": np.stack([u_stack, u_stack]),
+        }
+    return replace(state, field=field, results=Results(components=components))
+
+
+def _static_factor_payload(tmp_path: Path, state: SimulationState) -> dict:
+    stage = DetectionCurve(
+        params={
+            "n_bright_ports": 1,
+            "n_dark_ports": 1,
+            "separations_mas": (1.0,),
+            "include_angular_coupling": False,
+            "n_mc_realizations": 0,
+        },
+        context=_context(tmp_path),
+    )
+    return stage.apply(state).results.components["sensitivity.detection_curve"]
+
+
+def test_detection_curve_applies_transport_phase_to_star_and_planet(
+    tmp_path: Path,
+) -> None:
+    """Issue 10: a static phase phi on one input leaks sin^2(phi/2) to the dark port.
+
+    With zero baseline the planet field is the star field, so the planet
+    throughput equals the null. A shared chip has no input trim.
+    """
+
+    phi_rad = 0.3
+    factor = np.ones((2, 3, 1), dtype=np.complex128)
+    factor[1] = np.exp(1j * phi_rad)
+    payload = _static_factor_payload(
+        tmp_path, _hadamard_state_with_static_factor(factor, per_pol_arm=False),
+    )
+
+    expected = math.sin(phi_rad / 2.0) ** 2
+    assert payload["realized_null_depth"] == pytest.approx(expected, rel=1e-12)
+    np.testing.assert_allclose(payload["planet_throughputs"], expected, rtol=1e-12)
+    assert payload["static_field_factor_sources"] == ("field.upstream",)
+
+
+def test_detection_curve_per_arm_trim_removes_design_bin_phase_keeps_imbalance(
+    tmp_path: Path,
+) -> None:
+    """Issue 10 / row 47 with a per-arm chip trim.
+
+    The trim cancels each mode's phase at the design bin, so a wavelength-flat
+    phase leaks nothing. An amplitude imbalance a on arm A and b on arm B is
+    not trimmed: the Hadamard dark port gets (1 - a)^2 / (2 (1 + a^2)) per arm,
+    and equal arm powers average the two.
+    """
+
+    a, b = 0.9, 0.97
+    factor = np.ones((2, 3, 2), dtype=np.complex128)
+    factor[1, :, 0] = a * np.exp(0.4j)
+    factor[1, :, 1] = b * np.exp(-0.7j)
+    payload = _static_factor_payload(
+        tmp_path, _hadamard_state_with_static_factor(factor, per_pol_arm=True),
+    )
+
+    def null(x: float) -> float:
+        return (1.0 - x) ** 2 / (2.0 * (1.0 + x * x))
+
+    expected = 0.5 * (null(a) + null(b))
+    assert payload["realized_null_depth"] == pytest.approx(expected, rel=1e-12)
+    np.testing.assert_allclose(payload["planet_throughputs"], expected, rtol=1e-12)
+
+
+def test_static_field_factors_map_pre_split_modes_and_reject_mismatch() -> None:
+    from nullsim.stages.sensitivity.detection_curve import _static_field_factors
+
+    pre_split = np.array([1.0, 1j], dtype=np.complex128)[:, np.newaxis, np.newaxis]
+    state = replace(
+        SimulationState.empty({"wavelength_grid_um": (1.25,)}),
+        field=Field(components={"transport": {"static_field_factor": pre_split}}),
+    )
+    kwargs = dict(state=state, n_arms=2, n_wl=1, n_chip_modes=4, design_index=None)
+
+    factors, _ = _static_field_factors(
+        mode_group_indices=np.array([0, 1, 0, 1], dtype=np.intp), **kwargs,
+    )
+
+    assert factors.shape == (2, 1, 4)
+    np.testing.assert_allclose(factors[1, 0], [1.0, 1j, 1.0, 1j])
+    with pytest.raises(ValueError, match="mode_splitter"):
+        _static_field_factors(mode_group_indices=None, **kwargs)

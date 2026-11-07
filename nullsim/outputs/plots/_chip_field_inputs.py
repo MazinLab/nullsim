@@ -15,6 +15,10 @@ from numpy.typing import NDArray
 
 from nullsim.physics.imaging import SubAperture
 from nullsim.pipeline import SimulationState
+from nullsim.stages._mode_splitter import (
+    component_mode_areas_m2,
+    component_mode_diameters_m,
+)
 
 
 @dataclass(frozen=True)
@@ -215,7 +219,12 @@ def mode_diameters_m(
         diameters = np.asarray(sensitivity["sub_diameters_m"], dtype=np.float64)
         if diameters.shape == (n_modes,):
             return diameters.astype(np.float64, copy=True)
-    for payload in state.geometry.components.values():
+    vector = component_mode_diameters_m(state, n_modes)
+    if vector is not None:
+        return vector[0].copy()
+    # Newest first: the oldest component is the telescope primary, which a
+    # later pupil_modes or AO stage subdivides (review 2026-11-07 Issue 1).
+    for payload in reversed(tuple(state.geometry.components.values())):
         if not isinstance(payload, dict):
             continue
         if payload.get("mode_diameter_m") is not None:
@@ -272,6 +281,9 @@ def mode_areas_m2(
         areas = np.asarray(sensitivity["sub_areas_m2"], dtype=np.float64)
         if areas.shape == (n_modes,) and np.all(areas > 0.0):
             return areas.astype(np.float64, copy=True)
+    vector = component_mode_areas_m2(state, n_modes)
+    if vector is not None:
+        return vector[0].copy()
     total = (
         state.geometry.effective_collecting_area_m2
         if state.geometry.effective_collecting_area_m2 is not None
