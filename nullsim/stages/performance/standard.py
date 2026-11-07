@@ -33,6 +33,13 @@ same single-source-of-truth pattern as KILO's
 rate-at-detector is computed exactly once by the detector stage, and
 the performance stage consumes the result without recomputing it.
 
+**Normalization.** Every planet and leakage rate is a fraction of the
+physical (pre-saturation) stellar rate, summed from the detector's
+``uncapped_port_rates``. Saturation is a per-port readout effect: when the
+dark ports saturate, the planet and leakage they record carry the dark-port
+recorded/physical ratio (``dark_detected_fraction``); bright-port
+saturation does not change dark-port science.
+
 **opd_budget is consumed optionally.** Space / formation-flying pipelines
 (e.g. HWO) strip atmosphere, AO, and fringe-tracking stages, so no
 upstream stage populates ``state.opd_budget``. When opd_budget is absent
@@ -141,27 +148,58 @@ class StandardPerformance(BaseStage):
         port_labels = tuple(detector_component["port_labels"])
         integration_time_s = float(detector_component["integration_time_s"])
 
+        # Saturation is a per-port readout effect, not a statement about the
+        # star (review 2026-11-07 Issue 9). Every rate below is normalized to
+        # the PHYSICAL (pre-cap) stellar rate; a saturated dark port then
+        # scales the planet and leakage it records by its recorded/physical
+        # ratio. Bright-port saturation does not touch dark-port science.
         (
-            bright_rate_hz,
+            _,
             leakage_rate_hz_total,
             n_dark_ports,
             n_bright_ports,
         ) = _partition_port_rates(port_rates_hz, port_labels)
+        total_stellar_rate_hz_capped = _sum_stellar_port_rates(
+            port_rates_hz, port_labels
+        )
+        (
+            physical_port_rates_hz,
+            uncapped_available,
+            uncapped_source,
+            detector_saturated,
+        ) = _physical_port_rates(detector_component, port_rates_hz, port_labels)
+        bright_rate_hz, dark_rate_hz_physical, _, _ = _partition_port_rates(
+            physical_port_rates_hz, port_labels
+        )
         spectro_rate_hz_total = _sum_port_rates_by_prefix(
-            port_rates_hz,
+            physical_port_rates_hz,
             port_labels,
             "spectro",
         )
-        total_stellar_rate_hz = (
-            bright_rate_hz + leakage_rate_hz_total + spectro_rate_hz_total
+        total_stellar_rate_hz = _sum_stellar_port_rates(
+            physical_port_rates_hz, port_labels
         )
-        (
-            total_stellar_rate_hz_uncapped,
-            uncapped_source,
-            detector_saturated,
-        ) = _uncapped_stellar_rate_hz_total(
-            detector_component, port_labels, total_stellar_rate_hz
+        total_stellar_rate_hz_uncapped = (
+            total_stellar_rate_hz if uncapped_available else None
         )
+        dark_detected_fraction = (
+            leakage_rate_hz_total / dark_rate_hz_physical
+            if dark_rate_hz_physical > 0.0
+            else 1.0
+        )
+        if dark_detected_fraction < 1.0 - 1.0e-12:
+            warnings.warn(
+                "performance.standard: the dark ports saturated; the planet "
+                "and leakage rates are scaled by their recorded/physical ratio "
+                f"{dark_detected_fraction:.6g}. Raise the detector count-rate "
+                "cap or add dark-port pixels if that is not intended.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        # The stellar rate as the dark-port detectors record it: the physical
+        # rate times the dark-port saturation ratio. Every planet and leakage
+        # rate in the SNR budget is a fraction of this.
+        detected_stellar_rate_hz = total_stellar_rate_hz * dark_detected_fraction
 
         null_depth_residual, null_source = _resolve_null_depth_residual(
             state, detector_component
@@ -240,7 +278,8 @@ class StandardPerformance(BaseStage):
             # With the effective null we recompute the dark leakage so it
             # carries the disk floor and uses every stellar output port in
             # the normalization.
-            leakage_rate_hz = null_depth_effective * total_stellar_rate_hz
+            leakage_rate_hz = null_depth_effective * detected_stellar_rate_hz
+            systematic_leakage_rate_hz = leakage_rate_hz
             null_depth_used = null_depth_effective
             sensitivity_throughputs = tuple(
                 float(v) for v in np.asarray(sens_payload["planet_throughputs"])
@@ -256,11 +295,20 @@ class StandardPerformance(BaseStage):
             )
             instab_eps = float(sens_payload.get("null_instability", 0.0))
             null_instability_used = instab_eps
-            eps_used = _combined_systematic_eps(
-                null_instability=instab_eps / float(params.nsc_systematic_reduction),
-                residual_speckle_stability_factor=(
-                    params.residual_speckle_stability_factor
-                ),
+            relative_instability = instab_eps / float(params.nsc_systematic_reduction)
+            null_fluctuation_rms = _resolve_null_fluctuation_rms(
+                sens_payload, sens_name
+            )
+            # sigma_L is the RMS of the fluctuating leakage alone, in null
+            # units; in rate units it scales with the stellar rate, not with
+            # the deterministic leakage terms (disk floor, setpoint) that the
+            # legacy CV-times-L_eff form multiplied (review Issue 19).
+            fluctuation_rate_hz = (
+                None
+                if null_fluctuation_rms is None
+                else null_fluctuation_rms
+                * detected_stellar_rate_hz
+                / float(params.nsc_systematic_reduction)
             )
             # Optional sensitivity-stage f_eff override. When the
             # sensitivity stage sets
@@ -292,31 +340,43 @@ class StandardPerformance(BaseStage):
                 null_depth_effective_fraction = calibration_floor_effective
                 null_source = f"calibration_floor:{calibration_floor_source}"
                 calibration_floor_applied = True
+            # The detected dark-port rate is what the photons are: it sets
+            # the Poisson variance whatever calibration does. The calibration-
+            # subtracted residual max(raw - floor, 0), bounded below by the
+            # floor, only sets the systematic residual (review row 71).
+            leakage_rate_hz = leakage_rate_hz_total
             if null_source == "detector.null_depth_raw":
-                leakage_rate_hz = leakage_rate_hz_total
+                systematic_leakage_rate_hz = leakage_rate_hz_total
             elif null_depth_effective_fraction is not None:
                 # Convert the KILO mean(dark)/mean(bright) convention to a
                 # dark/total fraction BEFORE multiplying by the total
                 # stellar rate. The unconverted product underestimated the
                 # dark leakage by n_dark x mean_bright/total (review
                 # 2026-06-10 Issue 27a).
-                leakage_rate_hz = (
-                    null_depth_effective_fraction * total_stellar_rate_hz
+                systematic_leakage_rate_hz = (
+                    null_depth_effective_fraction * detected_stellar_rate_hz
                 )
             else:
-                leakage_rate_hz = null_depth_effective * total_stellar_rate_hz
+                systematic_leakage_rate_hz = (
+                    null_depth_effective * detected_stellar_rate_hz
+                )
             null_depth_used = null_depth_effective
             sensitivity_throughputs = None
             sensitivity_separations_mas = None
             sensitivity_null_by_separation = None
             null_instability_used = 0.0
-            eps_used = _combined_systematic_eps(
-                null_instability=0.0,
-                residual_speckle_stability_factor=(
-                    params.residual_speckle_stability_factor
-                ),
-            )
+            relative_instability = 0.0
+            null_fluctuation_rms = None
+            fluctuation_rate_hz = None
             sens_bandwidth_hz = None
+
+        eps_used = _systematic_eps(
+            leakage_rate_hz=leakage_rate_hz,
+            systematic_leakage_rate_hz=systematic_leakage_rate_hz,
+            fluctuation_rate_hz=fluctuation_rate_hz,
+            relative_instability=relative_instability,
+            residual_speckle_stability_factor=params.residual_speckle_stability_factor,
+        )
 
         # KILO convention (kilo/performance.py L204-292 signal_to_noise):
         # signal and stellar-leakage rates are **aggregate over all dark
@@ -341,12 +401,13 @@ class StandardPerformance(BaseStage):
         # Sensitivity-stage throughputs are normalized to total coupled
         # stellar power. The legacy flat planet_dark_throughput parameter is
         # retained as a bright-port routing scalar for configs without the
-        # sensitivity handoff.
+        # sensitivity handoff. Both bases are physical rates; the planet lands
+        # on the dark ports, so it carries their saturation ratio.
         planet_rate_base_hz = (
             total_stellar_rate_hz
             if sensitivity_throughputs is not None
             else bright_rate_hz
-        )
+        ) * dark_detected_fraction
         planet_rate_hz = (
             planet_rate_base_hz
             * planet_contrast
@@ -432,15 +493,34 @@ class StandardPerformance(BaseStage):
             contrast_leakage_rate_hz_per_sep = (
                 _contrast_curve_leakage_rates_from_null_curve(
                     sensitivity_null_by_separation=sensitivity_null_by_separation,
-                    total_stellar_rate_hz=total_stellar_rate_hz,
+                    total_stellar_rate_hz=detected_stellar_rate_hz,
                     null_depth_residual=null_depth_residual_effective,
                     calibration_floor=calibration_floor_effective,
                 )
             )
+            contrast_eps_per_sep = (
+                None
+                if contrast_leakage_rate_hz_per_sep is None
+                else tuple(
+                    _systematic_eps(
+                        leakage_rate_hz=leak,
+                        systematic_leakage_rate_hz=leak,
+                        fluctuation_rate_hz=fluctuation_rate_hz,
+                        relative_instability=relative_instability,
+                        residual_speckle_stability_factor=(
+                            params.residual_speckle_stability_factor
+                        ),
+                    )
+                    for leak in contrast_leakage_rate_hz_per_sep
+                )
+            )
+            # The contrast denominator is the stellar rate the dark-port
+            # detectors would record, so a planet at contrast c contributes
+            # c x throughput x that rate, matching planet_rate_hz above.
             contrast_value = _contrast_curve(
                 separations_mas=separations_mas,
                 bright_rate_hz=bright_rate_hz,
-                stellar_rate_hz=total_stellar_rate_hz,
+                stellar_rate_hz=detected_stellar_rate_hz,
                 leakage_rate_hz=leakage_rate_hz,
                 leakage_rate_hz_per_sep=contrast_leakage_rate_hz_per_sep,
                 dark_rate_hz_per_port=dark_rate_hz_per_port,
@@ -449,6 +529,7 @@ class StandardPerformance(BaseStage):
                 n_dark_ports=n_dark_ports,
                 integration_time_s=contrast_curve_time_s,
                 eps=eps_used,
+                eps_per_sep=contrast_eps_per_sep,
                 with_fringe_tracking=params.with_fringe_tracking,
                 servo_bw_hz=servo_bw_hz,
                 target_snr=params.target_snr,
@@ -467,6 +548,7 @@ class StandardPerformance(BaseStage):
             contrast_sky_rate_hz_per_port = None
             contrast_sky_rate_source = None
             contrast_leakage_rate_hz_per_sep = None
+            contrast_eps_per_sep = None
 
         component_name = unique_component_name(
             self.type_name,
@@ -499,18 +581,28 @@ class StandardPerformance(BaseStage):
             "planet_dark_throughput_used": float(planet_dark_throughput_used),
             "planet_dark_throughput_source": planet_dark_throughput_source,
             "planet_separation_mas": planet_separation_mas,
+            # Physical (pre-saturation) rates: bright, spectro, and the
+            # stellar total every planet and leakage rate is normalized to.
+            # leakage_rate_hz_total is the dark-port rate as recorded.
             "bright_rate_hz": float(bright_rate_hz),
             "leakage_rate_hz": float(leakage_rate_hz),
+            # The leakage the systematic amplitude is built from. Equal to
+            # leakage_rate_hz except without a sensitivity stage, where the
+            # Poisson term uses the detected leak and the systematic uses the
+            # calibration residual.
+            "systematic_leakage_rate_hz": float(systematic_leakage_rate_hz),
             "leakage_rate_hz_total": float(leakage_rate_hz_total),
             "spectro_rate_hz_total": float(spectro_rate_hz_total),
             "stellar_rate_hz_total": float(total_stellar_rate_hz),
-            # The same total before detector saturation clipped it, plus where
-            # it came from and whether any port actually saturated. Everything
-            # else in this payload stays on the CAPPED rates -- they are what
-            # the detector reads out and what the SNR budget must use -- but a
-            # consumer normalizing a physical quantity against the stellar flux
-            # (detection-mode HDC's unit-contrast planet reference) needs the
-            # uncapped one, and there is no way to recover it downstream.
+            # The post-saturation readout total, for audit only.
+            "stellar_rate_hz_total_capped": float(total_stellar_rate_hz_capped),
+            # Recorded/physical ratio summed over the dark ports. The planet
+            # and leakage rates above already carry it.
+            "dark_detected_fraction": float(dark_detected_fraction),
+            # The physical total again when the detector published its
+            # pre-cap rates, None when it did not (then the physical total
+            # falls back to the recorded one), plus where it came from and
+            # whether any port actually saturated.
             "stellar_rate_hz_total_uncapped": (
                 None
                 if total_stellar_rate_hz_uncapped is None
@@ -531,6 +623,11 @@ class StandardPerformance(BaseStage):
                 params.residual_speckle_stability_factor
             ),
             "null_instability": float(null_instability_used),
+            "null_fluctuation_rms": (
+                None if null_fluctuation_rms is None else float(null_fluctuation_rms)
+            ),
+            # eps_systematic_used x leakage_rate_hz is the systematic amplitude
+            # in Hz, whichever model built it.
             "eps_systematic_used": float(eps_used),
             "nsc_systematic_reduction": float(params.nsc_systematic_reduction),
             "calibration_floor": (
@@ -579,6 +676,10 @@ class StandardPerformance(BaseStage):
                 contrast_leakage_rate_hz_per_sep,
                 dtype=np.float64,
             )
+            component_payload["contrast_curve_eps_systematic"] = np.asarray(
+                contrast_eps_per_sep,
+                dtype=np.float64,
+            )
 
         results = state.results.add_component(component_name, component_payload)
         if separations_mas and contrast_value:
@@ -609,9 +710,9 @@ _SENSITIVITY_PREFIX = "sensitivity.detection_curve"
 def _find_sensitivity_component(
     state: SimulationState,
 ) -> tuple[str, dict[str, Any]] | None:
-    """Return (name, payload) of an upstream sensitivity.detection_curve, if any."""
+    """Return the newest upstream sensitivity.detection_curve, if any."""
 
-    for name, payload in state.results.components.items():
+    for name, payload in reversed(tuple(state.results.components.items())):
         if (
             name.startswith(_SENSITIVITY_PREFIX)
             and isinstance(payload, dict)
@@ -623,9 +724,9 @@ def _find_sensitivity_component(
 
 
 def _find_detector_component(state: SimulationState) -> tuple[str, Any]:
-    """Return the first ``detector.*`` component with port_rates + port_labels."""
+    """Return the newest ``detector.*`` component with port_rates + port_labels."""
 
-    for name, value in state.results.components.items():
+    for name, value in reversed(tuple(state.results.components.items())):
         if not name.startswith(_DETECTOR_PREFIX):
             continue
         if not isinstance(value, dict):
@@ -716,9 +817,9 @@ def _sum_port_rates_by_prefix(
 def _resolve_null_depth_residual(
     state: SimulationState, detector_component: dict[str, Any]
 ) -> tuple[float, str]:
-    """Prefer the calibration stage's explicit residual, fall back to raw."""
+    """Prefer the newest calibration stage's explicit residual, fall back to raw."""
 
-    for name, value in state.results.components.items():
+    for name, value in reversed(tuple(state.results.components.items())):
         if not name.startswith(_CALIBRATION_PREFIX):
             continue
         if not isinstance(value, dict):
@@ -730,76 +831,74 @@ def _resolve_null_depth_residual(
     return float(detector_component["null_depth_raw"]), "detector.null_depth_raw"
 
 
-def _uncapped_stellar_rate_hz_total(
-    detector_component: Any,
+def _sum_stellar_port_rates(
+    port_rates_hz: NDArray[np.float64], port_labels: tuple[str, ...]
+) -> float:
+    """Sum of the bright, dark, and spectro port rates: the stellar total."""
+
+    mask = np.array(
+        [label.startswith(("bright", "dark", "spectro")) for label in port_labels],
+        dtype=bool,
+    )
+    return float(port_rates_hz[mask].sum())
+
+
+def _physical_port_rates(
+    detector_component: dict[str, Any],
+    port_rates_hz: NDArray[np.float64],
     port_labels: tuple[str, ...],
-    capped_total_hz: float,
-) -> tuple[float | None, str, bool | None]:
-    """Total stellar rate across all output ports before saturation clipping.
+) -> tuple[NDArray[np.float64], bool, str, bool | None]:
+    """Per-port stellar rates before detector saturation clipping.
 
-    Detectors publish ``port_rates`` post-cap, which is what the readout sees
-    and what every noise term here has to use. They also publish
-    ``uncapped_port_rates``: the same per-port totals before the cap. Summing
-    the uncapped array over the same bright/dark/spectro ports recovers the
-    physical stellar rate.
+    Detectors publish ``port_rates`` post-cap, which is what the readout
+    records, and ``uncapped_port_rates``, the same per-port totals before the
+    cap. Saturation is a readout limit, so the pre-cap array is the physical
+    star. When it is missing or unusable the recorded rates stand in for it.
 
-    Returns ``(total_or_None, source, saturated_or_None)``. ``None`` for the
-    total means the detector published no uncapped array; ``None`` for the
-    saturation flag means it published no verdict either way, which is not the
-    same as "did not saturate" and must not be read as one.
+    Returns ``(rates, uncapped_available, source, saturated_or_None)``. ``None``
+    for the saturation flag means the detector published no verdict, which is
+    not the same as "did not saturate".
     """
 
     saturated: bool | None = None
-    declared = (
-        detector_component.get("detector_saturated")
-        if isinstance(detector_component, dict)
-        else None
-    )
+    declared = detector_component.get("detector_saturated")
     if declared is not None:
         saturated = bool(declared)
-    else:
-        flags = (
-            detector_component.get("saturated_per_port")
-            if isinstance(detector_component, dict)
-            else None
+    elif detector_component.get("saturated_per_port") is not None:
+        saturated = bool(
+            np.any(np.asarray(detector_component["saturated_per_port"], dtype=bool))
         )
-        if flags is not None:
-            saturated = bool(np.any(np.asarray(flags, dtype=bool)))
 
-    values = (
-        detector_component.get("uncapped_port_rates")
-        if isinstance(detector_component, dict)
-        else None
-    )
+    values = detector_component.get("uncapped_port_rates")
     if values is None:
-        return None, "unavailable (detector published no uncapped_port_rates)", saturated
-    rates = np.asarray(values, dtype=np.float64)
-    if rates.shape != (len(port_labels),):
         return (
-            None,
+            port_rates_hz,
+            False,
+            "unavailable (detector published no uncapped_port_rates)",
+            saturated,
+        )
+    rates = np.asarray(values, dtype=np.float64)
+    if rates.shape != port_rates_hz.shape:
+        return (
+            port_rates_hz,
+            False,
             "unavailable (detector uncapped_port_rates does not match "
             f"port_labels: shape {rates.shape} vs {len(port_labels)} ports)",
             saturated,
         )
-    mask = np.array(
-        [
-            label.startswith(("bright", "dark", "spectro"))
-            for label in port_labels
-        ],
-        dtype=bool,
-    )
-    total = float(rates[mask].sum())
-    if not math.isfinite(total) or total < capped_total_hz * (1.0 - 1.0e-9):
-        # Below the capped total is arithmetically impossible for a cap that
-        # only ever scales rates down; treat it as an unusable array rather
-        # than publishing a number that would silently shrink the star.
+    if not np.all(np.isfinite(rates)) or np.any(
+        rates < port_rates_hz * (1.0 - 1.0e-9)
+    ):
+        # A cap only ever scales a port down; an uncapped rate below the
+        # recorded one is an unusable array, not a smaller star.
         return (
-            None,
-            "unavailable (detector uncapped_port_rates sums below the capped "
-            f"total: {total!r} < {capped_total_hz!r})",
+            port_rates_hz,
+            False,
+            "unavailable (detector uncapped_port_rates is non-finite or below "
+            "the recorded port_rates)",
             saturated,
         )
-    return total, "detector uncapped_port_rates", saturated
+    return rates, True, "detector uncapped_port_rates", saturated
 
 
 def _kilo_null_to_dark_power_fraction(
@@ -845,9 +944,9 @@ def _max_finite_nonnegative(*values: float | None) -> float:
 def _resolve_calibration_floor(
     state: SimulationState,
 ) -> tuple[float | None, str | None]:
-    """Return the first explicit calibration floor from an upstream calibration stage."""
+    """Return the newest explicit calibration floor from an upstream calibration stage."""
 
-    for name, value in state.results.components.items():
+    for name, value in reversed(tuple(state.results.components.items())):
         if not name.startswith(_CALIBRATION_PREFIX):
             continue
         if not isinstance(value, dict):
@@ -1127,6 +1226,60 @@ def _combined_systematic_eps(
     return math.hypot(float(null_instability), float(residual_speckle_stability_factor))
 
 
+def _systematic_eps(
+    *,
+    leakage_rate_hz: float,
+    systematic_leakage_rate_hz: float,
+    fluctuation_rate_hz: float | None,
+    relative_instability: float,
+    residual_speckle_stability_factor: float,
+) -> float:
+    """Fractional systematic eps such that eps x leakage_rate_hz is the amplitude.
+
+    The systematic amplitude in rate units is
+
+        A = hypot(F, residual_speckle_stability_factor x L_sys)
+
+    with ``F = sigma_L x S / nsc`` when sensitivity publishes the RMS of the
+    fluctuating leakage ``sigma_L`` (``fluctuation_rate_hz``), and the legacy
+    ``F = (null_instability / nsc) x L_sys`` (``relative_instability``) when it
+    does not. Expressing A as a fraction of the Poisson leakage keeps
+    ``_systematic_variance``'s ``eps x L`` form and the published
+    ``eps_systematic_used`` meaning the same thing for every consumer.
+    """
+
+    if leakage_rate_hz <= 0.0:
+        # No leakage to multiply: any eps gives zero variance. Keep the
+        # legacy relative value so the published number stays meaningful.
+        return math.hypot(relative_instability, residual_speckle_stability_factor)
+    fluctuation = (
+        relative_instability * systematic_leakage_rate_hz
+        if fluctuation_rate_hz is None
+        else fluctuation_rate_hz
+    )
+    amplitude_hz = math.hypot(
+        fluctuation, residual_speckle_stability_factor * systematic_leakage_rate_hz
+    )
+    return amplitude_hz / leakage_rate_hz
+
+
+def _resolve_null_fluctuation_rms(
+    sens_payload: dict[str, Any], sens_name: str
+) -> float | None:
+    """Read sensitivity's ``null_fluctuation_rms`` (sigma_L), if published."""
+
+    value = sens_payload.get("null_fluctuation_rms")
+    if value is None:
+        return None
+    sigma = float(value)
+    if not math.isfinite(sigma) or sigma < 0.0:
+        raise ValueError(
+            f"performance.standard: sensitivity component {sens_name!r} "
+            f"published a non-finite or negative null_fluctuation_rms ({value!r})."
+        )
+    return sigma
+
+
 def _resolve_dark_rate_hz_per_port(
     detector_component: dict[str, Any],
     configured_rate_hz_per_port: float,
@@ -1173,7 +1326,7 @@ def _resolve_servo_bw(
          second-tier audit signal.
     """
 
-    for name, payload in state.results.components.items():
+    for name, payload in reversed(tuple(state.results.components.items())):
         if not name.startswith("fringe_tracking.closed_loop"):
             continue
         bw = payload.get("servo_bandwidth_hz") if isinstance(payload, dict) else None
@@ -1330,6 +1483,7 @@ def _contrast_curve(
     planet_dark_throughput: float = 0.5,
     sky_rate_hz_per_port_per_sep: tuple[float, ...] | None = None,
     leakage_rate_hz_per_sep: tuple[float, ...] | None = None,
+    eps_per_sep: tuple[float, ...] | None = None,
 ) -> tuple[float, ...]:
     """Return the minimum-detectable contrast at each separation.
 
@@ -1356,6 +1510,10 @@ def _contrast_curve(
 
     The quadratic-in-``S`` solution and the noise model mirror KILO
     ``contrast_curve`` lines 968-1008.
+
+    ``eps_per_sep`` overrides the scalar ``eps`` per separation, for a
+    systematic amplitude that is not proportional to the per-separation
+    leakage (see `_systematic_eps`).
     """
 
     if not separations_mas:
@@ -1408,11 +1566,23 @@ def _contrast_curve(
     else:
         leakage_rates = tuple(leakage_rate_hz for _ in separations_mas)
 
+    if eps_per_sep is not None:
+        if len(eps_per_sep) != len(separations_mas):
+            raise ValueError(
+                "_contrast_curve: eps_per_sep length "
+                f"{len(eps_per_sep)} != separations_mas length "
+                f"{len(separations_mas)}."
+            )
+        eps_values = eps_per_sep
+    else:
+        eps_values = tuple(eps for _ in separations_mas)
+
     contrasts: list[float] = []
-    for t, sky_rate, leakage_rate in zip(
+    for t, sky_rate, leakage_rate, eps_sep in zip(
         throughputs,
         sky_rates,
         leakage_rates,
+        eps_values,
         strict=True,
     ):
         if t <= 0.0:
@@ -1432,7 +1602,7 @@ def _contrast_curve(
         systematic_var = _systematic_variance(
             leakage_rate_hz=float(leakage_rate),
             integration_time_s=integration_time_s,
-            eps=eps,
+            eps=float(eps_sep),
             with_fringe_tracking=with_fringe_tracking,
             servo_bw_hz=servo_bw_hz,
         )

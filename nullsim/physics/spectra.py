@@ -22,6 +22,7 @@ import math
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -367,6 +368,8 @@ def convolve_to_resolving_power(
     values: NDArray[np.float64],
     r_out: float,
     r_in: float = math.inf,
+    *,
+    outside: Literal["zero", "edge"] = "zero",
 ) -> NDArray[np.float64]:
     """Degrade a log-uniform spectrum from resolving power ``r_in`` to ``r_out``.
 
@@ -390,6 +393,13 @@ def convolve_to_resolving_power(
     within about ``8 * sigma`` samples of either end are attenuated, so any
     wavelength whose result matters -- in particular every channel edge passed
     to `channelize` -- should sit at least that far inside the grid.
+
+    ``outside="edge"`` is the model for a dimensionless multiplicative shape
+    (a transmission or an albedo) rather than a rate: the curve is continued
+    past each end at its edge value. A transmission does not drop to zero
+    outside the supplied grid, so zero padding there reads as absorption and
+    darkens the edge samples (a flat T = 0.9 came back near 0.77 at R = 100).
+    Edge continuation leaves any constant exactly unchanged.
 
     Raises ``ValueError`` if the grid is not log-uniform (``d ln lambda``
     constant to 1e-6 relative) or if ``r_in <= r_out``.
@@ -432,6 +442,12 @@ def convolve_to_resolving_power(
     inv_r_eff_sq = 1.0 / r_out**2 - (0.0 if math.isinf(r_in) else 1.0 / r_in**2)
     r_eff = 1.0 / math.sqrt(inv_r_eff_sq)
     sigma_samples = r_grid / (r_eff * 2.0 * math.sqrt(2.0 * math.log(2.0)))
+    if outside == "edge":
+        return gaussian_filter1d(
+            source, sigma_samples, mode="nearest", truncate=_KERNEL_TRUNCATE
+        )
+    if outside != "zero":
+        raise ValueError(f"outside must be 'zero' or 'edge', got {outside!r}")
     # Explicit zero pad, convolve, crop. Equivalent to mode="constant" here,
     # written out so the outside-band model is visible at the call site and the
     # pad width is tied to the same truncation the kernel uses.

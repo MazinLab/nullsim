@@ -1120,7 +1120,14 @@ class _RateDensities:
             0.0,
         )
 
-        star_shape = _shape_on_grid(templates.star, grid_um, r_grid, 0.0)
+        # Every template is degraded to the LOWEST content resolving power
+        # before the products below are formed, so the product carries one
+        # line-spread function and `_ChannelBuilder._channelize` can broaden it
+        # from that R. Broadening each template to a different R and
+        # multiplying would leave the sharper ones' lines unbroadened whenever
+        # the instrument R reaches the coarsest template (review row 51).
+        r_content = templates.content_resolving_power(r_grid)
+        star_shape = _shape_on_grid(templates.star, grid_um, r_content, 0.0)
         star_norm = _weighted_mean(star_shape, coarse_density, grid_um)
         star_shape = star_shape / star_norm
         stellar_density = coarse_density * star_shape
@@ -1145,7 +1152,7 @@ class _RateDensities:
         # The mask, by contrast, thresholds on ABSOLUTE transmission, so it
         # keeps the raw curve.
         telluric_transmission = (
-            np.clip(_shape_on_grid(templates.telluric, grid_um, r_grid, 0.0), 0.0, 1.0)
+            np.clip(_shape_on_grid(templates.telluric, grid_um, r_content, 0.0), 0.0, 1.0)
             if templates.telluric is not None
             else np.ones_like(grid_um)
         )
@@ -1162,7 +1169,7 @@ class _RateDensities:
         )
         leak_density = leak_density_raw * leak_normalization
 
-        albedo_rest = _shape_on_grid(templates.planet, grid_um, r_grid, 0.0)
+        albedo_rest = _shape_on_grid(templates.planet, grid_um, r_content, 0.0)
         # Weight the albedo by everything it actually multiplies, telluric shape
         # included. For an Earth analogue seen through Earth's atmosphere the
         # albedo dips and the telluric dips are the same molecules, so leaving
@@ -1174,11 +1181,11 @@ class _RateDensities:
         )
 
         def planet_density_raw(rv_kms: float) -> NDArray[np.float64]:
-            albedo = _shape_on_grid(templates.planet, grid_um, r_grid, rv_kms)
+            albedo = _shape_on_grid(templates.planet, grid_um, r_content, rv_kms)
             star_rv = (
                 star_shape
                 if rv_kms == 0.0
-                else _shape_on_grid(templates.star, grid_um, r_grid, rv_kms)
+                else _shape_on_grid(templates.star, grid_um, r_content, rv_kms)
                 / star_norm
             )
             return (
@@ -1311,7 +1318,9 @@ class _ChannelBuilder:
         The mask has to describe the transmission the *instrument* sees, so
         the raw curve goes through the same line-spread function as the rates
         before it is bin-averaged. Masking on the unconvolved curve would
-        threshold structure the spectrograph cannot resolve.
+        threshold structure the spectrograph cannot resolve. The curve is
+        continued at its edge values past the grid: zero padding would read as
+        absorption and push the edge channels under the mask threshold.
         """
 
         # ``None`` means "no telluric mask at all", which is what
@@ -1327,6 +1336,7 @@ class _ChannelBuilder:
                 transmission,
                 resolving_power,
                 r_in=self.content_resolving_power,
+                outside="edge",
             )
         # Bin MEANS, not integrals: this is a transmission, not a rate.
         return np.clip(
@@ -1403,8 +1413,9 @@ class _ChannelBuilder:
                 )
             )
         # At (or beyond) the resolution the templates carry there is no further
-        # broadening to apply -- the template's own line-spread function is
-        # already the instrument's -- so bin-average directly. This is exactly
+        # broadening to apply -- `_RateDensities.build` degraded every template
+        # to that common content R, so the product's line-spread function is
+        # already the instrument's -- and the density is bin-averaged directly. This is exactly
         # ``channelize`` minus a convolution by a zero-width kernel, and it lets
         # the R scan reach the template resolution instead of stopping short of
         # it on ``convolve_to_resolving_power``'s strict r_in > r_out guard.
@@ -2043,25 +2054,31 @@ def _template_resolving_power(spectrum: TemplateSpectrum) -> float:
 def _shape_on_grid(
     template: _Template,
     grid_um: NDArray[np.float64],
-    r_grid: float,
+    r_content: float,
     rv_kms: float,
 ) -> NDArray[np.float64]:
-    """Doppler shift, degrade to the analysis grid, and sample onto it.
+    """Doppler shift, degrade to the common content R, and sample onto the grid.
 
-    Smoothing to the analysis grid's own resolving power before point sampling
-    keeps template structure the grid cannot represent from aliasing into it.
-    The shift happens first, on the template's native (finer) grid, so a
-    sub-resolution-element radial velocity survives.
+    ``r_content`` is `_Templates.content_resolving_power`: the lowest content
+    resolving power among the templates and the analysis grid. Degrading every
+    template to it before the caller multiplies them gives the product a single
+    line-spread function, and since it never exceeds the grid's own resolving
+    power it also keeps unresolvable structure from aliasing into the point
+    samples. The shift happens first, on the template's native (finer) grid, so
+    a sub-resolution-element radial velocity survives. Every template is a
+    dimensionless shape and the crop edge is arbitrary, so the curve is
+    continued at its edge values rather than zero padded.
     """
 
     spectrum = template.spectrum
     shifted = spectrum if rv_kms == 0.0 else doppler_shift(spectrum, rv_kms)
-    if template.content_resolving_power > r_grid:
+    if template.content_resolving_power > r_content:
         values = convolve_to_resolving_power(
             shifted.wavelength_um,
             shifted.values,
-            r_grid,
+            r_content,
             r_in=template.spectral_resolving_power,
+            outside="edge",
         )
     else:
         values = shifted.values

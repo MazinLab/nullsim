@@ -1195,3 +1195,54 @@ def test_chromatic_leak_floor_is_read_in_the_effective_convention(
     # its chromatic structure cannot be flat.
     row = leak[0]
     assert row[-1] > 10.0 * row[0]
+
+
+def test_dark_port_saturation_scales_the_planet_reference(tmp_path: Path) -> None:
+    """Review 2026-11-07 Issue 9: the planet carries the dark-port saturation ratio.
+
+    performance.standard scales its published leak by dark_detected_fraction;
+    the unit-contrast planet reference has to carry the same factor, and
+    channelization is linear, so the per-channel reference halves exactly.
+    """
+
+    baseline = _stage(_context(tmp_path)).apply(_state()).results.components[
+        "performance.hdc"
+    ]
+    with pytest.warns(RuntimeWarning, match="dark ports saturated"):
+        halved = _stage(_context(tmp_path)).apply(
+            _state(performance_overrides={"dark_detected_fraction": 0.5})
+        ).results.components["performance.hdc"]
+
+    assert np.asarray(
+        halved["ccf_planet_rate_hz_per_channel_unit_contrast"]
+    ) == pytest.approx(
+        0.5 * np.asarray(baseline["ccf_planet_rate_hz_per_channel_unit_contrast"])
+    )
+    assert halved["dark_detected_fraction"] == pytest.approx(0.5)
+
+
+def test_per_separation_eps_from_performance_is_used_per_anchor(
+    tmp_path: Path,
+) -> None:
+    """A systematic amplitude that does not scale with the leak arrives per anchor.
+
+    With the null fluctuation RMS the amplitude is fixed while the leak varies,
+    so performance.standard publishes contrast_curve_eps_systematic; a larger
+    eps at one anchor must raise only that anchor's systematic variance.
+    """
+
+    eps_curve = np.full(_N_ANCHORS, _EPS_SYSTEMATIC)
+    eps_curve[2] = 10.0 * _EPS_SYSTEMATIC
+    payload = _stage(_context(tmp_path)).apply(
+        _state(performance_overrides={"contrast_curve_eps_systematic": eps_curve})
+    ).results.components["performance.hdc"]
+    baseline = _stage(_context(tmp_path)).apply(_state()).results.components[
+        "performance.hdc"
+    ]
+
+    assert np.asarray(payload["eps_systematic_per_anchor"]) == pytest.approx(eps_curve)
+    changed = np.asarray(payload["systematic_var_counts_per_anchor"])
+    reference = np.asarray(baseline["systematic_var_counts_per_anchor"])
+    others = np.arange(_N_ANCHORS) != 2
+    assert changed[2] > reference[2]
+    assert changed[others] == pytest.approx(reference[others])

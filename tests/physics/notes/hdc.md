@@ -46,6 +46,21 @@ claim about the unobserved band than "nothing is there". The cost is that the
 caller must leave margin: values within `~8 sigma` of either end are
 attenuated, so channel edges must sit at least that far inside the grid.
 
+That model is right for a *rate density* and wrong for a dimensionless
+*shape*. A transmission or albedo does not vanish past the supplied grid, so
+zero padding there reads as absorption: a flat T = 0.9 came back near 0.77 in
+the edge channels at R = 100 and fell under the 0.8 mask (review 2026-11-07
+row 50). `outside="edge"` continues the curve at its edge value, which leaves
+any constant exactly unchanged; the telluric mask and every template shape use
+it, and the rate densities keep zero padding.
+
+*Mixed content resolution.* The templates are each degraded to the lowest
+content resolving power among them (and the analysis grid) before they are
+multiplied, and only the product is broadened further, from that R to the
+instrument R, when the instrument R is lower. Broadening each template
+separately to a different R and multiplying left the sharper templates
+unbroadened whenever the instrument R reached the coarsest one (row 51).
+
 Order matters. `resample_flux_conserving` returns bin *means*, which is already
 a boxcar average over each channel. Convolving after resampling would apply the
 LSF on top of that boxcar and over-smooth; convolving first, on the log-uniform

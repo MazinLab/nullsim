@@ -28,7 +28,11 @@ The functions consumed by nullsim's `StandardPerformance` stage are:
   the upstream calibration stage produced (`null_depth_residual` if
   the calibration stage ran, else `null_depth_raw`). The old
   `null_depth_calibrated` key is only a compatibility alias for the
-  residual.
+  residual. Without a sensitivity stage the residual sets only the
+  systematic leakage; the Poisson term always uses the detected dark rate
+  (review 2026-11-07 row 71). Every rate is normalized to the physical
+  (pre-saturation) stellar rate, with dark-port saturation applied as a
+  per-port ratio (Issue 9).
 - `planet_throughput(planet_dark_power, planet_total_power)` (lines
   184-202). `T = planet_dark / planet_total`. Returns `0.0` for
   non-positive total. The nullsim stage carries planet throughput as a

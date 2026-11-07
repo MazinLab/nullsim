@@ -282,9 +282,8 @@ class HdcPerformanceStage(BaseStage):
         stellar_rate_hz_total, stellar_rate_source = _resolve_stellar_rate_hz_total(
             performance, performance_name
         )
-        saturation_note = _stellar_normalization_note(
-            performance, stellar_rate_hz_total
-        )
+        dark_detected_fraction = _dark_detected_fraction(performance)
+        saturation_note = _dark_saturation_note(dark_detected_fraction)
         if saturation_note is not None:
             warnings.warn(saturation_note, RuntimeWarning, stacklevel=2)
         n_dark_ports = max(int(performance["n_dark_ports"]), 1)
@@ -332,8 +331,13 @@ class HdcPerformanceStage(BaseStage):
         # UNITY rather than the actual rate -- scaling a zero scalar sky by a
         # per-anchor ratio would zero every anchor even when the per-anchor
         # curve is positive.
+        # The planet lands on the dark ports, so it carries their
+        # recorded/physical saturation ratio exactly as the leak published by
+        # performance.standard already does.
         reference_budget = _DetectionBudget(
-            planet_rate_hz=stellar_rate_hz_total * float(params.awg_throughput),
+            planet_rate_hz=stellar_rate_hz_total
+            * dark_detected_fraction
+            * float(params.awg_throughput),
             leak_rate_hz=1.0,
             sky_rate_hz=1.0,
             dark_rate_hz_per_channel=_dark_rate_hz_per_channel(
@@ -372,6 +376,9 @@ class HdcPerformanceStage(BaseStage):
 
         leak_per_anchor = _leak_rate_hz_per_anchor(
             performance, separations_mas, float(params.awg_throughput)
+        )
+        eps_per_anchor = _eps_systematic_per_anchor(
+            performance, separations_mas, eps_systematic
         )
         sky_per_anchor = _sky_rate_hz_per_anchor(
             performance,
@@ -438,9 +445,13 @@ class HdcPerformanceStage(BaseStage):
             # The whole solve-and-refine sits inside the catch: the refinement
             # calls matched_filter_ccf, which validates its own inputs and can
             # raise ValueError too, and one bad anchor must not abort the curve.
+            anchor_kwargs = {
+                **solver_kwargs,
+                "eps_systematic": float(eps_per_anchor[index]),
+            }
             try:
                 solution = ccf_contrast_at_target_snr(
-                    planet_unit, leak, sky, dark, **solver_kwargs
+                    planet_unit, leak, sky, dark, **anchor_kwargs
                 )
                 value, snr, first_snr, did_correct = _refine_contrast(
                     solution,
@@ -450,7 +461,7 @@ class HdcPerformanceStage(BaseStage):
                     sky=sky,
                     dark=dark,
                     target_snr=float(target_snr),
-                    solver_kwargs=solver_kwargs,
+                    solver_kwargs=anchor_kwargs,
                 )
             except ValueError as error:
                 # Reachable in ordinary sweeps: a low-throughput anchor whose
@@ -550,7 +561,8 @@ class HdcPerformanceStage(BaseStage):
             "planet_throughputs": throughputs.astype(np.float64, copy=True),
             "stellar_rate_hz_total": stellar_rate_hz_total,
             "stellar_rate_hz_total_source": stellar_rate_source,
-            "stellar_normalization_mismatch_note": saturation_note,
+            "dark_detected_fraction": float(dark_detected_fraction),
+            "dark_saturation_note": saturation_note,
             "pixels_per_resolution_element_used": int(
                 pixels_per_resolution_element
             ),
@@ -558,6 +570,9 @@ class HdcPerformanceStage(BaseStage):
                 pixels_per_resolution_element_source
             ),
             "eps_systematic_used": eps_systematic,
+            "eps_systematic_per_anchor": eps_per_anchor.astype(
+                np.float64, copy=True
+            ),
             "servo_bw_hz_used": servo_bw_hz,
             "with_fringe_tracking_used": bool(with_fringe_tracking),
             "systematic_branch_source": systematic_branch_source,
@@ -1043,8 +1058,11 @@ def _resolve_stellar_rate_hz_total(
     ``c`` produces ``c`` times the *physical* stellar rate regardless of what
     the bright-port pixels can count. Normalizing the reference planet against
     the clipped total therefore understates the planet by the saturation ratio
-    and inflates every contrast on the curve by the same factor -- 3.8x on the
-    shipped KILO example at J = 4.
+    and inflates every contrast on the curve by the same factor -- 3.80x in
+    ``examples/test/hdc_detection_smoke.toml`` at J = 5, where the two bright
+    ports saturate. (kilo_keck_6 at J = 4 does not saturate: it peaks at 794 Hz
+    per pixel against the 5e4 Hz cap.) ``performance.standard`` now publishes
+    ``stellar_rate_hz_total`` on the physical normalization as well.
 
     So the uncapped total wins whenever ``performance.standard`` published one.
     When it did not and the detector is known to have saturated, this raises
@@ -1088,39 +1106,28 @@ def _resolve_stellar_rate_hz_total(
     )
 
 
-def _stellar_normalization_note(
-    performance: dict[str, Any], stellar_rate_hz_total: float
-) -> str | None:
-    """Flag a CCF/broadband comparison made against two different star rates.
+def _dark_detected_fraction(performance: dict[str, Any]) -> float:
+    """Dark-port recorded/physical saturation ratio from performance.standard.
 
-    This stage now normalizes its planet reference against the PHYSICAL
-    stellar rate, but ``performance.standard`` built its broadband curve --
-    and its leak rate -- from the saturation-capped readout total. When the
-    detector saturates the two are not the same number, so the absolute CCF
-    curve is right while the broadband curve it is divided by is still
-    inflated by the saturation ratio, and ``ccf_contrast_gain`` carries that
-    ratio. Fixing the broadband side means changing what
-    ``performance.standard`` publishes for every config in the repo, so it is
-    a separate decision; what this stage can do is refuse to let the mismatch
-    be silent.
+    ``performance.standard`` normalizes every rate to the physical stellar rate
+    and scales the dark-port leak by this ratio; the planet reference here has
+    to carry it too. A payload without the key had no dark-port scaling.
     """
 
-    capped = _positive_finite(performance.get("stellar_rate_hz_total"))
-    if capped is None or capped <= 0.0:
-        return None
-    ratio = stellar_rate_hz_total / capped
-    if abs(ratio - 1.0) <= 1.0e-9:
+    value = _positive_finite(performance.get("dark_detected_fraction"))
+    return 1.0 if value is None else min(value, 1.0)
+
+
+def _dark_saturation_note(dark_detected_fraction: float) -> str | None:
+    """Flag a curve computed with saturated dark ports."""
+
+    if dark_detected_fraction >= 1.0 - 1.0e-12:
         return None
     return (
-        "performance.hdc normalized its unit-contrast planet against the "
-        f"uncapped stellar total {stellar_rate_hz_total:.6g} Hz, which is "
-        f"{ratio:.4g}x the saturation-capped {capped:.6g} Hz that "
-        "performance.standard built its broadband contrast curve and leakage "
-        "rate from. ccf_contrast_at_target is therefore on the physical "
-        "normalization while broadband_contrast_at_target is not, and "
-        f"ccf_contrast_gain carries that {ratio:.4g}x factor. Raise the "
-        "detector count-rate cap so nothing saturates if you need the two "
-        "curves on the same normalization."
+        "performance.hdc: the dark ports saturated, so the planet and leak are "
+        f"both scaled by the recorded/physical ratio {dark_detected_fraction:.6g} "
+        "performance.standard published. Raise the detector count-rate cap or "
+        "add dark-port pixels if that is not intended."
     )
 
 
@@ -1201,9 +1208,10 @@ def _detection_budget_model(
         f"({stellar_rate_source}); this is the PHYSICAL stellar rate, not the "
         "saturation-clipped readout total, because a planet at contrast c "
         "delivers c times the photons the star actually sends. The leak and "
-        "sky rates below are the ones performance.standard published, which "
-        "are built from its capped total; when the detector saturates they are "
-        "correspondingly conservative."
+        "sky rates below are the ones performance.standard published, on the "
+        "same physical normalization; when the dark ports saturate, the planet "
+        "and the leak both carry the dark-port recorded/physical ratio "
+        "(dark_detected_fraction)."
     )
 
 
@@ -1258,6 +1266,27 @@ def _leak_rate_hz_per_anchor(
         return np.clip(per_sep, 0.0, None) * awg_throughput
     scalar = max(float(performance["leakage_rate_hz"]), 0.0)
     return np.full(separations_mas.size, scalar * awg_throughput, dtype=np.float64)
+
+
+def _eps_systematic_per_anchor(
+    performance: dict[str, Any],
+    separations_mas: NDArray[np.float64],
+    eps_scalar: float,
+) -> NDArray[np.float64]:
+    """Fractional systematic per anchor, paired with the per-anchor leak.
+
+    ``performance.standard`` publishes ``contrast_curve_eps_systematic`` beside
+    ``contrast_curve_leakage_rate_hz``: when the systematic amplitude is set by
+    the null fluctuation RMS it does not scale with the per-separation leak,
+    so one scalar eps would misstate it away from the scene separation.
+    """
+
+    per_sep = _performance_curve_on_anchors(
+        performance, "contrast_curve_eps_systematic", separations_mas
+    )
+    if per_sep is not None:
+        return np.clip(per_sep, 0.0, None)
+    return np.full(separations_mas.size, eps_scalar, dtype=np.float64)
 
 
 def _sky_rate_hz_per_anchor(

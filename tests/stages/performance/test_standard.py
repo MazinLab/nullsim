@@ -562,11 +562,14 @@ def test_performance_uses_calibration_component_when_present(tmp_path: Path) -> 
     assert component["null_depth_calibrated"] == pytest.approx(2.5e-7)
     assert component["null_depth_source"] == "calibration.floor_lookup"
     assert component["leakage_rate_hz_total"] == pytest.approx(1.0e2)
-    # KILO mean(dark)/mean(bright) converted to a dark/total fraction
-    # before the rate product: 2.5e-7 x mean_bright(1e8/1) x n_dark(3)
-    # (review 2026-06-10 Issue 27a; the old pin tested the unconverted
-    # mixed-convention product).
-    assert component["leakage_rate_hz"] == pytest.approx(
+    # Poisson noise is the detected dark rate; calibration cannot subtract
+    # photons (review 2026-11-07 row 71; the old pin put the residual here).
+    assert component["leakage_rate_hz"] == pytest.approx(1.0e2)
+    # The residual sets only the systematic leakage. KILO mean(dark)/
+    # mean(bright) converted to a dark/total fraction before the rate
+    # product: 2.5e-7 x mean_bright(1e8/1) x n_dark(3) (review 2026-06-10
+    # Issue 27a).
+    assert component["systematic_leakage_rate_hz"] == pytest.approx(
         2.5e-7 * 1.0e8 * 3.0,
     )
 
@@ -594,11 +597,13 @@ def test_performance_calibration_floor_bounds_detector_null_without_sensitivity(
         component["null_depth_source"]
         == "calibration_floor:calibration.floor_lookup"
     )
-    # Converted convention (review 2026-06-10 Issue 27a): 5.5e-7 x
-    # mean_bright(1e8/1) x n_dark(3).
-    assert component["leakage_rate_hz"] == pytest.approx(
+    # The floor bounds the systematic residual only (review 2026-11-07 row
+    # 71); converted convention (review 2026-06-10 Issue 27a): 5.5e-7 x
+    # mean_bright(1e8/1) x n_dark(3). Poisson stays on the detected 100 Hz.
+    assert component["systematic_leakage_rate_hz"] == pytest.approx(
         5.5e-7 * 1.0e8 * 3.0,
     )
+    assert component["leakage_rate_hz"] == pytest.approx(1.0e2)
     assert result.results.null_depth == pytest.approx(5.5e-7)
 
 
@@ -1079,3 +1084,187 @@ def test_performance_snr_invariant_in_n_dark_ports_total_semantics(
         f"SNR drifted with n_dark_ports={n_dark_ports}: "
         f"got {snr}, expected ~{snr_ref}"
     )
+
+
+def test_calibration_residual_sets_only_the_systematic_without_sensitivity(
+    tmp_path: Path,
+) -> None:
+    """Review 2026-11-07 row 71: Poisson on the detected leak, systematic on the residual.
+
+    Hand calculation, no FT: B = 100 Hz x 10 s = 1000 counts whatever the
+    calibration residual is, and the systematic amplitude is
+    rssf x L_sys = 1e-2 x (2.5e-7 x 1e8 x 3) = 0.75 Hz, so systematic_var =
+    (0.75 x 10)^2 = 56.25 counts^2.
+    """
+
+    state = _state(
+        include_calibration_component=True,
+        null_depth_calibrated=2.5e-7,
+        null_depth_raw=3.0e-7,
+        integration_time_s=10.0,
+    )
+    stage = _stage(
+        _context(tmp_path),
+        residual_speckle_stability_factor=1.0e-2,
+        with_fringe_tracking=False,
+        compute_contrast_curve=False,
+    )
+    component = stage.apply(state).results.components["performance.standard"]
+
+    assert component["B"] == pytest.approx(1000.0)
+    assert component["systematic_var"] == pytest.approx((0.75 * 10.0) ** 2)
+    assert component["eps_systematic_used"] * component[
+        "leakage_rate_hz"
+    ] == pytest.approx(0.75)
+
+
+def _saturated_state(
+    *,
+    uncapped_bright_hz: float,
+    uncapped_dark_hz: float,
+    recorded_dark_hz: float,
+    recorded_bright_hz: float = 1.0e6,
+) -> SimulationState:
+    """One bright and three dark ports with explicit pre/post-cap rates."""
+
+    state = _state(bright_rate_hz=recorded_bright_hz, leakage_rate_hz=recorded_dark_hz)
+    detector = dict(state.results.components["detector.mkid"])
+    detector["uncapped_port_rates"] = np.array(
+        [uncapped_bright_hz] + [uncapped_dark_hz / 3.0] * 3, dtype=np.float64
+    )
+    detector["detector_saturated"] = True
+    results = replace(
+        state.results,
+        components={**state.results.components, "detector.mkid": detector},
+    )
+    return replace(state, results=results)
+
+
+def _sensitivity_payload(
+    null: float, throughput: float = 0.5, **extra: object
+) -> dict[str, object]:
+    return {
+        "planet_throughputs": np.array([throughput, throughput]),
+        "separations_mas": (50.0, 150.0),
+        "effective_null_with_disk": null,
+        "null_instability": 0.0,
+        **extra,
+    }
+
+
+def _with_sensitivity(state: SimulationState, payload: dict[str, object]) -> SimulationState:
+    return replace(
+        state,
+        results=state.results.add_component("sensitivity.detection_curve", payload),
+    )
+
+
+def test_bright_saturation_does_not_rescale_dark_port_science(tmp_path: Path) -> None:
+    """Review 2026-11-07 Issue 9: normalize to the physical star, not the capped one.
+
+    Bright port clipped 1e8 -> 1e6 Hz, dark ports unsaturated (100 Hz). The
+    physical total is 1e8 + 100 Hz, so with the sensitivity null 1e-6 and
+    throughput 0.5 at contrast 1e-6 the planet is 1e-6 x 0.5 x (1e8 + 100) Hz
+    and the leak 1e-6 x (1e8 + 100) Hz, by hand. The capped total would have
+    made both ~100x smaller.
+    """
+
+    physical_total = 1.0e8 + 100.0
+    state = _with_sensitivity(
+        _saturated_state(
+            uncapped_bright_hz=1.0e8, uncapped_dark_hz=100.0, recorded_dark_hz=100.0
+        ),
+        _sensitivity_payload(1.0e-6),
+    )
+    component = _stage(_context(tmp_path), compute_contrast_curve=False).apply(
+        state
+    ).results.components["performance.standard"]
+
+    assert component["stellar_rate_hz_total"] == pytest.approx(physical_total)
+    assert component["stellar_rate_hz_total_capped"] == pytest.approx(1.0e6 + 100.0)
+    assert component["dark_detected_fraction"] == pytest.approx(1.0)
+    assert component["planet_rate_hz"] == pytest.approx(1.0e-6 * 0.5 * physical_total)
+    assert component["leakage_rate_hz"] == pytest.approx(1.0e-6 * physical_total)
+
+
+def test_dark_port_saturation_scales_planet_and_leak_by_its_ratio(
+    tmp_path: Path,
+) -> None:
+    """A saturated dark port records planet and leak alike at recorded/physical.
+
+    Dark ports clipped 400 -> 100 Hz (ratio 1/4); physical total 1e8 + 400 Hz.
+    Planet and leak are the physical values times 1/4, and the warning fires.
+    """
+
+    physical_total = 1.0e8 + 400.0
+    state = _with_sensitivity(
+        _saturated_state(
+            uncapped_bright_hz=1.0e8, uncapped_dark_hz=400.0, recorded_dark_hz=100.0
+        ),
+        _sensitivity_payload(1.0e-6),
+    )
+    with pytest.warns(RuntimeWarning, match="dark ports saturated"):
+        component = _stage(_context(tmp_path), compute_contrast_curve=False).apply(
+            state
+        ).results.components["performance.standard"]
+
+    assert component["dark_detected_fraction"] == pytest.approx(0.25)
+    assert component["planet_rate_hz"] == pytest.approx(
+        1.0e-6 * 0.5 * physical_total * 0.25
+    )
+    assert component["leakage_rate_hz"] == pytest.approx(1.0e-6 * physical_total * 0.25)
+
+
+def test_null_fluctuation_rms_sets_the_systematic_amplitude(tmp_path: Path) -> None:
+    """Issue 19 interface: A = hypot(sigma_L S / nsc, rssf L), not CV x L_eff.
+
+    S = 1e8 + 100 Hz, L = 1e-6 S. sigma_L = 2e-7, nsc = 4, rssf = 1e-2:
+    A = hypot(2e-7 S / 4, 1e-2 x 1e-6 S) = S x hypot(5e-8, 1e-8). The
+    published null_instability (0.9) must not enter when sigma_L is present.
+    On the contrast curve the sigma_L term stays fixed while the speckle term
+    follows each separation's null (1e-6, 4e-6).
+    """
+
+    total = 1.0e8 + 100.0
+    state = _with_sensitivity(
+        _state(bright_rate_hz=1.0e8, leakage_rate_hz=100.0),
+        _sensitivity_payload(
+            1.0e-6,
+            null_instability=0.9,
+            null_fluctuation_rms=2.0e-7,
+            effective_null_with_disk_by_separation=np.array([1.0e-6, 4.0e-6]),
+        ),
+    )
+    component = _stage(
+        _context(tmp_path),
+        nsc_systematic_reduction=4.0,
+        residual_speckle_stability_factor=1.0e-2,
+    ).apply(state).results.components["performance.standard"]
+
+    amplitude_hz = total * math.hypot(5.0e-8, 1.0e-8)
+    assert component["eps_systematic_used"] * component["leakage_rate_hz"] == (
+        pytest.approx(amplitude_hz)
+    )
+    eps_curve = np.asarray(component["contrast_curve_eps_systematic"])
+    leak_curve = np.asarray(component["contrast_curve_leakage_rate_hz"])
+    assert leak_curve == pytest.approx(total * np.array([1.0e-6, 4.0e-6]))
+    assert eps_curve * leak_curve == pytest.approx(
+        total * np.hypot(5.0e-8, 1.0e-2 * np.array([1.0e-6, 4.0e-6]))
+    )
+
+
+def test_newest_detector_component_wins(tmp_path: Path) -> None:
+    """Review 2026-11-07 Issue 25: one rule, the newest matching component."""
+
+    state = _state(leakage_rate_hz=100.0)
+    newer = dict(state.results.components["detector.mkid"])
+    newer["port_rates"] = np.asarray(newer["port_rates"]) * 2.0
+    state = replace(
+        state, results=state.results.add_component("detector.snspd", newer)
+    )
+    component = _stage(_context(tmp_path), compute_contrast_curve=False).apply(
+        state
+    ).results.components["performance.standard"]
+
+    assert component["upstream_detector_component"] == "detector.snspd"
+    assert component["leakage_rate_hz_total"] == pytest.approx(200.0)

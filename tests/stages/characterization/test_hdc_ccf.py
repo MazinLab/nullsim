@@ -1153,3 +1153,78 @@ def test_rv_scan_grid_contains_the_scene_velocity(tmp_path: Path) -> None:
             "marginal",
             "unreliable",
         )
+
+
+def _template_csv(
+    tmp_path: Path, name: str, kind: str, lsf_resolving_power: float, values: str
+) -> Path:
+    """A synthetic snapshot on a 30000 constant-R grid; ``values`` is "flat" or "lambda"."""
+
+    from nullsim.physics.spectra import constant_r_grid
+
+    grid = constant_r_grid(1.0, 1.5, 30_000.0)
+    path = tmp_path / f"{name}.csv"
+    lines = [
+        f"# kind: {kind}",
+        f"# lsf_resolving_power: {lsf_resolving_power:g}",
+        "# source: synthetic test template",
+        "wavelength_um,value",
+    ]
+    lines += [
+        f"{w:.10e},{(0.9 if values == 'flat' else w):.10e}" for w in grid
+    ]
+    path.write_text("\n".join(lines))
+    return path
+
+
+def test_flat_telluric_masks_no_edge_channels(tmp_path: Path) -> None:
+    """Review 2026-11-07 row 50: broadening must not darken the band edges.
+
+    A flat T = 0.9 is above the 0.8 mask everywhere, so no channel at any R may
+    be masked. Zero padding the transmission before the LSF convolution read as
+    absorption and pushed the edge channels to ~0.77.
+    """
+
+    telluric = _template_csv(tmp_path, "flat_t", "transmission", 30_000.0, "flat")
+    payload = _stage(
+        _context(tmp_path),
+        telluric_template=str(telluric),
+        resolving_power=100.0,
+        snr_vs_r_points=0,
+        rv_scan_points=0,
+    ).apply(_state()).results.components["characterization.hdc_ccf"]
+
+    assert float(payload["telluric_masked_fraction"]) == 0.0
+    assert int(payload["n_channels_used"]) == int(payload["n_channels"])
+
+
+def test_mixed_resolution_templates_are_broadened_before_the_product(
+    tmp_path: Path,
+) -> None:
+    """Review 2026-11-07 row 51: one LSF for the product, however R is mixed.
+
+    A flat-F_lambda star is invariant under broadening, so declaring its
+    content R as 3000 or as 30000 must give the same planet channels at an
+    instrument R of 3000. At 3000 the instrument R equals the lowest content R
+    and no further convolution runs, so the R = 30000 albedo has to have been
+    broadened to 3000 before the product. Pre-fix it was left unbroadened and
+    the two runs differed by several percent per channel.
+    """
+
+    def planet_channels(lsf: float) -> np.ndarray:
+        star = _template_csv(tmp_path, f"star_{lsf:g}", "stellar_flux", lsf, "lambda")
+        payload = _stage(
+            _context(tmp_path),
+            star_template=str(star),
+            resolving_power=3000.0,
+            snr_vs_r_points=0,
+            rv_scan_points=0,
+        ).apply(_state()).results.components["characterization.hdc_ccf"]
+        return np.asarray(payload["ccf_planet_rate_hz_per_channel"], dtype=np.float64)
+
+    coarse_star = planet_channels(3000.0)
+    fine_star = planet_channels(30_000.0)
+    interior = slice(10, -10)  # the two edge models differ within an LSF of the band edge
+    np.testing.assert_allclose(
+        coarse_star[interior], fine_star[interior], rtol=2.0e-3
+    )

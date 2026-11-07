@@ -7,9 +7,10 @@ date: 2026-08-09
 `performance.standard`'s `stellar_rate_hz_total`, which is the sum of the
 detector's port rates *after* per-pixel saturation clipping. Saturation is a
 readout limit; a planet at contrast `c` still delivers `c` times the photons
-the star actually sends. On the shipped KILO example at J = 4 the bright ports
-clip by 3.804x, so every contrast on the CCF curve came out that much too
-bright.
+the star actually sends. In `examples/test/hdc_detection_smoke.toml` at J = 5
+the two bright ports clip by 3.804x, so every contrast on the CCF curve came
+out that much too bright. (The shipped KILO example does not saturate:
+kilo_keck_6 at J = 4 peaks at 794 Hz per pixel against the 5e4 Hz cap.)
 
 The physical rate now travels the whole chain. `detector.mkid` and
 `detector.snspd` publish `uncapped_port_rates` (per-port totals before the cap)

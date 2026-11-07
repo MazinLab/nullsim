@@ -222,6 +222,18 @@ def test_convolve_leaves_a_constant_flat_away_from_the_edges():
     assert out[margin:-margin] == pytest.approx(3.0, rel=1e-9)
 
 
+def test_convolve_edge_mode_keeps_a_flat_transmission_flat_to_the_edges():
+    # Review 2026-11-07 row 50: a transmission continues past the grid, so a
+    # flat T must survive broadening everywhere, edge samples included. Zero
+    # padding gave the first sample 0.5 + g(0)/2 of its value (0.9 -> ~0.49
+    # here) and read as absorption.
+    grid = constant_r_grid(1.0, 1.1, 20_000.0)
+    flat = np.full(grid.size, 0.9)
+    out = convolve_to_resolving_power(grid, flat, 100.0, outside="edge")
+    assert out == pytest.approx(0.9, rel=1e-12)
+    assert convolve_to_resolving_power(grid, flat, 100.0)[0] < 0.5
+
+
 def test_provenance_number_does_not_confuse_a_key_with_its_suffix():
     # The reason the two resolving powers are separate keys at all: a naive
     # substring search for "resolving_power" happily matches
