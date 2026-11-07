@@ -12,12 +12,14 @@ The two canonical Kolmogorov constants pinned by this module are:
   KILO uses the same numeric value as ``C_TEMP`` in its temporal-error
   formula (``kilo/atmosphere.py``); the coefficient arises from the same
   Kolmogorov spectrum.
-- ``NOLL_TOTAL_VARIANCE_COEFFICIENT = 1.0299``: the piston-included
-  full-aperture wavefront phase variance over a circular aperture of
-  diameter D, ``sigma^2 = 1.0299 (D / r0)^(5/3)`` (Noll 1976, Table I).
-  Neither KILO nor NAYRA expose this constant directly — both jump to
-  budget breakdowns (fitting, temporal, WFS noise) for AO-residual work.
-  See ``tests/physics/notes/kolmogorov.md`` for the rationale.
+- ``NOLL_PISTON_REMOVED_COEFFICIENT = 1.0299``: the piston-removed
+  wavefront phase variance over a circular aperture of diameter D,
+  ``Delta_1 = 1.0299 (D / r0)^(5/3)`` (Noll 1976, Table IV). The
+  piston-included variance diverges for pure Kolmogorov turbulence (the
+  k^(-11/3) spectrum is not integrable at k -> 0), so there is no finite
+  "total" coefficient. Neither KILO nor NAYRA expose this constant
+  directly — both jump to budget breakdowns (fitting, temporal, WFS
+  noise) for AO-residual work. See ``tests/physics/notes/kolmogorov.md``.
 
 The Fried wavelength scaling ``r0 propto lambda^(6/5)`` matches KILO's
 ``scale_r0`` (KILO/NAYRA atmosphere.py, ``r0_500nm * (lambda/500e-9)^1.2``).
@@ -54,22 +56,18 @@ from numpy.typing import ArrayLike, NDArray
 #: from the Kolmogorov spectrum.
 KOLMOGOROV_PHASE_SF_COEFFICIENT: float = 6.88
 
-#: Noll 1976 Table I piston-included total wavefront phase variance over
-#: a circular aperture of diameter D (sum across all Zernike modes):
+#: Noll 1976 residual after the first Zernike (piston) is removed,
+#: Delta_1 in Noll's Table IV:
 #:
-#:     sigma^2 = NOLL_TOTAL_VARIANCE_COEFFICIENT * (D / r0)^(5/3)   [rad^2]
+#:     sigma^2 = NOLL_PISTON_REMOVED_COEFFICIENT * (D / r0)^(5/3)   [rad^2]
 #:
-#: This constant does not appear explicitly in KILO/NAYRA — both packages
-#: track AO error sub-budgets (fitting, temporal, WFS noise) instead of
-#: the raw Kolmogorov full-aperture variance. Adopting Noll's canonical
-#: value here means downstream nullsim stages can decompose into the
-#: same sub-budgets KILO uses, with this constant as the integral check.
-NOLL_TOTAL_VARIANCE_COEFFICIENT: float = 1.0299
+#: This is the smallest finite Kolmogorov aperture variance: the
+#: piston-included variance diverges for an infinite outer scale.
+NOLL_PISTON_REMOVED_COEFFICIENT: float = 1.0299
 
-#: Noll 1976 Table II piston-removed coefficient (first Zernike removed).
-#: Useful when the full aperture is implicitly piston-corrected (e.g. a
-#: tip-tilt-only AO mode or a fringe-tracker that removes piston).
-NOLL_PISTON_REMOVED_COEFFICIENT: float = 0.582
+#: Noll 1976 residual after piston, tip, and tilt are removed (Delta_3,
+#: Table IV). Tip/tilt carry ~87% of the piston-removed variance.
+NOLL_TIP_TILT_REMOVED_COEFFICIENT: float = 0.134
 
 #: Reference wavelength for the Fried r0 scaling. 500 nm matches KILO's
 #: ``scale_r0`` convention and the standard atmospheric site characterisation.
@@ -256,18 +254,21 @@ def phase_variance(
     aperture_diameter_m: ArrayLike,
     r0_m: ArrayLike,
     *,
-    piston_removed: bool = False,
+    tip_tilt_removed: bool = False,
 ) -> float | NDArray[np.floating]:
     """Wavefront phase variance over a circular aperture (Noll 1976).
 
-    Piston-included form (default):
-        ``sigma^2 = 1.0299 (D / r0)^(5/3)`` rad^2 (Noll 1976, Table I).
+    Piston-removed form (default):
+        ``Delta_1 = 1.0299 (D / r0)^(5/3)`` rad^2 (Noll 1976, Table IV,
+        residual after the first Zernike is removed).
 
-    Piston-removed form (``piston_removed=True``):
-        ``sigma^2 = 0.582 (D / r0)^(5/3)`` rad^2 (Noll 1976, Table II,
-        residual after the first Zernike is removed). Use this form when
-        the aperture is implicitly piston-corrected (e.g. by a single-mode
-        fringe tracker that removes the mean phase).
+    Tip/tilt-removed form (``tip_tilt_removed=True``):
+        ``Delta_3 = 0.134 (D / r0)^(5/3)`` rad^2 (Noll 1976, Table IV,
+        residual after piston, tip, and tilt are removed).
+
+    There is no piston-included form: for pure Kolmogorov turbulence
+    (infinite outer scale) the piston variance over a finite aperture
+    diverges.
 
     Architect note: SPEC §15.2 lists the signature as
     ``phase_variance(r0_m, wavelength_m)``, but the aperture diameter
@@ -282,9 +283,9 @@ def phase_variance(
             Must be finite and positive.
         r0_m: Fried parameter at the same wavelength the returned phase
             variance is in. NaN propagates; zero/negative raises.
-        piston_removed: When True, use the piston-removed Noll coefficient
-            (0.582). Default False uses the piston-included coefficient
-            (1.0299).
+        tip_tilt_removed: When True, use the tip/tilt-removed Noll
+            coefficient (0.134). Default False uses the piston-removed
+            coefficient (1.0299).
 
     Returns:
         Phase variance in rad^2. ``sigma^2 -> 0`` as ``r0 -> infinity``
@@ -293,9 +294,9 @@ def phase_variance(
     aperture_value = _require_positive(aperture_diameter_m, "aperture_diameter_m")
     r0_value = _require_positive_r0(r0_m)
     coefficient = (
-        NOLL_PISTON_REMOVED_COEFFICIENT
-        if piston_removed
-        else NOLL_TOTAL_VARIANCE_COEFFICIENT
+        NOLL_TIP_TILT_REMOVED_COEFFICIENT
+        if tip_tilt_removed
+        else NOLL_PISTON_REMOVED_COEFFICIENT
     )
     ratio = np.divide(aperture_value, r0_value)
     return coefficient * np.power(ratio, _FIVE_THIRDS)
@@ -308,7 +309,7 @@ def opd_rms_m(
     r0_m: ArrayLike,
     wavelength_m: ArrayLike,
     *,
-    piston_removed: bool = False,
+    tip_tilt_removed: bool = False,
 ) -> float | NDArray[np.floating]:
     """Wavefront OPD RMS over a circular aperture (Kolmogorov, Noll 1976).
 
@@ -334,7 +335,7 @@ def opd_rms_m(
         r0_m: Fried parameter at ``wavelength_m`` in meters.
         wavelength_m: Wavelength in meters for the phase-to-OPD
             conversion. Must be finite and positive.
-        piston_removed: When True, use the piston-removed Noll
+        tip_tilt_removed: When True, use the tip/tilt-removed Noll
             coefficient (see ``phase_variance``).
 
     Returns:
@@ -342,7 +343,7 @@ def opd_rms_m(
     """
     wavelength_value = _require_positive(wavelength_m, "wavelength_m")
     sigma2_rad2 = phase_variance(
-        aperture_diameter_m, r0_m, piston_removed=piston_removed,
+        aperture_diameter_m, r0_m, tip_tilt_removed=tip_tilt_removed,
     )
     return np.sqrt(sigma2_rad2) * wavelength_value / (2.0 * np.pi)
 
@@ -405,8 +406,8 @@ def _require_nonnegative_propagating(
 
 __all__ = [
     "KOLMOGOROV_PHASE_SF_COEFFICIENT",
-    "NOLL_TOTAL_VARIANCE_COEFFICIENT",
     "NOLL_PISTON_REMOVED_COEFFICIENT",
+    "NOLL_TIP_TILT_REMOVED_COEFFICIENT",
     "R0_REFERENCE_WAVELENGTH_M",
     "TAU0_WIND_COEFFICIENT",
     "effective_wind_speed_m_s",

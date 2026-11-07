@@ -263,3 +263,25 @@ def test_chromatic_coupling_rolloff_off_stays_pinned() -> None:
     np.testing.assert_allclose(
         power, UNOBSTRUCTED_GEOMETRIC_COUPLING_LIMIT, rtol=1e-12
     )
+
+
+def test_ao_subaperture_strehl_drives_coupling_over_full_pupil_strehl() -> None:
+    """With an ``ao_residual`` payload, coupling uses the piston-removed
+    subaperture Strehl: a piston uniform over the subaperture changes the
+    coupled phase, not the coupled power, and the OPD budget books it."""
+
+    full_strehl = (0.30, 0.50, 0.70)
+    subaperture_strehl = (0.40, 0.60, 0.80)
+    state = _state(strehl=full_strehl)
+    state = replace(
+        state,
+        wavefront=state.wavefront.add_component(
+            "ao_residual", {"subaperture_strehl_ratio": subaperture_strehl}
+        ),
+    )
+    stage = IdealInjection(params={"n_modes": 2}, context=_ctx())
+    out = stage.apply(state)
+
+    expected_eta = UNOBSTRUCTED_GEOMETRIC_COUPLING_LIMIT * np.asarray(subaperture_strehl)
+    np.testing.assert_allclose(np.abs(out.field.amplitudes[0, :, 0]) ** 2, expected_eta)
+    assert out.wavefront.strehl_ratio == pytest.approx(subaperture_strehl)

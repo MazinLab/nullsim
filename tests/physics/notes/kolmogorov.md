@@ -51,14 +51,28 @@ nullsim pins this as `KOLMOGOROV_PHASE_SF_COEFFICIENT = 6.88` in
 
 ### Full-aperture phase variance coefficient (Noll 1976)
 
-The canonical Noll 1976 result for the total piston-included wavefront
-phase variance over a circular aperture of diameter D is
+Noll (1976) tabulates the residual variance Delta_J left over a circular
+aperture of diameter D after the first J Zernike modes are removed:
 
-    sigma_phi^2 = 1.0299 (D / r0)^(5/3)    rad^2    (Noll Table I)
+    Delta_1 = 1.0299 (D / r0)^(5/3)    rad^2    piston removed
+    Delta_2 = 0.582  (D / r0)^(5/3)    rad^2    piston and one tilt removed
+    Delta_3 = 0.134  (D / r0)^(5/3)    rad^2    piston, tip, and tilt removed
 
-After the first Zernike (piston) is removed:
+There is no piston-included value. For pure Kolmogorov turbulence the
+k^(-11/3) spectrum is not integrable at k -> 0, so the piston variance
+over a finite aperture diverges; only a finite outer scale makes it
+finite. Before 2026-11-07 nullsim labeled 1.0299 "piston included" and
+0.582 (which is Delta_2) "piston removed", so the atmosphere stage's
+piston-removed variance was 43.5% low.
 
-    sigma_phi^2 = 0.582 (D / r0)^(5/3)    rad^2    (Noll Table II)
+Independent check (`test_noll_coefficients_match_kolmogorov_spectrum_quadrature`):
+integrating Phi(f) = 0.022896 r0^(-5/3) f^(-11/3) against
+`1 - (2 J1(x)/x)^2` (and minus `16 J2(x)^2/x^2` for tip/tilt), with
+x = pi D f, gives 1.0324 and 0.1347. The structure function route,
+`(1/2) <6.8839 (|r - r'|/r0)^(5/3)>` over the disk, gives the same 1.0324.
+Noll's tabulated values sit 0.24% and 0.5% below; the test tolerance is
+0.6%. The 0.24% offset in Delta_1 is not explained here; it is too small
+to matter for any nullsim budget.
 
 **Neither KILO nor NAYRA expose this constant directly.** Both packages
 jump straight to AO error sub-budgets:
@@ -72,14 +86,13 @@ jump straight to AO error sub-budgets:
 The 0.28 coefficient is **not** an alternative to 1.0299 — it is the
 post-DM-fit residual coefficient with an actuator pitch as the spatial
 scale. The two coefficients describe different physical situations
-(uncorrected total variance over a full aperture vs. fitting error
-residual after a deformable mirror with actuator pitch d_act).
+(uncorrected piston-removed variance over a full aperture vs. fitting
+error residual after a deformable mirror with actuator pitch d_act).
 
-Because the canonical Noll 1976 value is not duplicated in KILO/NAYRA,
-**no KILO/NAYRA-vs-canonical discrepancy exists for the total-variance
-coefficient**. nullsim adopts the Noll 1976 value 1.0299 directly,
-citing Noll Table I, and the 0.582 piston-removed value from Noll
-Table II as an opt-in via `piston_removed=True`.
+Because the Noll 1976 values are not duplicated in KILO/NAYRA, **no
+KILO/NAYRA-vs-canonical discrepancy exists**. nullsim adopts Delta_1 =
+1.0299 as the default and Delta_3 = 0.134 as an opt-in via
+`tip_tilt_removed=True`.
 
 ### Marechal Strehl
 
@@ -104,8 +117,8 @@ specification lacks an aperture argument.
 
 This implementation adopts
 
-    phase_variance(aperture_diameter_m, r0_m, *, piston_removed=False)
-    opd_rms_m(aperture_diameter_m, r0_m, wavelength_m, *, piston_removed=False)
+    phase_variance(aperture_diameter_m, r0_m, *, tip_tilt_removed=False)
+    opd_rms_m(aperture_diameter_m, r0_m, wavelength_m, *, tip_tilt_removed=False)
 
 Rationale:
 
@@ -114,10 +127,10 @@ Rationale:
 - `opd_rms_m` keeps `wavelength_m` for the explicit phase-to-OPD
   conversion factor `lambda / (2 pi)` and so the API documents the
   dimensioned conversion at the call site.
-- The piston-removed Noll coefficient is opt-in via keyword. This keeps
-  the default behavior aligned with the textbook Noll Table I value
-  (1.0299) while exposing the piston-removed Table II value (0.582)
-  without proliferating function names.
+- The tip/tilt-removed Noll coefficient is opt-in via keyword. The
+  default is the piston-removed Delta_1 (1.0299), the smallest finite
+  Kolmogorov aperture variance; Delta_3 (0.134) is exposed without
+  proliferating function names.
 
 Flagged for Inspector / Architect to confirm and update SPEC §15.2 to
 reflect the corrected signature.

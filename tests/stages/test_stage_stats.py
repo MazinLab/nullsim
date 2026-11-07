@@ -205,8 +205,8 @@ def test_atmosphere_seeing_envelopes_match_marechal_curve(tmp_path: Path) -> Non
     """Strehl across a (D, r0) sweep falls on the Marechal-like envelope.
 
     Plots Strehl vs (D/r0_at_lambda)^(5/3) and overlays exp(-c*x) with c set
-    by the Noll piston-removed coefficient (0.582). Bad seeing (D=10, r0=0.05)
-    gives Strehl << 0.01; excellent seeing (D=2, r0=0.5) gives Strehl > 0.5.
+    by the Noll piston-removed coefficient (1.0299). Bad seeing (D=10, r0=0.05)
+    gives Strehl << 0.01; excellent seeing (D=1, r0=0.5) gives Strehl > 0.5.
     """
     scenarios = [
         (10.0, 0.05),  # terrible seeing on a big telescope
@@ -216,7 +216,7 @@ def test_atmosphere_seeing_envelopes_match_marechal_curve(tmp_path: Path) -> Non
         (4.0, 0.30),
         (4.0, 0.50),
         (3.0, 0.50),
-        (2.0, 0.50),  # excellent seeing on a small telescope
+        (1.0, 0.50),  # excellent seeing on a small telescope
     ]
     wavelength_um = 1.65
     wavelength_m = wavelength_um * 1.0e-6
@@ -238,7 +238,7 @@ def test_atmosphere_seeing_envelopes_match_marechal_curve(tmp_path: Path) -> Non
 
     # Architect's two anchor envelopes:
     bad = next(s for (d, r), s in zip(scenarios, strehls) if d == 10.0 and r == 0.05)
-    good = next(s for (d, r), s in zip(scenarios, strehls) if d == 2.0 and r == 0.5)
+    good = next(s for (d, r), s in zip(scenarios, strehls) if d == 1.0 and r == 0.5)
     assert bad < 0.01
     assert good > 0.5
 
@@ -250,7 +250,7 @@ def test_atmosphere_seeing_envelopes_match_marechal_curve(tmp_path: Path) -> Non
         x_curve,
         np.exp(-kolmogorov.NOLL_PISTON_REMOVED_COEFFICIENT * x_curve),
         "k--",
-        label="Marechal: exp(-0.582*(D/r0)^(5/3))",
+        label="Marechal: exp(-1.0299*(D/r0)^(5/3))",
     )
     ax.set_xlabel(r"$(D/r_0(\lambda))^{5/3}$")
     ax.set_ylabel("Strehl ratio")

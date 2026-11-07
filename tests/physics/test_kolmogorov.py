@@ -16,7 +16,7 @@ import pytest
 from nullsim.physics.kolmogorov import (
     KOLMOGOROV_PHASE_SF_COEFFICIENT,
     NOLL_PISTON_REMOVED_COEFFICIENT,
-    NOLL_TOTAL_VARIANCE_COEFFICIENT,
+    NOLL_TIP_TILT_REMOVED_COEFFICIENT,
     R0_REFERENCE_WAVELENGTH_M,
     TAU0_WIND_COEFFICIENT,
     effective_wind_speed_m_s,
@@ -36,14 +36,60 @@ def test_phase_structure_function_coefficient_matches_kilo_c_temp() -> None:
     assert KOLMOGOROV_PHASE_SF_COEFFICIENT == pytest.approx(6.88, rel=1e-12)
 
 
-def test_noll_total_variance_coefficient_matches_table_i() -> None:
-    """1.0299 (D/r0)^(5/3) is Noll 1976 Table I, piston included."""
-    assert NOLL_TOTAL_VARIANCE_COEFFICIENT == pytest.approx(1.0299, rel=1e-12)
+def test_noll_piston_removed_coefficient_is_delta_1() -> None:
+    """Delta_1 = 1.0299 (D/r0)^(5/3): Noll 1976, residual after piston."""
+    assert NOLL_PISTON_REMOVED_COEFFICIENT == pytest.approx(1.0299, rel=1e-12)
 
 
-def test_noll_piston_removed_coefficient_matches_table_ii() -> None:
-    """0.582 (D/r0)^(5/3) is Noll 1976 Table II, first Zernike removed."""
-    assert NOLL_PISTON_REMOVED_COEFFICIENT == pytest.approx(0.582, rel=1e-12)
+def test_noll_tip_tilt_removed_coefficient_is_delta_3() -> None:
+    """Delta_3 = 0.134 (D/r0)^(5/3): Noll 1976, residual after piston and tilt."""
+    assert NOLL_TIP_TILT_REMOVED_COEFFICIENT == pytest.approx(0.134, rel=1e-12)
+
+
+def _kolmogorov_residual_coefficient(*, remove_tilt: bool) -> float:
+    """Residual variance / (D/r0)^(5/3) from the Kolmogorov phase spectrum.
+
+    sigma^2 = int Phi(f) [1 - |Q(f)|^2] 2 pi f df with
+    Phi(f) = c r0^(-5/3) f^(-11/3), c = Gamma(11/6)^2 / (2 pi^(11/3))
+    (24/5 Gamma(6/5))^(5/6), and the angle-averaged Zernike filters of
+    Noll (1976) Eq. 8 with x = pi D f: piston (2 J1(x)/x)^2, tip plus tilt
+    16 J2(x)^2 / x^2. Below x0 the piston-removed integrand is replaced by
+    its leading term x^(-2/3)/4 to avoid roundoff in 1 - (2 J1/x)^2.
+    """
+    from scipy.integrate import quad
+    from scipy.special import gamma, j1, jv
+
+    c = gamma(11 / 6) ** 2 / (2 * math.pi ** (11 / 3)) * (24 / 5 * gamma(6 / 5)) ** (5 / 6)
+
+    def integrand(x: float) -> float:
+        filtered = 1.0 - (2.0 * j1(x) / x) ** 2
+        if remove_tilt:
+            filtered -= 16.0 * jv(2, x) ** 2 / x**2
+        return x ** (-8.0 / 3.0) * filtered
+
+    x0 = 1.0e-2
+    head = 0.0 if remove_tilt else 0.75 * x0 ** (1.0 / 3.0)
+    body = quad(integrand, x0, 60.0, limit=400)[0]
+    tail = quad(integrand, 60.0, np.inf, limit=400)[0]
+    return 2.0 * math.pi * c * math.pi ** (5.0 / 3.0) * (head + body + tail)
+
+
+@pytest.mark.parametrize(
+    ("remove_tilt", "coefficient"),
+    [(False, NOLL_PISTON_REMOVED_COEFFICIENT), (True, NOLL_TIP_TILT_REMOVED_COEFFICIENT)],
+)
+def test_noll_coefficients_match_kolmogorov_spectrum_quadrature(
+    remove_tilt: bool, coefficient: float,
+) -> None:
+    """Pins the piston/tip-tilt labels against an independent integral.
+
+    The quadrature gives 1.0324 and 0.1347; Noll's tabulated 1.0299 and
+    0.134 sit 0.24% and 0.5% below. A swap of labels (or the former 0.582,
+    which is Delta_2, piston plus one tilt) fails by tens of percent.
+    """
+    assert _kolmogorov_residual_coefficient(remove_tilt=remove_tilt) == pytest.approx(
+        coefficient, rel=6e-3,
+    )
 
 
 def test_r0_reference_wavelength_matches_kilo_convention() -> None:
@@ -127,19 +173,17 @@ def test_phase_structure_function_array_broadcasting() -> None:
 # ── phase_variance: Noll 1976 ───────────────────────────────────────────
 
 
-def test_phase_variance_pinned_against_noll_table_i() -> None:
-    """sigma^2 = 1.0299 (D/r0)^(5/3) at D = r0 (Noll Table I)."""
+def test_phase_variance_default_is_piston_removed_delta_1() -> None:
+    """sigma^2 = 1.0299 (D/r0)^(5/3) at D = r0 (Noll Delta_1)."""
     r0 = 0.15
-    assert phase_variance(r0, r0) == pytest.approx(
-        NOLL_TOTAL_VARIANCE_COEFFICIENT, rel=1e-12,
-    )
+    assert phase_variance(r0, r0) == pytest.approx(1.0299, rel=1e-12)
 
 
-def test_phase_variance_piston_removed_matches_noll_table_ii() -> None:
-    """sigma^2 = 0.582 (D/r0)^(5/3) at D = r0 with piston removed."""
+def test_phase_variance_tip_tilt_removed_is_delta_3() -> None:
+    """sigma^2 = 0.134 (D/r0)^(5/3) at D = r0 with tip/tilt also removed."""
     r0 = 0.15
-    assert phase_variance(r0, r0, piston_removed=True) == pytest.approx(
-        NOLL_PISTON_REMOVED_COEFFICIENT, rel=1e-12,
+    assert phase_variance(r0, r0, tip_tilt_removed=True) == pytest.approx(
+        0.134, rel=1e-12,
     )
 
 
@@ -165,7 +209,7 @@ def test_phase_variance_kilo_consistency_h_band_maunakea_median() -> None:
     """Maunakea median r0=15 cm at 500 nm -> r0(H) ~ 60 cm.
 
     For a Keck sub-aperture diameter D = 2.5 m (Keck N=7), the
-    piston-included Noll variance is roughly 10.3 rad^2 — large, because
+    piston-removed Noll variance is roughly 10.3 rad^2 — large, because
     KILO's design uses a deformable mirror to drive the residual down
     via fitting/temporal/WFS-noise terms. This test just pins the raw
     Kolmogorov number so any future change to the normalization
@@ -182,7 +226,7 @@ def test_phase_variance_array_broadcasting() -> None:
     r0 = 0.15
     diameters_m = np.array([0.5, 1.0, 2.5, 10.0])
     out = phase_variance(diameters_m, r0)
-    expected = NOLL_TOTAL_VARIANCE_COEFFICIENT * (diameters_m / r0) ** (5.0 / 3.0)
+    expected = NOLL_PISTON_REMOVED_COEFFICIENT * (diameters_m / r0) ** (5.0 / 3.0)
     np.testing.assert_allclose(out, expected, rtol=1e-12)
 
 
@@ -217,18 +261,15 @@ def test_opd_rms_m_wavelength_independent_when_r0_tracks_wavelength() -> None:
     )
 
 
-def test_opd_rms_m_piston_removed_smaller_than_default() -> None:
-    """sqrt(0.582 / 1.0299) ~ 0.752 factor between piston-removed and full."""
+def test_opd_rms_m_tip_tilt_removed_smaller_than_default() -> None:
+    """sqrt(0.134 / 1.0299) ~ 0.361 factor between tip/tilt- and piston-removed."""
     d = 1.0
     r0 = 0.5
     wavelength_m = 1.65e-6
-    sigma_total = opd_rms_m(d, r0, wavelength_m)
-    sigma_piston_removed = opd_rms_m(d, r0, wavelength_m, piston_removed=True)
-    ratio = sigma_piston_removed / sigma_total
-    expected_ratio = math.sqrt(
-        NOLL_PISTON_REMOVED_COEFFICIENT / NOLL_TOTAL_VARIANCE_COEFFICIENT,
-    )
-    assert ratio == pytest.approx(expected_ratio, rel=1e-12)
+    sigma_piston_removed = opd_rms_m(d, r0, wavelength_m)
+    sigma_tip_tilt_removed = opd_rms_m(d, r0, wavelength_m, tip_tilt_removed=True)
+    ratio = sigma_tip_tilt_removed / sigma_piston_removed
+    assert ratio == pytest.approx(math.sqrt(0.134 / 1.0299), rel=1e-12)
 
 
 # ── strehl_marechal ──────────────────────────────────────────────────────

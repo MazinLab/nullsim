@@ -68,7 +68,7 @@ should store that result in nanometers.
 
 KILO does not use the Noll 1976 full-aperture phase-variance coefficients in
 the AO path. The stage should not approximate KILO's `ao_residual_variance`
-with `phase_variance(D, r0, piston_removed=...)`.
+with `phase_variance(D, r0)`.
 
 Instead:
 
@@ -76,10 +76,14 @@ Instead:
   `sigma2_fit + sigma2_temporal + sigma2_noise`.
 - Coupled-mode piston comes from KILO's Bessel-filtered AO residual terms via
   `ao_piston_phase_components`.
-- `nullsim.physics.kolmogorov.phase_variance(..., piston_removed=False)`
-  remains the correct raw uncorrected full-aperture default. Use
-  `piston_removed=True` only for a deliberately modeled piston-removed raw
-  Kolmogorov case, not for the KILO AO-residual stage.
+- `nullsim.physics.kolmogorov.phase_variance(D, r0)` is the raw
+  uncorrected piston-removed variance, Noll Delta_1 = 1.0299 (D/r0)^(5/3);
+  the atmosphere stage uses it with r0 degraded to the pointing airmass as
+  `r0 * airmass**(-0.6)`, the same scaling as the AO stage. There is no
+  piston-included form (it diverges for pure Kolmogorov turbulence).
+  `tip_tilt_removed=True` gives Delta_3 = 0.134 (D/r0)^(5/3) for a
+  deliberately modeled tip/tilt-corrected case, not for the KILO
+  AO-residual stage.
 
 For the OPD budget vocabulary, use the SPEC key `atmos_piston` for the
 coupled-mode atmosphere piston component. Keep the per-term KILO names

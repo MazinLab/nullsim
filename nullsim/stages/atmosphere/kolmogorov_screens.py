@@ -4,7 +4,10 @@ This is the first SPEC §15.3 atmosphere-stage pass: it wraps the pure
 ``nullsim.physics.kolmogorov`` functions into the pipeline state model without
 adding AO, scintillation, or finite-outer-scale physics. The delivered
 wavefront/Strehl budget uses the piston-removed Noll coefficient because a
-constant aperture piston does not degrade image quality. ``L0_m`` is accepted
+constant aperture piston does not degrade image quality (and the
+piston-included Kolmogorov variance diverges). The zenith r0 is degraded to
+the pointing airmass as ``r0 * airmass^(-3/5)`` (Roddier 1981), the same
+scaling ``ao.pyramid_wfs`` applies. ``L0_m`` is accepted
 and recorded for provenance, but the current primitive assumes infinite outer
 scale. The Kolmogorov/Noll normalization and KILO/NAYRA provenance live in
 ``nullsim/physics/kolmogorov.py`` and ``tests/physics/notes/kolmogorov.md``.
@@ -90,21 +93,17 @@ class KolmogorovScreens(BaseStage):
         aperture_diameter_m = _require_aperture_diameter_m(state)
 
         wavelength_grid_m = np.asarray(wavelength_grid_um, dtype=np.float64) * _MICRON_TO_M
+        airmass = _airmass_from_scene(state)
         r0_scaled_m = kolmogorov.r0_scaled(
             params.r0_500nm_m,
             wavelength_grid_m,
             kolmogorov.R0_REFERENCE_WAVELENGTH_M,
-        )
-        phase_variance_rad2 = kolmogorov.phase_variance(
-            aperture_diameter_m,
-            r0_scaled_m,
-            piston_removed=True,
-        )
+        ) * airmass ** (-0.6)
+        phase_variance_rad2 = kolmogorov.phase_variance(aperture_diameter_m, r0_scaled_m)
         opd_rms_m = kolmogorov.opd_rms_m(
             aperture_diameter_m,
             r0_scaled_m,
             wavelength_grid_m,
-            piston_removed=True,
         )
         strehl_ratio = kolmogorov.strehl_marechal(opd_rms_m, wavelength_grid_m)
 
@@ -123,6 +122,7 @@ class KolmogorovScreens(BaseStage):
                 aperture_diameter_m=aperture_diameter_m,
                 wavelength_grid_um=wavelength_grid_um,
                 r0_scaled_m=r0_scaled_m,
+                airmass=airmass,
                 phase_variance_rad2=phase_variance_rad2,
                 opd_rms_m=opd_rms_m,
                 strehl_ratio=strehl_ratio,
@@ -135,7 +135,7 @@ class KolmogorovScreens(BaseStage):
             state=state,
             wavelength_grid_um=wavelength_grid_um,
             atmospheric_transmission=params.atmospheric_transmission,
-            airmass=_airmass_from_scene(state),
+            airmass=airmass,
             instance_id=self.context.instance_id,
         )
 
@@ -200,6 +200,7 @@ def _wavefront_component(
     aperture_diameter_m: float,
     wavelength_grid_um: tuple[float, ...],
     r0_scaled_m: np.ndarray,
+    airmass: float,
     phase_variance_rad2: np.ndarray,
     opd_rms_m: np.ndarray,
     strehl_ratio: np.ndarray,
@@ -209,7 +210,9 @@ def _wavefront_component(
         "aperture_diameter_m": aperture_diameter_m,
         "wavelength_grid_um": wavelength_grid_um,
         "r0_500nm_m": params.r0_500nm_m,
+        # Wavelength- and airmass-scaled r0 that the variance uses.
         "r0_scaled_m": _float_tuple(r0_scaled_m),
+        "airmass": airmass,
         "seeing_arcsec": (
             params.seeing_arcsec
             if params.seeing_arcsec is not None

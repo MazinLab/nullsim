@@ -347,6 +347,45 @@ def test_full_scene_atmosphere_ao_injection_pipeline_validates_and_runs(
     assert "ao_temporal" in result.state.opd_budget.components
 
 
+def test_subaperture_strehl_removes_only_the_booked_piston(tmp_path: Path) -> None:
+    """SMF coupling sees exp(-(sigma2_total - sigma2_piston,sub)); the
+    full-pupil Strehl and the OPD-budget piston are unchanged."""
+
+    _register_stage_modules()
+    result = run(_pyramid_config(tmp_path, include_injection=True))
+    ao_component = result.state.wavefront.components["ao_residual"]
+
+    total_rad2 = ao_component["residual_phase_variance_rad2"]["total"]
+    piston_rad2 = ao_component["piston_phase_variance_rad2"]["total"]
+    expected = math.exp(-(total_rad2 - piston_rad2))
+    assert ao_component["subaperture_strehl_ratio"] == pytest.approx((expected,))
+    assert ao_component["strehl_ratio"] == pytest.approx((math.exp(-total_rad2),))
+    assert expected > ao_component["strehl_ratio"][0]
+    assert result.state.wavefront.strehl_ratio == pytest.approx((expected,))
+
+
+def test_temporal_piston_fraction_matches_weber_schafheitlin_closed_form() -> None:
+    """For k_c d >> 1 the k^(-2/3) piston integral on [0, k_c] tends to
+    4 (pi d)^(-1/3) int_0^inf x^(-8/3) J1(x)^2 dx, and the Weber-Schafheitlin
+    integral gives Gamma(8/3) Gamma(1/6) / (2^(8/3) Gamma(11/6)^2 Gamma(17/6)).
+    The unfiltered denominator is 3 k_c^(1/3). The former 1e-6 lower clamp
+    put the fraction 1.0% low here."""
+
+    from scipy.special import gamma
+
+    from nullsim.stages.ao.pyramid_wfs import _piston_filter_fraction
+
+    d_m, k_c_m_inv = 1.0, 50.0
+    bessel_integral = (
+        gamma(8 / 3) * gamma(1 / 6) / (2 ** (8 / 3) * gamma(11 / 6) ** 2 * gamma(17 / 6))
+    )
+    expected = 4.0 * (math.pi * d_m) ** (-1 / 3) * bessel_integral / (3.0 * k_c_m_inv ** (1 / 3))
+    fraction = _piston_filter_fraction(
+        d_m, psd_exponent=-5.0 / 3.0, k_low_m_inv=0.0, k_high_m_inv=k_c_m_inv
+    )
+    assert fraction == pytest.approx(expected, rel=1e-5)
+
+
 def _run_pyramid_pipeline(
     tmp_path: Path,
     *,

@@ -11,7 +11,6 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from nullsim.physics import kolmogorov
 from nullsim.pipeline import (
     Geometry,
     OPDComponent,
@@ -72,21 +71,15 @@ def _expected_stage_arrays(
     r0_500nm_m: float,
     diameter_m: float,
     wavelength_grid_um: tuple[float, ...],
+    airmass: float = 1.0,
 ) -> dict[str, np.ndarray]:
+    """Hand formulas: r0 = r0_500 (lambda/500 nm)^(6/5) X^(-3/5) and the
+    Noll (1976) piston-removed variance 1.0299 (D/r0)^(5/3)."""
     wavelength_grid_m = np.asarray(wavelength_grid_um, dtype=np.float64) * 1.0e-6
-    r0_scaled_m = kolmogorov.r0_scaled(r0_500nm_m, wavelength_grid_m)
-    phase_variance_rad2 = kolmogorov.phase_variance(
-        diameter_m,
-        r0_scaled_m,
-        piston_removed=True,
-    )
-    opd_rms_m = kolmogorov.opd_rms_m(
-        diameter_m,
-        r0_scaled_m,
-        wavelength_grid_m,
-        piston_removed=True,
-    )
-    strehl_ratio = kolmogorov.strehl_marechal(opd_rms_m, wavelength_grid_m)
+    r0_scaled_m = r0_500nm_m * (wavelength_grid_m / 500.0e-9) ** 1.2 * airmass**-0.6
+    phase_variance_rad2 = 1.0299 * (diameter_m / r0_scaled_m) ** (5.0 / 3.0)
+    opd_rms_m = np.sqrt(phase_variance_rad2) * wavelength_grid_m / (2.0 * math.pi)
+    strehl_ratio = np.exp(-phase_variance_rad2)
     return {
         "r0_scaled_m": np.asarray(r0_scaled_m),
         "phase_variance_rad2": np.asarray(phase_variance_rad2),
@@ -132,6 +125,34 @@ def test_kolmogorov_screens_matches_physics_primitives(
     assert atmosphere_opd.reduction_stage == "kolmogorov_screens"
     assert state.opd_budget.total_rms_opd_nm == pytest.approx(
         expected["opd_rms_nm"][0],
+    )
+
+
+def test_kolmogorov_screens_degrades_r0_with_airmass(
+    stage_run_context: RunContext,
+) -> None:
+    """At altitude 30 deg (airmass 2) r0 shrinks by 2^(-3/5), as in the AO
+    stage, and the variance grows by 2^(5/3 * 3/5) = 2."""
+
+    state = _scene_geometry_state(wavelength_grid_um=(1.25, 1.65), diameter_m=4.0)
+    state = replace(state, scene=replace(state.scene, altitude_deg=30.0))
+    stage = _build_kolmogorov_screens(stage_run_context)
+
+    component = stage.apply(state).wavefront.components["atmosphere"]
+
+    expected = _expected_stage_arrays(
+        r0_500nm_m=0.16,
+        diameter_m=4.0,
+        wavelength_grid_um=(1.25, 1.65),
+        airmass=2.0,
+    )
+    zenith = _expected_stage_arrays(
+        r0_500nm_m=0.16, diameter_m=4.0, wavelength_grid_um=(1.25, 1.65),
+    )
+    assert component["airmass"] == pytest.approx(2.0)
+    assert component["r0_scaled_m"] == pytest.approx(tuple(expected["r0_scaled_m"]))
+    assert component["phase_variance_rad2"] == pytest.approx(
+        tuple(2.0 * zenith["phase_variance_rad2"])
     )
 
 
@@ -203,7 +224,8 @@ def test_bad_seeing_limit_has_low_j_band_strehl(stage_run_context: RunContext) -
 
 
 def test_good_seeing_limit_has_high_h_band_strehl(stage_run_context: RunContext) -> None:
-    state = _scene_geometry_state(wavelength_grid_um=(1.65,), diameter_m=2.0)
+    # r0(H) = 2.1 m, so D = 1 m gives S = exp(-1.0299 * 0.29) = 0.74.
+    state = _scene_geometry_state(wavelength_grid_um=(1.65,), diameter_m=1.0)
     stage = _build_kolmogorov_screens(stage_run_context, r0_500nm_m=0.5)
 
     result = stage.apply(state)

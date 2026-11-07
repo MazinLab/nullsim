@@ -310,6 +310,14 @@ def _upstream_strehl_per_wavelength(
 ) -> NDArray[np.float64]:
     """Return the upstream Strehl on the wavelength grid (defaults to 1.0).
 
+    Prefers ``ao.pyramid_wfs``'s ``subaperture_strehl_ratio``: the residual
+    with the subaperture piston removed. That piston changes the phase of
+    the coupled light, not the coupled power, and the OPD budget already
+    books it for the realized null, so the full-pupil Strehl would charge
+    it twice. The chosen Strehl is republished as the top-level
+    ``wavefront.strehl_ratio`` so downstream coupling stays consistent with
+    the injected field.
+
     Falls back to a unit Strehl spectrum **only** when no upstream
     wavefront-bearing stage has run at all (no components AND no Strehl
     array) — the ``injection.ideal`` stage is also used in the minimal
@@ -325,7 +333,12 @@ def _upstream_strehl_per_wavelength(
     ``state.wavefront`` fully empty.
     """
 
-    strehl = state.wavefront.strehl_ratio
+    ao_residual = state.wavefront.components.get("ao_residual")
+    strehl = (
+        ao_residual.get("subaperture_strehl_ratio")
+        if isinstance(ao_residual, dict)
+        else None
+    ) or state.wavefront.strehl_ratio
     if not strehl:
         if state.wavefront.components:
             raise ValueError(

@@ -809,6 +809,17 @@ def _piston_filter_fraction(
 ) -> float:
     """KILO atmosphere.py _piston_filter_fraction Bessel piston integral.
 
+    Fraction of the radially integrated PSD ``k^p * k`` on
+    ``[k_low, k_high]`` that survives the piston filter
+    ``(2 J1(pi k d) / (pi k d))^2`` (aperture-average piston filter). The
+    unfiltered denominator is the closed form
+    ``(k_high^(p+2) - k_low^(p+2)) / (p+2)``; for the temporal term
+    (``p = -5/3``, ``k_low = 0``) that is ``3 k_c^(1/3)``. Both integrals
+    start at ``k_low`` itself: the ``k^(-2/3)`` endpoint singularity is
+    integrable and QUADPACK handles it, whereas the former ``1e-6``
+    lower clamp dropped ``3 (1e-6)^(1/3) = 0.03`` from both integrals and
+    biased the fraction low by ~1%.
+
     lru-cached on raw float inputs. The quantized-input scheme documented
     by Code Review 2026-05-16 Issue 61 was never implemented; in practice
     ``d_sub`` comes from one deterministic derivation per run, so
@@ -822,7 +833,7 @@ def _piston_filter_fraction(
     if k_high_m_inv <= k_low_m_inv or k_low_m_inv < 0.0:
         return 0.0
 
-    lower = max(k_low_m_inv, 1.0e-6)
+    lower = k_low_m_inv
     j1_zeros = np.array([3.8317, 7.0156, 10.1735, 13.3237, 16.4706])
     k_zeros = j1_zeros / (math.pi * piston_subaperture_diameter_m)
     breakpoints = k_zeros[(k_zeros > lower) & (k_zeros < k_high_m_inv)]
@@ -842,14 +853,8 @@ def _piston_filter_fraction(
             limit=100,
         )
         numerator += value
-    denominator, _ = quad(
-        lambda k_m_inv: k_m_inv**psd_exponent * k_m_inv,
-        lower,
-        k_high_m_inv,
-        limit=100,
-    )
-    if denominator <= 0.0:
-        return 0.0
+    power = psd_exponent + 2.0
+    denominator = (k_high_m_inv**power - lower**power) / power
     return float(max(0.0, min(1.0, numerator / denominator)))
 
 
@@ -951,6 +956,13 @@ def _wavefront_component(
     airmass: float = 1.0,
     airmass_source: str = "params.airmass",
 ) -> dict[str, Any]:
+    # A piston uniform over the coupled subaperture shifts the phase of the
+    # light it couples into a single-mode fiber, not the coupled power, and
+    # the OPD budget already books it for the realized null. SMF coupling
+    # therefore sees only the piston-removed residual over the subaperture:
+    # S_sub = exp(-(sigma2_total - sigma2_piston,sub)) (Ruilier & Cassaing
+    # 2001, coupling with residual phase variance; Marechal form).
+    subaperture_rad2 = residuals.total_rad2 - piston.total_rad2
     return {
         "aperture_diameter_m": aperture_diameter_m,
         "actuator_pitch_m": actuator_pitch_m,
@@ -1017,6 +1029,10 @@ def _wavefront_component(
         "n_subapertures_per_aperture": params.n_subapertures_per_aperture,
         "pupil_template": params.pupil_template,
         "strehl_ratio": _float_tuple(residuals.strehl_ratio),
+        "subaperture_residual_phase_variance_rad2": _float_scalar_or_tuple(
+            subaperture_rad2
+        ),
+        "subaperture_strehl_ratio": _float_tuple(np.exp(-subaperture_rad2)),
         # Marechal S = exp(-sigma^2) is only accurate for sigma^2 below
         # ~2 rad^2; at the faint end of an NGS J-mag sweep the residual can
         # exceed that, making the published Strehl pessimistic (review
