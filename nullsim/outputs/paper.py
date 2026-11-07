@@ -1767,10 +1767,10 @@ def _survey_rows(collection: RunCollection) -> list[dict[str, Any]]:
                 )
                 char_curve = _char_curve_rescaled_to_cell(
                     _find_component(char_record, "characterization.detection_curve"),
-                    donor_sensitivity=_find_component(
-                        char_record, "sensitivity.detection_curve"
+                    donor_spectro=_find_component(
+                        char_record, "characterization.spectro"
                     ),
-                    cell_sensitivity=sensitivity,
+                    cell_spectro=char,
                 )
                 char = _find_component(char_record, "characterization.spectro")
                 char_record_jmag = _record_jmag(char_record)
@@ -1793,6 +1793,8 @@ def _survey_rows(collection: RunCollection) -> list[dict[str, Any]]:
             stellar_rate_scale=char_rate_scale,
             curve_expected=curve_expected,
         ))
+        char_source = char if char is not None else char_curve
+        n_spectro_ports = 0 if char_source is None else _spectro_port_count(char_source)
         radius = float(planet.radius_rearth)
         if not np.isfinite(radius) and raw is not None:
             mass = _float_value(raw, "pl_bmasse")
@@ -1862,6 +1864,24 @@ def _survey_rows(collection: RunCollection) -> list[dict[str, Any]]:
                 char, "spectro_leak_fraction", default=0.0
             ),
             "char_snr_4h": float(char_snr),
+            # Spectro-port background for the characterization PDI: sky is the
+            # arm total per logical port, dark the per-port rate in the
+            # stage's D budget.
+            "char_n_spectro_ports": n_spectro_ports,
+            "char_sky_rate_per_spectro_port": _first_float(
+                char_curve,
+                "sky_rate_hz_per_spectro_port",
+                default=_first_float(char, "sky_rate_hz_per_spectro_port", default=0.0),
+            ),
+            "char_dark_rate_per_spectro_port": (
+                _char_dark_rate_hz_per_port(
+                    char,
+                    integration_time_s=_integration_time_s_for_record(char_record),
+                    n_spectro_ports=n_spectro_ports,
+                )
+                if char is not None
+                else 0.0
+            ),
             # Largest R with per-bin SNR >= 3, computed per planet from its
             # characterization rates (previously this column copied the
             # scene-level max_spectral_resolution, identical for every row).
@@ -1923,6 +1943,9 @@ def _exoplanet_table_columns() -> list[str]:
         "char_spectro_leak_fraction",
         "char_snr_4h",
         "char_max_R",
+        "char_n_spectro_ports",
+        "char_sky_rate_per_spectro_port",
+        "char_dark_rate_per_spectro_port",
     ]
 
 
@@ -2058,8 +2081,9 @@ def _latex_characterization_table(
             r" Hosts whose nearest simulated $J$ cell has no characterization "
             r"curve use the chip throughput and static leak of the nearest "
             r"cell that has one, with its realized leakage floor scaled by "
-            r"the ratio of the two cells' realized null excess, and with the "
-            r"systematic $\epsilon$ and bandwidth of the host's own cell."
+            r"the ratio of the two cells' retuned spectro floors, and with "
+            r"the systematic $\epsilon$ and bandwidth of the host's own "
+            r"retuned spectro port."
         )
     if any(row.get("host_jmag_outside_sweep") for row in rows):
         notes += (
@@ -2154,9 +2178,24 @@ def _pdi_row(row: dict[str, Any], collection: RunCollection) -> dict[str, Any] |
     snr_pdi = _signal_to_noise_pdi_rates(
         planet, leakage, tint, pol, n_dark, sky_rate_hz=sky, dark_rate_hz=dark
     )
-    # The characterization rates are spectro port rates; the survey row
-    # carries no spectro port background, so none is charged here.
-    snr_char = _signal_to_noise_pdi_rates(char_planet, char_leakage, tint, pol, n_dark)
+    # Characterization rates are spectro port rates: charge the spectro
+    # ports' background. The primitive sums per-arm rates over 2 arms, so the
+    # arm-total sky and the per-port dark are split evenly across the arms.
+    n_spectro = int(row.get("char_n_spectro_ports") or 0)
+    if n_spectro > 0:
+        snr_char = _signal_to_noise_pdi_rates(
+            char_planet,
+            char_leakage,
+            tint,
+            pol,
+            n_spectro,
+            sky_rate_hz=0.5 * float(row.get("char_sky_rate_per_spectro_port") or 0.0),
+            dark_rate_hz=0.5 * float(row.get("char_dark_rate_per_spectro_port") or 0.0),
+        )
+    else:
+        snr_char = _signal_to_noise_pdi_rates(
+            char_planet, char_leakage, tint, pol, n_dark, sky_rate_hz=sky, dark_rate_hz=dark
+        )
     det = float(row.get("snr_det_4h") or 0.0)
     return {
         "name": row.get("name"),
@@ -2484,13 +2523,14 @@ def _char_max_resolving_power(
     integration_time_s: float,
     eps_systematic: float,
     servo_bw_hz: float,
+    spectro_throughput: float,
 ) -> float:
     """Largest resolving power with per-bin SNR >= 3 (AWG Nyquist binning).
 
-    The characterization planet/leakage rates handed in are already at the
-    spectro output, so ``spectro_throughput=1.0`` avoids double-counting.
-    Capped at the R = 1e4 AWG hardware limit referenced by the paper's
-    headline table.
+    The characterization planet/leakage rates handed in are pre-spectrograph,
+    so ``spectro_throughput`` is the AWG optical throughput in AWG mode and 1
+    otherwise, as ``characterization.spectro`` charges it. Capped at the
+    R = 1e4 AWG hardware limit referenced by the paper's headline table.
     """
 
     from nullsim.physics.spectroscopy import max_spectral_resolution
@@ -2509,7 +2549,7 @@ def _char_max_resolving_power(
     return max_spectral_resolution(
         planet_rate_total_hz=float(planet_rate_hz),
         leakage_rate_total_hz=max(float(leakage_rate_hz), 0.0),
-        spectro_throughput=1.0,
+        spectro_throughput=float(spectro_throughput),
         band_lambda_m=band_lambda_m,
         band_bandwidth_m=band_bandwidth_m,
         integration_time_s=float(integration_time_s),
@@ -2519,6 +2559,14 @@ def _char_max_resolving_power(
         servo_bandwidth_hz=max(float(servo_bw_hz), 0.0),
         sky_rate_hz_per_spectro_port=max(float(sky_rate_hz_per_port), 0.0),
     )
+
+
+def _awg_throughput(char: Mapping[str, Any] | None) -> float:
+    """AWG optical throughput of a ``characterization.spectro`` payload, else 1."""
+
+    if char is None or char.get("spectrograph") != "awg":
+        return 1.0
+    return _first_float(char.get("awg"), "throughput", default=1.0)
 
 
 def _characterization_rates_for_planet(
@@ -2636,6 +2684,7 @@ def _characterization_rates_for_planet(
         integration_time_s=integration_time_s,
         eps_systematic=eps_systematic,
         servo_bw_hz=servo_bw_hz,
+        spectro_throughput=_awg_throughput(char),
     )
     return (
         float(planet_rate_hz),
@@ -2702,6 +2751,16 @@ def _characterization_curve_estimate_for_planet(
         "eps_systematic",
         default=_first_float(char, "eps_systematic", default=null_instability),
     )
+    # The curve publishes each anchor's retuned-port leak CV; use the one at
+    # the planet's separation when it is defined there.
+    eps_per_anchor = _payload_vector(char_curve, "eps_systematic_per_anchor")
+    seps = _payload_vector(char_curve, "separations_mas")
+    if eps_per_anchor is not None and seps is not None and seps.shape == eps_per_anchor.shape:
+        eps_at = _interp_gapped(
+            seps, eps_per_anchor, np.isfinite(eps_per_anchor), planet_separation_mas
+        )
+        if np.isfinite(eps_at):
+            eps_systematic = eps_at
     servo_bw_hz = _first_float(
         char_curve,
         "servo_bw_hz",
@@ -2733,6 +2792,7 @@ def _characterization_curve_estimate_for_planet(
         integration_time_s=integration_time_s,
         eps_systematic=eps_systematic,
         servo_bw_hz=servo_bw_hz,
+        spectro_throughput=_awg_throughput(char),
     )
     return (
         float(planet_rate_hz),
@@ -2745,36 +2805,31 @@ def _characterization_curve_estimate_for_planet(
 def _char_curve_rescaled_to_cell(
     donor_curve: Mapping[str, Any],
     *,
-    donor_sensitivity: Mapping[str, Any] | None,
-    cell_sensitivity: Mapping[str, Any] | None,
+    donor_spectro: Mapping[str, Any] | None,
+    cell_spectro: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Carry a characterization curve from a donor J cell to the host's cell.
 
     The retuned chip's throughput and static leak transfer between cells. The
-    realized (piston and scintillation) floor, eps, and the systematic
-    bandwidth do not: all three follow the fringe tracker's photon budget.
+    realized floor, eps, and the systematic bandwidth do not: they follow the
+    fringe tracker's photon budget and the setpoint trim. Each cell's
+    ``characterization.spectro`` retunes the chip at its own J, so:
 
-    - floor: scaled by the ratio of the two cells' realized-null excess over
-      the ideal chip null, ``realized_null_depth - ideal_chip_null_depth``.
-    - eps: the stage forms ``hypot(null_instability / nsc_reduction, speckle)``
-      (``_combined_systematic_eps``), so swapping the donor's sensitivity null
-      instability for the cell's keeps the donor's speckle term.
-    - bandwidth: the cell's ``effective_systematic_bandwidth_hz``, as the
-      stage reads it.
+    - floor: scaled by the ratio of the cells' spectro ``realized_spectro_floor``
+      (direct retuned measurements, setpoint-trim leakage included).
+    - eps: the host cell's spectro ``eps_systematic`` (the retuned port's own
+      leak CV); the donor's per-anchor eps is dropped.
+    - bandwidth: the host cell's spectro ``servo_bw_hz`` (0 without fringe
+      tracking) and ``with_fringe_tracking``.
     """
 
     curve = dict(donor_curve)
-    if donor_sensitivity is None or cell_sensitivity is None:
+    if donor_spectro is None or cell_spectro is None:
         return curve
 
-    def excess(sensitivity: Mapping[str, Any]) -> float:
-        return _first_float(sensitivity, "realized_null_depth") - _first_float(
-            sensitivity, "ideal_chip_null_depth"
-        )
-
-    donor_excess = excess(donor_sensitivity)
-    ratio = excess(cell_sensitivity) / donor_excess if donor_excess > 0.0 else 1.0
-    if np.isfinite(ratio):
+    donor_floor = _first_float(donor_spectro, "realized_spectro_floor")
+    ratio = _first_float(cell_spectro, "realized_spectro_floor") / donor_floor
+    if np.isfinite(ratio) and donor_floor > 0.0:
         floor = _payload_vector(curve, "realized_spectro_floor_per_anchor")
         static = _payload_vector(curve, "spectro_static_leak_fraction_per_anchor")
         if floor is not None and static is not None:
@@ -2783,19 +2838,10 @@ def _char_curve_rescaled_to_cell(
         if curve.get("realized_spectro_floor") is not None:
             curve["realized_spectro_floor"] = float(curve["realized_spectro_floor"]) * ratio
 
-    nsc = _first_float(curve, "nsc_systematic_reduction", default=1.0)
-    eps_donor = _first_float(curve, "eps_systematic", default=float("nan"))
-    ni_donor = _first_float(donor_sensitivity, "null_instability", default=0.0)
-    ni_cell = _first_float(cell_sensitivity, "null_instability", default=float("nan"))
-    if np.isfinite(eps_donor) and np.isfinite(ni_cell) and nsc > 0.0:
-        curve["eps_systematic"] = float(
-            np.sqrt(max(eps_donor**2 + (ni_cell**2 - ni_donor**2) / nsc**2, 0.0))
-        )
-    bandwidth = _first_float(
-        cell_sensitivity, "effective_systematic_bandwidth_hz", default=float("nan")
-    )
-    if np.isfinite(bandwidth) and bandwidth > 0.0:
-        curve["servo_bw_hz"] = bandwidth
+    for key in ("eps_systematic", "servo_bw_hz", "with_fringe_tracking"):
+        if cell_spectro.get(key) is not None:
+            curve[key] = cell_spectro[key]
+    curve.pop("eps_systematic_per_anchor", None)
     return curve
 
 

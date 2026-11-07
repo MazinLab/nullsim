@@ -426,12 +426,12 @@ def test_char_curve_single_surviving_anchor_is_valid_only_at_its_separation(
 def test_char_curve_rescaled_to_cell_moves_floor_eps_and_bandwidth() -> None:
     """Review 2026-11-07 Issue 14: a borrowed curve keeps the donor chip's
     throughput and static leak but takes the floor, eps, and bandwidth from
-    the host's J cell.
+    the host cell's retuned ``characterization.spectro``.
 
-    Hand values: donor excess 1e-5 - 1e-6 = 9e-6, cell excess 3.7e-5 - 1e-6
-    = 3.6e-5, so the floor scales 4x. Donor eps 0.05 with nsc = 2 and
-    null instability 0.06 leaves a speckle term sqrt(0.05^2 - 0.03^2) = 0.04;
-    the cell's null instability 0.18 gives hypot(0.09, 0.04) = sqrt(0.0097).
+    Hand values: spectro floors 3e-6 (donor) and 1.2e-5 (host) scale the
+    per-anchor floor 4x, so leak = static + 4 floor = [8.1e-6, 16.2e-6].
+    eps and bandwidth are copied from the host spectro; the donor's
+    per-anchor eps must not survive.
     """
 
     from nullsim.outputs.paper import _char_curve_rescaled_to_cell
@@ -443,25 +443,19 @@ def test_char_curve_rescaled_to_cell_moves_floor_eps_and_bandwidth() -> None:
         "spectro_leak_fraction_per_anchor": np.array([2.1e-6, 4.2e-6]),
         "realized_spectro_floor": 3.0e-6,
         "eps_systematic": 0.05,
-        "nsc_systematic_reduction": 2.0,
+        "eps_systematic_per_anchor": np.array([0.04, 0.06]),
+        "servo_bw_hz": 3784.0,
     }
-    donor_sensitivity = {
-        "realized_null_depth": 1.0e-5,
-        "ideal_chip_null_depth": 1.0e-6,
-        "null_instability": 0.06,
-        "effective_systematic_bandwidth_hz": 3784.0,
-    }
-    cell_sensitivity = {
-        "realized_null_depth": 3.7e-5,
-        "ideal_chip_null_depth": 1.0e-6,
-        "null_instability": 0.18,
-        "effective_systematic_bandwidth_hz": 925.0,
+    donor_spectro = {"realized_spectro_floor": 3.0e-6, "eps_systematic": 0.05}
+    cell_spectro = {
+        "realized_spectro_floor": 1.2e-5,
+        "eps_systematic": 0.098,
+        "servo_bw_hz": 0.0,
+        "with_fringe_tracking": False,
     }
 
     curve = _char_curve_rescaled_to_cell(
-        donor_curve,
-        donor_sensitivity=donor_sensitivity,
-        cell_sensitivity=cell_sensitivity,
+        donor_curve, donor_spectro=donor_spectro, cell_spectro=cell_spectro
     )
 
     np.testing.assert_allclose(curve["spectro_throughput_per_anchor"], [0.3, 0.5])
@@ -469,35 +463,167 @@ def test_char_curve_rescaled_to_cell_moves_floor_eps_and_bandwidth() -> None:
         curve["spectro_leak_fraction_per_anchor"], [8.1e-6, 16.2e-6]
     )
     assert curve["realized_spectro_floor"] == pytest.approx(1.2e-5)
-    assert curve["eps_systematic"] == pytest.approx(np.sqrt(0.0097))
-    assert curve["servo_bw_hz"] == pytest.approx(925.0)
+    assert curve["eps_systematic"] == pytest.approx(0.098)
+    assert "eps_systematic_per_anchor" not in curve
+    assert curve["servo_bw_hz"] == 0.0
+    assert curve["with_fringe_tracking"] is False
     # The donor payload is left untouched.
     np.testing.assert_allclose(
         donor_curve["spectro_leak_fraction_per_anchor"], [2.1e-6, 4.2e-6]
     )
 
 
+def test_char_curve_eps_is_interpolated_per_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The curve's per-anchor eps (each anchor's retuned-port leak CV) is used
+    at the planet's separation: 0.02 and 0.06 at 10 and 20 mas give 0.04 at
+    15 mas, not the 0.5 scalar median."""
+
+    import nullsim.stages.performance.standard as standard
+
+    captured: dict[str, float] = {}
+    real = standard._compute_snr
+
+    def spy(**kwargs: object) -> dict:
+        captured["eps"] = float(kwargs["eps"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(standard, "_compute_snr", spy)
+    record = _collection(_config(), _state(), tmp_path).records[0]
+    char_curve = {
+        "detected_stellar_rate_hz": 1.0e6,
+        "separations_mas": np.array([10.0, 20.0]),
+        "spectro_throughput_per_anchor": np.array([0.5, 0.5]),
+        "spectro_leak_fraction_per_anchor": np.array([1.0e-3, 1.0e-3]),
+        "eps_systematic": 0.5,
+        "eps_systematic_per_anchor": np.array([0.02, 0.06]),
+        "servo_bw_hz": 0.0,
+    }
+    kwargs = dict(
+        record=record,
+        char=None,
+        planet_contrast=1.0e-4,
+        fallback_planet_rate_hz=0.0,
+        fallback_leakage_rate_hz=0.0,
+    )
+
+    _characterization_rates_for_planet(
+        char_curve=char_curve, planet_separation_mas=15.0, **kwargs
+    )
+    assert captured["eps"] == pytest.approx(0.04)
+
+    scalar_only = {k: v for k, v in char_curve.items() if k != "eps_systematic_per_anchor"}
+    _characterization_rates_for_planet(
+        char_curve=scalar_only, planet_separation_mas=15.0, **kwargs
+    )
+    assert captured["eps"] == pytest.approx(0.5)
+
+
+def test_char_max_r_charges_awg_throughput(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review 2026-11-07 row 31: the paper's max R uses the AWG throughput in
+    AWG mode (pre-spectrograph rates), and 1 otherwise."""
+
+    import nullsim.physics.spectroscopy as spectroscopy
+    from nullsim.outputs.paper import _awg_throughput
+
+    seen: list[float] = []
+
+    def fake_max_r(**kwargs: object) -> float:
+        seen.append(float(kwargs["spectro_throughput"]))
+        return 100.0
+
+    monkeypatch.setattr(spectroscopy, "max_spectral_resolution", fake_max_r)
+    record = _collection(_config(), _state(), tmp_path).records[0]
+    base = {
+        "detected_stellar_rate_hz": 1.0e6,
+        "spectro_throughput": 0.25,
+        "spectro_band_leak_fraction": 1.0e-5,
+        "D": 0.0,
+        "servo_bw_hz": 0.0,
+        "spectro_indices": np.array([1], dtype=np.intp),
+    }
+    for char in (
+        {**base, "spectrograph": "awg", "awg": {"throughput": 0.7}},
+        {**base, "spectrograph": "mkid"},
+    ):
+        _characterization_rates_for_planet(
+            record=record,
+            char=char,
+            planet_contrast=1.0e-7,
+            planet_separation_mas=10.0,
+            fallback_planet_rate_hz=0.0,
+            fallback_leakage_rate_hz=0.0,
+        )
+
+    assert seen == [pytest.approx(0.7), pytest.approx(1.0)]
+    assert _awg_throughput(None) == 1.0
+
+
+def test_char_pdi_charges_spectro_port_background(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review 2026-11-07 row 58: the characterization PDI charges the spectro
+    ports' sky and dark with the spectro port count. The primitive sums
+    per-arm rates over two arms, so the arm-total sky 4 Hz and dark 2 Hz per
+    port enter as 2 and 1 Hz per arm on 3 ports (totals 12 and 6 Hz, the
+    characterization stage's Sky and D budgets)."""
+
+    import nullsim.physics.pdi as pdi
+    from nullsim.outputs.paper import _pdi_row
+
+    calls: list[dict[str, object]] = []
+
+    def fake_signal_to_noise_pdi(**kwargs: object) -> float:
+        calls.append(kwargs)
+        return 1.0
+
+    monkeypatch.setattr(pdi, "signal_to_noise_pdi", fake_signal_to_noise_pdi)
+    row = {
+        "name": "p",
+        "radius_rearth": 10.0,
+        "planet_signal_rate_dark": 4.0,
+        "leakage_rate_dark": 100.0,
+        "sky_rate_per_dark_port": 9.0,
+        "char_planet_signal_rate": 1.0,
+        "char_leakage_rate": 10.0,
+        "char_n_spectro_ports": 3,
+        "char_sky_rate_per_spectro_port": 4.0,
+        "char_dark_rate_per_spectro_port": 2.0,
+    }
+    _pdi_row(row, _collection(_config(), _state(), tmp_path))
+
+    detection, characterization = calls
+    assert detection["sky_rate_hz_per_dark_port_per_arm"] == pytest.approx(9.0)
+    assert characterization["n_dark_ports_per_arm"] == 3
+    assert characterization["sky_rate_hz_per_dark_port_per_arm"] == pytest.approx(2.0)
+    assert characterization["dark_rate_hz_per_port_per_arm"] == pytest.approx(1.0)
+
+
 def test_survey_rows_rescale_borrowed_char_floor_and_flag_rows(
     tmp_path: Path,
 ) -> None:
     """End to end through ``_survey_rows``: hosts nearest a curveless J=6 cell
-    borrow the J=4 chip with the J=6 floor, and are flagged."""
+    borrow the J=4 chip with the J=6 spectro floor, and are flagged."""
 
     from nullsim.outputs.paper import _survey_rows
 
     anchors = np.array([0.1, 1.0e7])
 
-    def cell(jmag: float, *, excess: float, with_curve: bool) -> RunRecord:
+    def cell(jmag: float, *, spectro_floor: float, with_curve: bool) -> RunRecord:
         results = Results().add_component(
             "performance.standard", {"stellar_rate_hz_total": 1.0e6}
         )
         results = results.add_component(
-            "sensitivity.detection_curve",
+            "characterization.spectro",
             {
-                "realized_null_depth": 1.0e-6 + excess,
-                "ideal_chip_null_depth": 1.0e-6,
-                "null_instability": 0.0,
-                "effective_systematic_bandwidth_hz": 1000.0,
+                "realized_spectro_floor": spectro_floor,
+                "eps_systematic": 0.0,
+                "servo_bw_hz": 1000.0,
+                "spectro_indices": np.array([1], dtype=np.intp),
+                "D": 0.0,
             },
         )
         if with_curve:
@@ -529,8 +655,8 @@ def test_survey_rows_rescale_borrowed_char_floor_and_flag_rows(
     collection = RunCollection(
         config=_config(),
         records=(
-            cell(4.0, excess=1.0e-5, with_curve=True),
-            cell(6.0, excess=3.0e-5, with_curve=False),
+            cell(4.0, spectro_floor=1.0e-5, with_curve=True),
+            cell(6.0, spectro_floor=3.0e-5, with_curve=False),
         ),
         output_dir=tmp_path,
     )
@@ -549,7 +675,7 @@ def test_survey_rows_rescale_borrowed_char_floor_and_flag_rows(
         assert np.isnan(row["char_floor_scaled_from_jmag"])
 
     caption = _latex_characterization_table({"Rocky": borrowed[:1]})
-    assert "realized null excess" in caption
+    assert "retuned spectro floors" in caption
 
 
 def test_pdi_displayed_snr_sorts_finite_first_and_sinks_nan() -> None:

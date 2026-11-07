@@ -8,12 +8,20 @@ Paper bundle (`nullsim/outputs/paper.py`):
 - **Borrowed characterization curves (Issue 14).** A host whose nearest J
   cell skipped its characterization curve still borrows the nearest
   curve-bearing cell's chip throughput and static leak, but the realized
-  spectro floor is now scaled by the ratio of the two cells' realized-null
-  excess (`realized_null_depth - ideal_chip_null_depth`), and eps and the
-  systematic bandwidth come from the host's own cell. New survey columns
+  spectro floor is now scaled by the ratio of the two cells'
+  `characterization.spectro` `realized_spectro_floor` (direct retuned
+  measurements, setpoint-trim leakage included), and eps, `servo_bw_hz`,
+  and `with_fringe_tracking` come from the host cell's spectro payload. In
+  the archived July kilo_keck_6 run these floor ratios are 3.5 (J6/J4),
+  5.9 (J10/J8), and 61 (J12/J8). New survey columns
   `char_floor_scaled_from_jmag` (donor J, NaN when not borrowed) and
   `host_jmag_outside_sweep` (edge cell used without extrapolation); the
   characterization table caption says so when shown rows use either.
+- **Characterization eps and max R.** A host with its own curve takes
+  eps from `eps_systematic_per_anchor` interpolated at the planet's
+  separation (scalar median as fallback). The recomputed characterization
+  max R charges the AWG optical throughput in AWG mode (row 31), as
+  `characterization.spectro` does, instead of 1.
 - **Dual polarization factor (Issue 15).** The 0.87 scalar to dual
   polarization factor now applies only to pipelines without
   `polarization.*` stages, and the characterization fallback no longer
@@ -23,6 +31,10 @@ Paper bundle (`nullsim/outputs/paper.py`):
   row's sky and detector dark per dark port (new `dark_rate_per_dark_port`
   survey column; both carried into the PDI tables). tau Boo b 8.480 to
   8.463, GJ 3512 b 0.03224 to 0.03199 (from the archived July survey rates).
+  The characterization PDI now charges the spectro ports' sky
+  (`sky_rate_hz_per_spectro_port`, arm total) and dark with the spectro
+  port count; new survey columns `char_n_spectro_ports`,
+  `char_sky_rate_per_spectro_port`, `char_dark_rate_per_spectro_port`.
 - **Survey interpolation (row 59).** Failed anchors and infinite contrasts
   are gaps that are never bridged, a single surviving anchor holds only at
   its own separation, and planets outside the evaluated grid get NaN
