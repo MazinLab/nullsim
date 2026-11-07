@@ -33,6 +33,7 @@ from nullsim.physics.spectroscopy import (
     per_bin_snr,
 )
 from nullsim.pipeline import BaseStage, SimulationState, register_stage
+from nullsim.stages.background.nayra_sky import _diffuse_port_routing
 from nullsim.stages._utils import (
     mode_origin_positions_m,
     project_aperture_positions_for_pointing,
@@ -579,7 +580,13 @@ class SpectroCharacterization(BaseStage):
         servo_bw_hz = _servo_bw_hz(sensitivity, params)
         n_pol_arms, sky_rate_hz_per_spectro_arm, sky_rate_hz_per_spectro_port, (
             sky_rate_source
-        ) = _spectro_sky_rate_hz(state, detector, params.n_sky_background_hz)
+        ) = _spectro_sky_rate_hz(
+            state,
+            detector,
+            params.n_sky_background_hz,
+            u_stack=u_stack,
+            spectro_idx=spectro_idx,
+        )
         snr_breakdown = _compute_snr(
             planet_rate_hz=planet_signal_rate_hz,
             leakage_rate_hz=leakage_rate_hz,
@@ -885,6 +892,9 @@ def _spectro_sky_rate_hz(
     state: SimulationState,
     detector: dict[str, Any],
     configured_rate_hz_per_port: float,
+    *,
+    u_stack: NDArray[np.complex128],
+    spectro_idx: NDArray[np.intp],
 ) -> tuple[int, float, float, str]:
     """Return ``(n_pol_arms, sky per arm, sky per logical spectro port, source)``.
 
@@ -893,6 +903,11 @@ def _spectro_sky_rate_hz(
     from ``n_pol_arms`` PBS arms, each carrying that sky, while the spectro
     stellar and planet rates are arm totals; charge every arm, as
     ``performance.standard`` counts every dark channel.
+
+    A background stage that publishes ``sky_rate_hz_per_input_mode`` gets
+    its sky re-routed through the retuned chip ``u_stack``: the published
+    spectro value is the all-output mean, but a retuned spectro row can add
+    coherent splitter copies in phase (review 2026-11-07 Issue 11).
     """
 
     sky_per_arm_hz, source = _resolve_background_rate_hz_per_port(
@@ -900,8 +915,73 @@ def _spectro_sky_rate_hz(
         configured_rate_hz_per_port=configured_rate_hz_per_port,
         port_kind="spectro",
     )
+    background = state.results.components.get(source)
+    if isinstance(background, dict) and "sky_rate_hz_per_input_mode" in background:
+        published_sky = float(background["sky_rate_hz_per_spectro_port"])
+        additive_hz = float(
+            background.get("background_rate_hz_per_spectro_port", published_sky)
+        ) - published_sky
+        sky_per_arm_hz = (
+            _retuned_spectro_sky_per_arm_hz(state, background, u_stack, spectro_idx)
+            + additive_hz
+        )
+        source = f"{source} routed through the retuned spectro rows"
     n_pol_arms = max(int(detector.get("n_pol_arms") or 1), 1)
     return n_pol_arms, sky_per_arm_hz, sky_per_arm_hz * n_pol_arms, source
+
+
+def _retuned_spectro_sky_per_arm_hz(
+    state: SimulationState,
+    background: dict[str, Any],
+    u_stack: NDArray[np.complex128],
+    spectro_idx: NDArray[np.intp],
+) -> float:
+    """Diffuse sky per arm in one retuned spectro port.
+
+    ``sum_w P_w mean_s sum_k |(U_char S)_{s,k}|^2``, where ``P_w`` is the
+    sky per physical input per bin and ``S`` the splitter isometry, evaluated
+    by the background stage's own ``_diffuse_port_routing`` with the retuned
+    stack as the newest chip.
+    """
+
+    n_bins = int(u_stack.shape[2])
+    retuned = replace(
+        state,
+        results=state.results.add_component(
+            "chip.characterization_retune", {"u_stack": u_stack},
+        ),
+    )
+    routing = _diffuse_port_routing(retuned, n_bins)[0]
+    spectro_share = np.mean(routing[spectro_idx], axis=0)
+    return float(spectro_share @ _sky_per_input_per_bin_hz(background, n_bins))
+
+
+def _sky_per_input_per_bin_hz(
+    background: dict[str, Any],
+    n_bins: int,
+) -> NDArray[np.float64]:
+    """Per-bin sky per physical input, recovered from the background payload.
+
+    The stage publishes only the band sum, but its per-bin dark sky is that
+    rate times the published dark-row routing share, so dividing recovers it.
+    Without a usable dark share, spread the band sum evenly over the bins.
+    """
+
+    total_hz = float(background["sky_rate_hz_per_input_mode"])
+    dark_per_bin = background.get("sky_rate_hz_per_bin")
+    routing = background.get("sky_routing_fraction_per_port")
+    dark_idx = background.get("sky_routing_dark_port_indices")
+    if dark_per_bin is not None and routing is not None and dark_idx is not None:
+        dark_share = np.mean(
+            np.asarray(routing, dtype=np.float64)[np.asarray(dark_idx, dtype=np.intp)],
+            axis=0,
+        )
+        dark_per_bin = np.asarray(dark_per_bin, dtype=np.float64)
+        if dark_share.shape == dark_per_bin.shape == (n_bins,) and np.all(dark_share > 0.0):
+            per_bin = dark_per_bin / dark_share
+            if math.isclose(float(np.sum(per_bin)), total_hz, rel_tol=1.0e-9):
+                return per_bin
+    return np.full(n_bins, total_hz / n_bins, dtype=np.float64)
 
 
 def _result_u_stack_or_build(
@@ -1078,7 +1158,9 @@ def _awg_spectrograph_payload(
 
 
 def _find_sensitivity_component(state: SimulationState) -> tuple[str, dict[str, Any]]:
-    for name, payload in state.results.components.items():
+    # Newest first: the component the latest upstream stage produced wins
+    # (review 2026-11-07 Issue 25).
+    for name, payload in reversed(tuple(state.results.components.items())):
         if not name.startswith(_SENSITIVITY_PREFIX) or not isinstance(payload, dict):
             continue
         required = {
@@ -1102,7 +1184,7 @@ def _find_mkid_detector_component(
     state: SimulationState,
 ) -> tuple[str, dict[str, Any]]:
     missing_resolution: str | None = None
-    for name, payload in state.results.components.items():
+    for name, payload in reversed(tuple(state.results.components.items())):
         if not name.startswith("detector.mkid") or not isinstance(payload, dict):
             continue
         required_base = {"port_rates", "port_labels", "integration_time_s"}
@@ -1324,7 +1406,20 @@ def _realized_spectro_floor_for_stack(
         n_spectro_ports=n_spectro_ports,
     )
     if retuned is not None:
-        retuned_floor, leak_rms = retuned
+        retuned_floor, var_mc, var_phase, dyn_phase = retuned
+        # Issue 19 bias cross term (tests/physics/notes/sensitivity_null.md):
+        # the setpoint/dither phase offset b couples to the random piston as
+        # 4 b^T QCQ b = 2 (sigma_phase^2 / L_phase,dyn) L_b, from a phase-only
+        # MC (scintillation off), since the bias is a phase offset.
+        bias_leakage = _spectro_bias_leakage(
+            sensitivity=sensitivity,
+            n_dark_ports=n_dark_ports,
+            n_spectro_ports=n_spectro_ports,
+        )
+        cross_var = (
+            2.0 * var_phase / dyn_phase * bias_leakage if dyn_phase > 0.0 else 0.0
+        )
+        leak_rms = math.sqrt(var_mc + cross_var)
         return (
             float(retuned_floor + override_extra),
             "retuned spectro unitary realized-null MC using the upstream "
@@ -1404,14 +1499,17 @@ def _retuned_spectro_dynamic_floor(
     spectro_idx: NDArray[np.intp],
     wavelengths_m: NDArray[np.float64],
     stellar_rate_weights: NDArray[np.float64],
-) -> tuple[float, float] | None:
-    """Return the retuned port's photon-weighted dynamic floor and leak RMS.
+) -> tuple[float, float, float, float] | None:
+    """Return the retuned port's band leakage statistics.
 
-    Both use per-realization band leakage ``L_r = sum_k w_k N_kr`` with
-    ``w`` the normalized detected stellar rate per bin: the floor is
-    ``E[L] - L_static`` and the RMS is the within-azimuth standard deviation
-    of ``L_r``. The MC shares one piston draw across wavelength bins, so the
-    bins are paired realizations.
+    Returns ``(floor, var_mc, var_phase, dyn_phase)``. All use
+    per-realization band leakage ``L_r = sum_k w_k N_kr`` with ``w`` the
+    normalized detected stellar rate per bin: the floor is
+    ``E[L] - L_static`` and ``var_mc`` the within-azimuth variance of
+    ``L_r``. ``var_phase`` and ``dyn_phase`` are the same variance and
+    ``E[L] - L_static`` from a phase-only MC (scintillation off, same draws),
+    which set the bias cross term. The MC shares one piston draw across
+    wavelength bins, so the bins are paired realizations.
     """
 
     n_per_az = _optional_int(sensitivity.get("n_realizations_per_azimuth"))
@@ -1426,41 +1524,55 @@ def _retuned_spectro_dynamic_floor(
         sensitivity.get("realized_null_mode_group_indices"),
         n_modes=n_modes,
     )
-    mc = realized_null_depth_mc(
-        u_stack=np.asarray(u_stack, dtype=np.complex128),
-        stellar_field=np.asarray(base_amplitudes, dtype=np.complex128),
-        dark_indices=np.asarray(spectro_idx, dtype=np.intp),
-        ao_piston_opd_rms_per_sub_m=_optional_array_or_scalar(
-            sensitivity.get("ao_piston_opd_rms_per_sub_m"),
-            default=0.0,
-        ),
-        ao_piston_opd_covariance_m2=piston_covariance,
-        wavelengths_m=np.asarray(wavelengths_m, dtype=np.float64),
-        n_realizations_per_azimuth=n_per_az,
-        seed=_optional_int(sensitivity.get("mc_seed")),
-        scintillation_index_per_sub=_optional_array_or_scalar(
-            sensitivity.get("scintillation_index_per_sub"),
-            default=0.0,
-        ),
-        mode_group_indices=mode_group_indices,
-        fiber_phase_noise_rms_rad=float(
-            _optional_float(sensitivity.get("fiber_phase_noise_rms_rad")) or 0.0
-        ),
+    scintillation = _optional_array_or_scalar(
+        sensitivity.get("scintillation_index_per_sub"), default=0.0,
     )
+
+    def run_mc(scintillation_index_per_sub: Any) -> Any:
+        return realized_null_depth_mc(
+            u_stack=np.asarray(u_stack, dtype=np.complex128),
+            stellar_field=np.asarray(base_amplitudes, dtype=np.complex128),
+            dark_indices=np.asarray(spectro_idx, dtype=np.intp),
+            ao_piston_opd_rms_per_sub_m=_optional_array_or_scalar(
+                sensitivity.get("ao_piston_opd_rms_per_sub_m"),
+                default=0.0,
+            ),
+            ao_piston_opd_covariance_m2=piston_covariance,
+            wavelengths_m=np.asarray(wavelengths_m, dtype=np.float64),
+            n_realizations_per_azimuth=n_per_az,
+            seed=_optional_int(sensitivity.get("mc_seed")),
+            scintillation_index_per_sub=scintillation_index_per_sub,
+            mode_group_indices=mode_group_indices,
+            fiber_phase_noise_rms_rad=float(
+                _optional_float(sensitivity.get("fiber_phase_noise_rms_rad")) or 0.0
+            ),
+        )
+
+    mc = run_mc(scintillation)
     if mc.samples_by_wavelength is None:  # MC disabled: no dynamic term
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
     weights = np.asarray(stellar_rate_weights, dtype=np.float64)
     weights = weights / np.sum(weights)
     out = np.einsum("pmk,m->kp", u_stack, base_amplitudes.astype(np.complex128))
     power = np.abs(out) ** 2
-    ideal_per_wl = np.sum(power[:, spectro_idx], axis=1) / np.sum(power, axis=1)
-    samples = mc.samples_by_wavelength.reshape(
-        wavelengths_m.size, mc.n_azimuths, mc.n_realizations_per_azimuth,
+    ideal_band = float(
+        weights @ (np.sum(power[:, spectro_idx], axis=1) / np.sum(power, axis=1))
     )
-    band_leak = np.einsum("k,kar->ar", weights, samples)
-    floor = max(float(np.mean(band_leak) - weights @ ideal_per_wl), 0.0)
-    leak_rms = math.sqrt(float(np.mean(np.var(band_leak, axis=1))))
-    return floor, leak_rms
+
+    def band_stats(result: Any) -> tuple[float, float]:
+        samples = result.samples_by_wavelength.reshape(
+            wavelengths_m.size, result.n_azimuths, result.n_realizations_per_azimuth,
+        )
+        band_leak = np.einsum("k,kar->ar", weights, samples)
+        dynamic = max(float(np.mean(band_leak)) - ideal_band, 0.0)
+        return dynamic, float(np.mean(np.var(band_leak, axis=1)))
+
+    floor, var_mc = band_stats(mc)
+    if np.any(np.asarray(scintillation) > 0.0):
+        dyn_phase, var_phase = band_stats(run_mc(0.0))
+    else:
+        dyn_phase, var_phase = floor, var_mc
+    return floor, var_mc, var_phase, dyn_phase
 
 
 def _spectro_override_extra(
@@ -1475,6 +1587,20 @@ def _spectro_override_extra(
     null_port_count = max(int(n_dark_ports), 1)
     spectro_port_count = max(int(n_spectro_ports), 0)
     return float(override_extra * spectro_port_count / null_port_count)
+
+
+def _spectro_bias_leakage(
+    *,
+    sensitivity: dict[str, Any],
+    n_dark_ports: int,
+    n_spectro_ports: int,
+) -> float:
+    """Spectro ports' share of the setpoint-residual plus dither leakage."""
+
+    bias = float(_optional_float(sensitivity.get("null_setpoint_leakage")) or 0.0) + float(
+        _optional_float(sensitivity.get("setpoint_dither_leakage")) or 0.0
+    )
+    return bias * max(int(n_spectro_ports), 0) / max(int(n_dark_ports), 1)
 
 
 def _detection_floor_override_extra(sensitivity: dict[str, Any]) -> float:

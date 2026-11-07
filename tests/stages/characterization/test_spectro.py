@@ -27,9 +27,11 @@ from nullsim.stages.characterization import (
 from nullsim.stages.characterization.spectro import (
     _band_evaluated_spectro_metrics,
     _characterization_wavelength_grid,
+    _find_sensitivity_component,
     _mc_piston_opd_covariance_m2,
     _realized_spectro_floor_for_stack,
     _realized_spectro_floor,
+    _spectro_sky_rate_hz,
     _static_spectro_leak_fraction,
 )
 import nullsim.stages.characterization.detection_curve as detection_curve_module
@@ -1060,3 +1062,134 @@ def test_spectro_sky_charges_every_polarization_arm(tmp_path: Path) -> None:
     assert payload["sky_rate_hz_per_spectro_arm"] == pytest.approx(100.0)
     assert payload["Sky"] == pytest.approx(200.0 * 100.0)
     assert payload["awg_total_sky_rate_hz"] == pytest.approx(200.0 * 0.5)
+
+
+def test_spectro_sky_is_routed_through_the_retuned_rows() -> None:
+    """Two physical inputs split into four coherent copies (physical index
+    [0, 1, 0, 1]). Spectro row 0 adds input 0's copies in phase in bin 0
+    (share 1) and takes one copy in bin 1 (share 1/2). Per-input sky is
+    [30, 70] Hz, recovered from the published dark sky [15, 17.5] Hz over a
+    dark share [0.5, 0.25]. Per arm: 30 * 1 + 70 * 0.5 + 3 Hz additive = 68 Hz,
+    where the published all-output mean is 50 + 3 Hz."""
+
+    r = 1.0 / np.sqrt(2.0)
+    bin0 = np.array(
+        [[r, 0, r, 0], [r, 0, -r, 0], [0, r, 0, r], [0, r, 0, -r]],
+        dtype=np.complex128,
+    )
+    u_stack = np.stack([bin0, np.eye(4, dtype=np.complex128)], axis=2)
+    detection_routing = np.array(
+        [[0.5, 0.75], [0.5, 0.25], [0.5, 0.5], [0.5, 0.5]]
+    )
+    state = replace(
+        SimulationState.empty({"wavelength_grid_um": (1.2, 1.3)}),
+        geometry=Geometry(
+            components={
+                "injection.mode_splitter": {
+                    "n_input_modes": 2,
+                    "n_output_modes": 4,
+                    "copies": 2,
+                    "physical_mode_indices": np.array([0, 1, 0, 1]),
+                }
+            }
+        ),
+        field=Field(
+            amplitudes=np.ones((4, 2, 1), dtype=np.complex128),
+            wavelength_grid_um=(1.2, 1.3),
+        ),
+        results=Results(
+            components={
+                "background.sky_surface_brightness": {
+                    "sky_rate_hz_per_input_mode": 100.0,
+                    "sky_rate_hz_per_bin": np.array([15.0, 17.5]),
+                    "sky_routing_fraction_per_port": detection_routing,
+                    "sky_routing_dark_port_indices": np.array([1]),
+                    "sky_rate_hz_per_spectro_port": 50.0,
+                    "background_rate_hz_per_spectro_port": 53.0,
+                }
+            }
+        ),
+    )
+
+    n_arms, per_arm, per_port, source = _spectro_sky_rate_hz(
+        state,
+        {"n_pol_arms": 2},
+        0.0,
+        u_stack=u_stack,
+        spectro_idx=np.array([0], dtype=np.intp),
+    )
+
+    assert per_arm == pytest.approx(68.0)
+    assert per_port == pytest.approx(2 * 68.0)
+    assert n_arms == 2
+    assert "retuned" in source
+
+
+def test_spectro_leak_rms_includes_setpoint_bias_cross_term() -> None:
+    """Small-phase Bracewell null L = (D + beta)^2 / 4 with D ~ N(0, 2 s^2):
+    Var L = s^4 / 2 + beta^2 s^2 / 2 exactly, and L_b = beta^2 / 4 is the
+    setpoint leakage the stage reads."""
+
+    wavelength_m = 1.25e-6
+    sigma_rad, beta_rad = 0.02, 0.2
+    sensitivity = {
+        "ao_piston_opd_rms_per_sub_m": sigma_rad * wavelength_m / (2.0 * np.pi),
+        "n_realizations_per_azimuth": 40_000,
+        "mc_seed": 5,
+        "null_setpoint_leakage": beta_rad**2 / 4.0,
+        "setpoint_dither_leakage": 0.0,
+    }
+    kwargs = dict(
+        u_stack=_HADAMARD[:, :, None],
+        base_amplitudes=np.ones(2),
+        spectro_idx=np.array([1], dtype=np.intp),
+        wavelengths_m=np.array([wavelength_m]),
+        stellar_rate_weights=np.ones(1),
+        n_dark_ports=1,
+        n_spectro_ports=1,
+    )
+
+    _, _, leak_rms = _realized_spectro_floor_for_stack(sensitivity=sensitivity, **kwargs)
+
+    assert leak_rms**2 == pytest.approx(
+        sigma_rad**4 / 2.0 + beta_rad**2 * sigma_rad**2 / 2.0, rel=0.04,
+    )
+
+    # The bias is a phase offset: scintillation must not change the cross term
+    # (same seed, so the phase draws are shared).
+    def cross(extra: dict) -> float:
+        biased = _realized_spectro_floor_for_stack(
+            sensitivity={**sensitivity, **extra}, **kwargs,
+        )[2]
+        unbiased = _realized_spectro_floor_for_stack(
+            sensitivity={**sensitivity, **extra, "null_setpoint_leakage": 0.0},
+            **kwargs,
+        )[2]
+        return biased**2 - unbiased**2
+
+    assert cross({"scintillation_index_per_sub": 0.1}) == pytest.approx(
+        cross({}), rel=1.0e-12,
+    )
+
+
+def test_find_sensitivity_component_prefers_newest() -> None:
+    payload = {
+        "coupling_per_sub": np.ones(2),
+        "sub_areas_m2": np.ones(2),
+        "sub_diameters_m": np.ones(2),
+        "effective_null_with_disk": 1.0e-4,
+        "wavelengths_m": (1.25e-6,),
+    }
+    state = replace(
+        SimulationState.empty({}),
+        results=Results(
+            components={
+                "sensitivity.detection_curve": payload,
+                "sensitivity.detection_curve.late": {**payload, "effective_null_with_disk": 2.0e-4},
+            }
+        ),
+    )
+
+    name, _ = _find_sensitivity_component(state)
+
+    assert name == "sensitivity.detection_curve.late"

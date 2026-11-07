@@ -309,9 +309,6 @@ class CharacterizationDetectionCurve(BaseStage):
             )
 
         servo_bw_hz = _servo_bw_hz(sensitivity, params)
-        n_pol_arms, sky_rate_hz_per_spectro_arm, sky_rate_hz_per_spectro_port, (
-            sky_rate_source
-        ) = _spectro_sky_rate_hz(state, detector, params.n_sky_background_hz)
         piston_opd_covariance_m2 = _mc_piston_opd_covariance_m2(
             sensitivity, params.n_modes,
         )
@@ -330,6 +327,8 @@ class CharacterizationDetectionCurve(BaseStage):
         leakage_rate_per = np.empty(params.n_anchors, dtype=np.float64)
         snr_per = np.empty(params.n_anchors, dtype=np.float64)
         null_instability_per = np.empty(params.n_anchors, dtype=np.float64)
+        sky_rate_per = np.empty(params.n_anchors, dtype=np.float64)
+        sky_rate_per_arm = np.empty(params.n_anchors, dtype=np.float64)
         eps_systematic_per = np.empty(params.n_anchors, dtype=np.float64)
         optimization_success_per = np.empty(params.n_anchors, dtype=bool)
         constraint_margin_per = np.empty(params.n_anchors, dtype=np.float64)
@@ -553,6 +552,16 @@ class CharacterizationDetectionCurve(BaseStage):
             else:
                 disk_leak = float(np.mean(band_disk_leak_per_wl))
             leak_fraction = static_leak_fraction + realized_spectro_floor
+            # Sky through this anchor's retuned spectro rows (Issue 11).
+            n_pol_arms, sky_rate_hz_per_spectro_arm, sky_rate_hz_per_spectro_port, (
+                sky_rate_source
+            ) = _spectro_sky_rate_hz(
+                state,
+                detector,
+                params.n_sky_background_hz,
+                u_stack=u_stack,
+                spectro_idx=spectro_idx,
+            )
             leakage_rate_hz = leak_fraction * detected_stellar_rate_hz
             # Epsilon is this anchor's retuned spectro-port leakage CV.
             null_instability, null_instability_source = _spectro_null_instability(
@@ -624,6 +633,8 @@ class CharacterizationDetectionCurve(BaseStage):
             leakage_rate_per[index] = float(leakage_rate_hz)
             snr_per[index] = float(snr_payload["snr"])
             null_instability_per[index] = null_instability
+            sky_rate_per[index] = sky_rate_hz_per_spectro_port
+            sky_rate_per_arm[index] = sky_rate_hz_per_spectro_arm
             eps_systematic_per[index] = eps_systematic
             optimization_success_per[index] = bool(result.optimization_success)
             constraint_margin_per[index] = float(result.constraint_margin)
@@ -735,8 +746,12 @@ class CharacterizationDetectionCurve(BaseStage):
                 "restart candidates ranked on the full detector wavelength grid "
                 "using photon-rate-weighted characterization SNR proxy"
             ),
-            "sky_rate_hz_per_spectro_port": float(sky_rate_hz_per_spectro_port),
-            "sky_rate_hz_per_spectro_arm": float(sky_rate_hz_per_spectro_arm),
+            # Anchor medians; the sky depends on each anchor's retuned rows.
+            "sky_rate_hz_per_spectro_port": float(np.median(sky_rate_per)),
+            "sky_rate_hz_per_spectro_port_per_anchor": sky_rate_per.astype(
+                np.float64, copy=True,
+            ),
+            "sky_rate_hz_per_spectro_arm": float(np.median(sky_rate_per_arm)),
             "n_pol_arms": int(n_pol_arms),
             "sky_rate_source": sky_rate_source,
             "position_angle_deg": float(params.position_angle_deg),
