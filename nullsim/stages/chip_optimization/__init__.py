@@ -554,7 +554,11 @@ def _mode_diameters_m(
     state: SimulationState,
     n_modes: int,
 ) -> NDArray[np.float64] | None:
-    """Return area-equivalent per-mode diameters for disk-sample coupling."""
+    """Return per-mode physical diameters for off-axis coupling.
+
+    Published geometry diameters win; the equal-area circle is only the
+    fallback when no stage published one.
+    """
 
     component_diameters = _component_mode_diameters_m(state, n_modes)
     if component_diameters is not None:
@@ -1737,7 +1741,11 @@ def _throughput_penalty_fields(
         mode_areas = np.ones(params.n_modes, dtype=np.float64)
         mode_diameters = None
     else:
-        mode_diameters = np.sqrt(4.0 * mode_areas / math.pi)
+        # Physical mode diameters set the angular-coupling envelope
+        # (Ruilier & Cassaing 2001); a mode splitter divides area between
+        # copies but keeps the diameter, so the equal-area circle would
+        # overstate off-axis coupling (review 2026-11-07 Issue 20).
+        mode_diameters = _mode_diameters_m(state, params.n_modes)
 
     design_wl_idx = int(
         np.argmin(
@@ -1747,7 +1755,9 @@ def _throughput_penalty_fields(
             )
         )
     )
-    field_power = np.mean(
+    # Sum over polarization arms, matching the leakage term, so a PBS does
+    # not halve the reward relative to the leakage (review 2026-11-07 row 29).
+    field_power = np.sum(
         np.abs(field_array[:, design_wl_idx, :]) ** 2,
         axis=1,
     )
@@ -2168,6 +2178,8 @@ def _write_results(
     backend_name: str,
     kernel_rescales_per_wavelength: bool,
     convergence_history: tuple[tuple[int, float], ...] | None = None,
+    convergence_history_normalized_null: tuple[tuple[int, float], ...] | None = None,
+    optimal_params_unquantized: NDArray[np.float64] | None = None,
     optimal_u_stack: NDArray[np.complex128] | None = None,
     n_restarts_completed: int | None = None,
     normalized_loss_final: float | None = None,
@@ -2190,6 +2202,12 @@ def _write_results(
     the chromatic chip the optimizer actually evaluated (KILO column-
     alternating layout + per-λ phase rescaling), so the deployed chip matches
     the optimizer at every detector wavelength.
+
+    ``convergence_history`` holds ``(nfev, objective)`` pairs; the objective
+    is dimensional and can be negative. ``convergence_history_normalized_null``
+    holds ``(nfev, null)`` pairs in the convention of
+    ``optimization_normalized_null_final``. ``optimal_params_unquantized`` is
+    the pre-DAC optimum in the same layout as ``optimal_chip_params``.
     """
 
     components = dict(state.results.components)
@@ -2213,6 +2231,14 @@ def _write_results(
     if convergence_history is not None:
         payload["convergence_history"] = tuple(
             (int(nfev), float(loss)) for nfev, loss in convergence_history
+        )
+    if convergence_history_normalized_null is not None:
+        payload["convergence_history_normalized_null"] = tuple(
+            (int(nfev), float(null)) for nfev, null in convergence_history_normalized_null
+        )
+    if optimal_params_unquantized is not None:
+        payload["optimal_chip_params_unquantized"] = np.array(
+            optimal_params_unquantized, dtype=np.float64,
         )
     name = unique_component_name("chip_optimization", components, instance_id)
     components[name] = payload

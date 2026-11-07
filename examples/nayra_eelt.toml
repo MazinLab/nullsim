@@ -284,7 +284,8 @@ bootstrap_n_restarts = 5
 # range rather than at a single point. alpha=1e-2 from the tuning pass:
 # at kernel_order=2 it recovers throughput without measurable floor cost
 # (iteration-1 grid showed higher alphas trade floor for little gain).
-throughput_penalty_alpha = 1.0e-2
+# Halved from 1e-2 when the reward began summing over the two PBS arms (2026-11-07); objective unchanged.
+throughput_penalty_alpha = 5.0e-3
 throughput_penalty_seps_mas = [5.0, 10.0, 20.0]
 broadband_refine = true
 # Tracker/joint observability regularization carried from the

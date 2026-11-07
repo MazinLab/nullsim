@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
 import nullsim  # noqa: F401
 from nullsim.outputs.plots.calibration_time import (
     _ConvergenceTrace,
+    _extract_traces,
     plot_calibration_time,
 )
 
@@ -17,8 +19,36 @@ def _trace(label: str, color: str, n_points: int = 10) -> _ConvergenceTrace:
     return _ConvergenceTrace(
         record_label=label, color=color,
         nfev=np.arange(n_points) * 50,
-        loss=np.logspace(0, -10, n_points),
+        normalized_null=np.logspace(0, -10, n_points),
+        final_null=1e-10,
     )
+
+
+def test_plot_uses_normalized_null_not_objective() -> None:
+    """The objective goes negative with the throughput reward; the log axis
+    must show the published normalized null instead (review Issue 23)."""
+
+    payload = {
+        "convergence_history": ((0, 1e-3), (10, -5e-3)),
+        "convergence_history_normalized_null": ((0, 1e-2), (10, 4e-6)),
+        "optimization_normalized_null_final": 3.5e-6,
+    }
+    record = SimpleNamespace(
+        result=SimpleNamespace(state=SimpleNamespace(results=SimpleNamespace(
+            components={"chip_optimization": payload},
+        ))),
+        config=SimpleNamespace(grid=SimpleNamespace(wavelength_center_um=1.25)),
+    )
+
+    (trace,) = _extract_traces(SimpleNamespace(records=[record]))
+    np.testing.assert_array_equal(trace.normalized_null, [1e-2, 4e-6])
+    assert trace.final_null == 3.5e-6
+
+    fig = plot_calibration_time([trace])
+    ax = fig.axes[0]
+    assert "Normalized null" in ax.get_ylabel()
+    floor = [line for line in ax.get_lines() if line.get_label().startswith("Best floor")]
+    assert floor and floor[0].get_ydata()[0] == 3.5e-6
 
 
 def test_render_one_trace(tmp_path: Path) -> None:
@@ -74,6 +104,8 @@ def test_capture_convergence_history_end_to_end() -> None:
     assert nfev_first == 0
     assert nfev_last > nfev_first
     assert loss_last < loss_first  # optimizer actually progressed
+    null_history = payload["convergence_history_normalized_null"]
+    assert [n for n, _ in null_history] == [n for n, _ in history]
 
 
 def test_default_flag_off_keeps_payload_clean() -> None:
@@ -107,3 +139,4 @@ def test_default_flag_off_keeps_payload_clean() -> None:
     out_state = stage.apply(state)
     payload = next(iter(out_state.results.components.values()))
     assert "convergence_history" not in payload
+    assert "convergence_history_normalized_null" not in payload

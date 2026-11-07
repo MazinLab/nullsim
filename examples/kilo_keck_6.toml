@@ -98,7 +98,8 @@ id = "chip_opt"
 # dark throughput 0.068 -> 0.084). The tracker observability floor below
 # only works in combination with it: floor alone (NAYRA lesson) sells
 # planet throughput because kernel_order=3 rows leave no DOF slack.
-throughput_penalty_alpha = 1.0e-2
+# Halved from 1e-2 when the reward began summing over the two PBS arms (2026-11-07); objective unchanged.
+throughput_penalty_alpha = 5.0e-3
 # tp+floor is the paper baseline (kilo_keck_6_tp_full_b/20260612-100900):
 # det SNR >= the publication chip at every J (J=4 tie at 40.2, +34%/+11%/
 # +35% at J=6/8/10) while the fringe-tracking diagnostics central to the

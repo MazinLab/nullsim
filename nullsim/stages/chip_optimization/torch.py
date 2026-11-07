@@ -654,7 +654,9 @@ class ChipOptimizationTorch(BaseStage):
                     "reference-power-weighted bright-port intensity-response "
                     "singular values per nm of physical piston. The floor "
                     "hinge prevents dropped modes; the optional CRLB term "
-                    "minimizes sqrt(mean(1/s_i^2)). The diagnostics."
+                    "minimizes sqrt(mean(1/s_i^2)). Each delay state is a "
+                    "separate pointing; the hinge, CRLB, and rank act on the "
+                    "worst state. The diagnostics."
                     "fringe_observability stage computes the count-weighted "
                     "grouped-channel Fisher/CRLB model."
                 ),
@@ -1069,7 +1071,8 @@ class ChipOptimizationTorch(BaseStage):
                 u_r_tracker = u_r.index_select(0, tracker_eval_wave_idx_t)
                 u_i_tracker = u_i.index_select(0, tracker_eval_wave_idx_t)
                 tracker_loss, tracker_crlb_loss = (
-                    _tracker_observability_losses_torch(
+                    _tracker_worst_state_losses_torch(
+                        n_states=tracker_n_field_states,
                         u_r=u_r_tracker,
                         u_i=u_i_tracker,
                         field_r_by_wl=tracker_field_r_sel,
@@ -1352,7 +1355,8 @@ class ChipOptimizationTorch(BaseStage):
                     params.n_modes,
                     torch_mod=torch_mod,
                 )
-                singular_t = _tracker_observability_singular_values_torch(
+                singular_t = _tracker_per_state_singular_values_torch(
+                    n_states=tracker_n_field_states,
                     u_r=u_r_eval.index_select(0, tracker_eval_wave_idx_t),
                     u_i=u_i_eval.index_select(0, tracker_eval_wave_idx_t),
                     field_r_by_wl=tracker_field_r_sel,
@@ -1588,7 +1592,8 @@ class ChipOptimizationTorch(BaseStage):
                 )
                 if tracker_active:
                     tracker_loss, tracker_crlb_loss = (
-                        _tracker_observability_losses_torch(
+                        _tracker_worst_state_losses_torch(
+                            n_states=tracker_n_field_states,
                             u_r=u_r.unsqueeze(0).expand(
                                 bs_tracker_n_channels,
                                 -1,
@@ -1980,6 +1985,7 @@ class ChipOptimizationTorch(BaseStage):
         best_success = False
         best_message = ""
         best_convergence_history: tuple[tuple[int, float], ...] | None = None
+        best_null_history: tuple[tuple[int, float], ...] | None = None
         n_restarts_completed = 0
         if not params.broadband_refine:
             best_x = warm_start_arr
@@ -2011,11 +2017,17 @@ class ChipOptimizationTorch(BaseStage):
                 # iteration. Pre-fix the torch backend silently ignored the
                 # flag and the debug-report panel always claimed "history
                 # not captured" (review 2026-06-10 Issue 9).
+                # The objective is dimensional and goes negative with the
+                # throughput reward, so the published null (leakage only,
+                # reported convention) is recorded beside it (Issue 23).
                 restart_history: list[tuple[int, float]] | None = None
+                restart_null_history: list[tuple[int, float]] | None = None
                 restart_callback = None
                 restart_obj = _obj_and_grad_np
                 if params.capture_convergence_history:
                     nfev_counter = [0]
+                    restart_history = []
+                    restart_null_history = []
 
                     def restart_obj(
                         x: NDArray[np.float64],
@@ -2024,14 +2036,27 @@ class ChipOptimizationTorch(BaseStage):
                         _counter[0] += 1
                         return _obj_and_grad_np(x)
 
-                    restart_history = [(0, float(_obj_np(x0)))]
-
                     def restart_callback(
                         xk: NDArray[np.float64],
                         _h: list[tuple[int, float]] = restart_history,
+                        _hn: list[tuple[int, float]] = restart_null_history,
                         _counter: list[int] = nfev_counter,
                     ) -> None:
-                        _h.append((_counter[0], float(_obj_np(xk))))
+                        components = _objective_components_np(xk)
+                        _h.append(
+                            (_counter[0], components["optimization_objective_final"])
+                        )
+                        _hn.append((
+                            _counter[0],
+                            _reported_null_depth_for_target(
+                                components["optimization_leakage_loss_final"],
+                                target_field_array,
+                                n_objective_rows=n_rows,
+                                n_states=n_delay_states,
+                            ),
+                        ))
+
+                    restart_callback(x0)
 
                 result = minimize(
                     restart_obj,
@@ -2079,6 +2104,11 @@ class ChipOptimizationTorch(BaseStage):
                     best_convergence_history = (
                         tuple(restart_history)
                         if restart_history is not None
+                        else None
+                    )
+                    best_null_history = (
+                        tuple(restart_null_history)
+                        if restart_null_history is not None
                         else None
                     )
                     best_message = str(getattr(result, "message", ""))
@@ -2187,7 +2217,8 @@ class ChipOptimizationTorch(BaseStage):
         tracker_final_metadata: dict[str, Any] = {}
         if tracker_active:
             with torch_mod.no_grad():
-                singular_t = _tracker_observability_singular_values_torch(
+                singular_t = _tracker_per_state_singular_values_torch(
+                    n_states=tracker_n_field_states,
                     u_r=u_r_opt_diag.index_select(0, tracker_eval_wave_idx_t),
                     u_i=u_i_opt_diag.index_select(0, tracker_eval_wave_idx_t),
                     field_r_by_wl=tracker_field_r_sel,
@@ -2198,30 +2229,29 @@ class ChipOptimizationTorch(BaseStage):
                     eps=float(params.tracker_observability_eps),
                     torch_mod=torch_mod,
                 )
-                singular_np = (
-                    singular_t.detach()
-                    .cpu()
-                    .numpy()
-                    .astype(
-                        np.float64,
-                        copy=False,
-                    )
+                per_state_np = (
+                    singular_t.detach().cpu().numpy().astype(np.float64, copy=False)
                 )
+            # Headline values describe the worst delay state (Issue 21): the
+            # state with the weakest mode, the largest CRLB, the lowest rank.
             floor = float(params.tracker_observability_min_singular_per_nm)
-            if singular_np.size:
+            tracker_eps = float(params.tracker_observability_eps)
+            n_dof = int(tracker_basis.chip_basis.shape[1])
+            if per_state_np.shape[1]:
+                singular_np = per_state_np[int(np.argmin(per_state_np.min(axis=1)))]
                 min_singular = float(np.min(singular_np))
-                max_singular = float(np.max(singular_np))
                 condition = (
-                    float(max_singular / min_singular)
+                    float(np.max(singular_np) / min_singular)
                     if min_singular > 0.0
                     else float("inf")
                 )
             else:
+                singular_np = per_state_np[0]
                 min_singular = 0.0
                 condition = float("inf")
-            crlb_rms_nm = _tracker_crlb_rms_nm_from_singular_values(
-                singular_np,
-                eps=float(params.tracker_observability_eps),
+            crlb_rms_nm = max(
+                _tracker_crlb_rms_nm_from_singular_values(values, eps=tracker_eps)
+                for values in per_state_np
             )
             crlb_loss = (
                 crlb_rms_nm / float(params.tracker_observability_crlb_target_nm)
@@ -2230,16 +2260,18 @@ class ChipOptimizationTorch(BaseStage):
                 "tracker_observability_singular_values_per_nm_final": tuple(
                     float(value) for value in singular_np
                 ),
+                "tracker_observability_singular_values_per_nm_per_state_final": tuple(
+                    tuple(float(value) for value in values) for values in per_state_np
+                ),
                 "tracker_observability_min_singular_per_nm_final": min_singular,
                 "tracker_observability_condition_final": condition,
                 "tracker_observability_crlb_rms_nm_final": float(crlb_rms_nm),
                 "tracker_observability_crlb_loss_final": float(crlb_loss),
                 "tracker_observability_rank_at_floor_final": int(
-                    np.count_nonzero(singular_np >= floor)
+                    np.min(np.count_nonzero(per_state_np >= floor, axis=1))
                 ),
                 "tracker_observability_floor_met_final": bool(
-                    singular_np.size >= tracker_basis.chip_basis.shape[1]
-                    and np.all(singular_np >= floor)
+                    per_state_np.shape[1] >= n_dof and np.all(per_state_np >= floor)
                 ),
             }
 
@@ -2427,6 +2459,13 @@ class ChipOptimizationTorch(BaseStage):
             params.n_modes,
             build_unitary_complex=_torch_build_unitary_numpy,
         )
+        # Pre-DAC optimum in the same physics.clements layout, for the DAC
+        # bit-depth diagnostic (review 2026-11-07 row 60).
+        canonical_params_unquantized = _canonicalize_clements_params(
+            np.asarray(best_x, dtype=np.float64),
+            params.n_modes,
+            build_unitary_complex=_torch_build_unitary_numpy,
+        )
 
         # Tier 3.1 (option 2): publish the chromatic U_stack the optimizer
         # actually evaluated, so the chip stage can deploy verbatim
@@ -2506,6 +2545,8 @@ class ChipOptimizationTorch(BaseStage):
             n_restarts_completed=n_restarts_completed,
             normalized_loss_final=reported_null_final,
             convergence_history=best_convergence_history,
+            convergence_history_normalized_null=best_null_history,
+            optimal_params_unquantized=canonical_params_unquantized,
             optimal_u_stack=u_stack,
             backend_metadata={
                 "torch_device": str(device),
@@ -2933,6 +2974,74 @@ def _tracker_observability_losses_torch(
     return hinge, crlb
 
 
+def _tracker_worst_state_losses_torch(
+    *,
+    n_states: int,
+    u_r: Any,
+    u_i: Any,
+    field_r_by_wl: Any,
+    field_i_by_wl: Any,
+    wavelengths_m: Any,
+    torch_mod: Any,
+    **kwargs: Any,
+) -> tuple[Any, Any]:
+    """Tracker hinge and CRLB penalties of the worst delay state.
+
+    The tracker channel axis is wavelength-major with ``n_states`` delay
+    states innermost. The tracker sees one pointing at a time, so the states
+    are alternatives, not simultaneous measurements: each state gets its own
+    response matrix and the penalties take the maximum over states. Stacking
+    them into one matrix scaled every singular value by ``sqrt(n_states)``
+    for identical states and could hide a state that is unobservable alone
+    (review 2026-11-07 Issue 21).
+    """
+
+    hinges, crlbs = zip(*(
+        _tracker_observability_losses_torch(
+            u_r=u_r[state::n_states],
+            u_i=u_i[state::n_states],
+            field_r_by_wl=field_r_by_wl[state::n_states],
+            field_i_by_wl=field_i_by_wl[state::n_states],
+            wavelengths_m=wavelengths_m[state::n_states],
+            torch_mod=torch_mod,
+            **kwargs,
+        )
+        for state in range(int(n_states))
+    ))
+    return torch_mod.stack(hinges).max(), torch_mod.stack(crlbs).max()
+
+
+def _tracker_per_state_singular_values_torch(
+    *,
+    n_states: int,
+    u_r: Any,
+    u_i: Any,
+    field_r_by_wl: Any,
+    field_i_by_wl: Any,
+    wavelengths_m: Any,
+    torch_mod: Any,
+    **kwargs: Any,
+) -> Any:
+    """Tracker singular values per delay state, shape ``(n_states, n_dof)``.
+
+    Same wavelength-major, state-innermost channel layout as
+    ``_tracker_worst_state_losses_torch``.
+    """
+
+    return torch_mod.stack([
+        _tracker_observability_singular_values_torch(
+            u_r=u_r[state::n_states],
+            u_i=u_i[state::n_states],
+            field_r_by_wl=field_r_by_wl[state::n_states],
+            field_i_by_wl=field_i_by_wl[state::n_states],
+            wavelengths_m=wavelengths_m[state::n_states],
+            torch_mod=torch_mod,
+            **kwargs,
+        )
+        for state in range(int(n_states))
+    ])
+
+
 def _tracker_observability_loss_torch(
     *,
     u_r: Any,
@@ -3146,9 +3255,16 @@ def _tracker_rank_priority_selection_key(
     target_null_depth: float,
     eps: float,
 ) -> tuple[float, ...]:
-    """Rank restart candidates with tracker observability as a constraint."""
+    """Rank restart candidates with tracker observability as a constraint.
 
-    singular_values = np.asarray(singular_values_per_nm, dtype=np.float64).reshape(-1)
+    ``singular_values_per_nm`` is ``(n_dof,)`` for one pointing or
+    ``(n_states, n_dof)`` per delay state. Rank and CRLB are judged on the
+    worst state, since the tracker sees one pointing at a time (Issue 21).
+    """
+
+    singular_values = np.atleast_2d(
+        np.asarray(singular_values_per_nm, dtype=np.float64)
+    )
     if not np.all(np.isfinite(singular_values)):
         return (
             float(n_dof),
@@ -3159,12 +3275,16 @@ def _tracker_rank_priority_selection_key(
             float("inf"),
             float("inf"),
         )
-    rank_at_floor = int(np.count_nonzero(singular_values >= float(min_singular_per_nm)))
+    rank_at_floor = int(
+        np.min(
+            np.count_nonzero(singular_values >= float(min_singular_per_nm), axis=1)
+        )
+    )
     rank_deficit = max(int(n_dof) - rank_at_floor, 0)
     null_miss = 0.0 if float(normalized_null) <= float(target_null_depth) else 1.0
-    crlb_rms_nm = _tracker_crlb_rms_nm_from_singular_values(
-        singular_values,
-        eps=float(eps),
+    crlb_rms_nm = max(
+        _tracker_crlb_rms_nm_from_singular_values(values, eps=float(eps))
+        for values in singular_values
     )
     crlb_excess = max(crlb_rms_nm / float(crlb_target_nm) - 1.0, 0.0)
     crlb_miss = 1.0 if crlb_excess > 0.0 else 0.0

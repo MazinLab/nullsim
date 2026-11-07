@@ -17,8 +17,13 @@ the best restart needed to reach the realized null depth.
 
 To populate the convergence history during a run, set
 ``capture_convergence_history = true`` under the chip optimizer stage in
-the TOML. The scipy backend records ``(nfev, loss)`` at every BFGS
-iteration of the best restart.
+the TOML. Both backends record, at every iteration of the best restart,
+the objective (``convergence_history``) and the normalized null
+(``convergence_history_normalized_null``). The figure plots the normalized
+null, the quantity published as ``optimization_normalized_null_final``.
+The objective is not shown: it is dimensional and goes negative once the
+throughput reward is on, so it has no place on a log null-depth axis
+(review 2026-11-07 Issue 23).
 """
 
 from __future__ import annotations
@@ -43,7 +48,8 @@ class _ConvergenceTrace(NamedTuple):
     record_label: str
     color: str
     nfev: np.ndarray
-    loss: np.ndarray
+    normalized_null: np.ndarray
+    final_null: float
 
 
 def _extract_traces(collection: RunCollection) -> list[_ConvergenceTrace]:
@@ -53,7 +59,7 @@ def _extract_traces(collection: RunCollection) -> list[_ConvergenceTrace]:
         for name, payload in components.items():
             if not name.startswith("chip_optimization"):
                 continue
-            history = payload.get("convergence_history")
+            history = payload.get("convergence_history_normalized_null")
             if not history:
                 continue
             arr = np.asarray(history, dtype=np.float64)
@@ -63,7 +69,10 @@ def _extract_traces(collection: RunCollection) -> list[_ConvergenceTrace]:
                 record_label=f"{band} ({wl_um:.2f} um)",
                 color=color,
                 nfev=arr[:, 0],
-                loss=arr[:, 1],
+                normalized_null=arr[:, 1],
+                final_null=float(
+                    payload.get("optimization_normalized_null_final", arr[-1, 1])
+                ),
             ))
     return traces
 
@@ -88,26 +97,27 @@ def plot_calibration_time(
             fig.savefig(save_path)
         return fig
 
-    final_loss = float("inf")
+    best_null = float("inf")
     for trace in traces:
         ax.semilogy(
-            trace.nfev, trace.loss,
+            trace.nfev, trace.normalized_null,
             "-o", color=trace.color, markersize=3, linewidth=1.5,
             label=trace.record_label,
         )
-        final_loss = min(final_loss, float(trace.loss[-1]))
+        best_null = min(best_null, trace.final_null)
 
     ax.set_xlabel("Objective evaluations")
-    ax.set_ylabel("Null depth (mean dark-port leakage fraction)")
+    ax.set_ylabel(
+        "Normalized null (dark-port leakage / input power per objective row)"
+    )
     ax.set_title("Chip optimizer convergence")
     ax.grid(True, which="both", alpha=0.3)
-    if len(traces) > 1:
-        ax.legend(fontsize=9)
-    if np.isfinite(final_loss):
+    if np.isfinite(best_null) and best_null > 0.0:
         ax.axhline(
-            final_loss, color="0.4", linestyle="--", linewidth=1,
-            label=f"Best floor: {final_loss:.2e}",
+            best_null, color="0.4", linestyle="--", linewidth=1,
+            label=f"Best floor: {best_null:.2e}",
         )
+    ax.legend(fontsize=9)
     fig.tight_layout()
 
     if save_path is not None:

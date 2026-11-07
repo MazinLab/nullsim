@@ -57,7 +57,7 @@ from nullsim.stages.chip_optimization import (
     _optimizer_wavelength_metadata,
     _optimizer_wavelength_subset,
     _quantize_phases,
-    _reported_null_depth_for_target,
+    _reported_null_depth_denominator,
     _require_field,
     _require_wavelength_grid_um,
     _spectral_loss_metadata,
@@ -69,15 +69,26 @@ from nullsim.stages.chip_optimization import (
 
 _PROCESS_POOL_UNAVAILABLE_ERRORS = (OSError, NotImplementedError)
 
+_History = tuple[tuple[int, float], ...] | None
+_RestartResult = tuple[
+    float, NDArray[np.float64], NDArray[np.float64], int, _History, _History
+]
+
 
 def _run_one_restart_worker(
     args: tuple,
-) -> tuple[float, NDArray[np.float64], int, tuple[tuple[int, float], ...] | None]:
+) -> _RestartResult:
     """Top-level worker for the chip-restart ProcessPoolExecutor.
 
     Must be top-level (not a closure) so it pickles cleanly under the
     spawn multiprocessing context. Mirrors KILO ``_process_worker_run_restart``
     (kilo/chip.py L762).
+
+    Returns ``(loss, x_final, x_unquantized, nit, history, null_history)``.
+    With history capture on, ``history`` holds ``(nfev, objective)`` and
+    ``null_history`` holds ``(nfev, reported null)``: the leakage term
+    alone over ``null_denominator``, the convention published as
+    ``optimization_normalized_null_final`` (review 2026-11-07 Issue 23).
     """
 
     (
@@ -93,6 +104,7 @@ def _run_one_restart_worker(
         stellar_radius_rad,
         delay_state_fields,
         throughput_penalty_fields,
+        null_denominator,
     ) = args
 
     nfev_counter = [0]
@@ -111,26 +123,38 @@ def _run_one_restart_worker(
         else params.model_copy(update={"dac_bits": None})
     )
 
-    def _obj(x: NDArray[np.float64]) -> float:
-        nfev_counter[0] += 1
+    def _loss(
+        x: NDArray[np.float64],
+        loss_params: ChipOptimizationParams,
+        tp_fields: NDArray[np.complex128] | None,
+    ) -> float:
         return _loss_numpy(
             x, field_array=field_array,
             wavelength_grid_um=wavelength_grid_um,
-            params=smooth_params, null_idx=null_idx, dark_idx=dark_idx,
+            params=loss_params, null_idx=null_idx, dark_idx=dark_idx,
             aperture_positions_pupil_m=aperture_positions_pupil_m,
             sub_diameters_m=sub_diameters_m,
             stellar_radius_rad=stellar_radius_rad,
             delay_state_fields=delay_state_fields,
-            throughput_penalty_fields=throughput_penalty_fields,
+            throughput_penalty_fields=tp_fields,
         )
 
+    def _obj(x: NDArray[np.float64]) -> float:
+        nfev_counter[0] += 1
+        return _loss(x, smooth_params, throughput_penalty_fields)
+
     history: list[tuple[int, float]] | None = None
+    null_history: list[tuple[int, float]] | None = None
     callback = None
     if capture_convergence_history:
-        history = [(0, _obj(x0))]
+        history = []
+        null_history = []
 
-        def callback(xk: NDArray[np.float64], _h=history) -> None:
-            _h.append((nfev_counter[0], _obj(xk)))
+        def callback(xk: NDArray[np.float64], _h=history, _hn=null_history) -> None:
+            _h.append((nfev_counter[0], _loss(xk, smooth_params, throughput_penalty_fields)))
+            _hn.append((nfev_counter[0], _loss(xk, smooth_params, None) / null_denominator))
+
+        callback(x0)
 
     result = minimize(
         _obj, x0,
@@ -139,30 +163,23 @@ def _run_one_restart_worker(
         callback=callback,
     )
     nit = int(getattr(result, "nit", 0))
-    x_final = np.asarray(result.x, dtype=np.float64)
+    x_unquantized = np.asarray(result.x, dtype=np.float64)
+    x_final = x_unquantized
     if params.dac_bits is not None:
         x_final = _quantize_phases(x_final, params.dac_bits)
     # Re-evaluate at the (possibly quantized) final iterate with the
     # ORIGINAL params so the returned loss matches the deployed chip.
-    loss = float(
-        _loss_numpy(
-            x_final, field_array=field_array,
-            wavelength_grid_um=wavelength_grid_um,
-            params=params, null_idx=null_idx, dark_idx=dark_idx,
-            aperture_positions_pupil_m=aperture_positions_pupil_m,
-            sub_diameters_m=sub_diameters_m,
-            stellar_radius_rad=stellar_radius_rad,
-            delay_state_fields=delay_state_fields,
-            throughput_penalty_fields=throughput_penalty_fields,
-        )
-    )
+    loss = _loss(x_final, params, throughput_penalty_fields)
     if history is not None:
-        if not history or history[-1][0] != nfev_counter[0]:
+        if history[-1][0] != nfev_counter[0]:
             history.append((nfev_counter[0], loss))
-        history_tuple = tuple(history)
-    else:
-        history_tuple = None
-    return loss, x_final, nit, history_tuple
+            null_history.append(
+                (nfev_counter[0], _loss(x_final, params, None) / null_denominator)
+            )
+        return (
+            loss, x_final, x_unquantized, nit, tuple(history), tuple(null_history),
+        )
+    return loss, x_final, x_unquantized, nit, None, None
 
 
 @register_stage
@@ -304,6 +321,11 @@ class ChipOptimizationScipy(BaseStage):
         n_delay_states = (
             int(delay_state_fields.shape[0]) if delay_state_fields is not None else 1
         )
+        null_denominator = _reported_null_depth_denominator(
+            target_field_array,
+            n_objective_rows=n_objective_rows,
+            n_states=n_delay_states,
+        )
 
         seed_base = 0 if params.seed is None else int(params.seed)
         n_params_total = _n_params(params.n_modes)
@@ -335,12 +357,15 @@ class ChipOptimizationScipy(BaseStage):
                 stellar_radius_rad,
                 delay_state_fields,
                 throughput_penalty_fields,
+                null_denominator,
             )
             for k in range(params.n_restarts)
         ]
 
         best_convergence_history: tuple[tuple[int, float], ...] | None = None
+        best_null_history: tuple[tuple[int, float], ...] | None = None
         best_params: NDArray[np.float64] | None = None
+        best_params_unquantized: NDArray[np.float64] | None = None
         best_loss = math.inf
         best_iterations = 0
         # Phase 9: count how many restarts actually executed so the
@@ -355,12 +380,14 @@ class ChipOptimizationScipy(BaseStage):
             n_workers = min(params.n_workers, params.n_restarts)
             results = _run_restarts_with_pool_or_serial(worker_args, n_workers)
             n_restarts_completed = len(results)
-            for loss, x_out, nit, history in results:
+            for loss, x_out, x_raw, nit, history, null_history in results:
                 if loss < best_loss:
                     best_loss = loss
                     best_params = x_out
+                    best_params_unquantized = x_raw
                     best_iterations = nit
                     best_convergence_history = history
+                    best_null_history = null_history
         else:
             # Serial path with KILO-style stall detection across restarts.
             # KILO empirically: deepest basin is found in the first 1-5
@@ -368,14 +395,18 @@ class ChipOptimizationScipy(BaseStage):
             # shallower basins.
             n_no_improve = 0
             for worker_arg in worker_args:
-                loss, x_out, nit, history = _run_one_restart_worker(worker_arg)
+                loss, x_out, x_raw, nit, history, null_history = (
+                    _run_one_restart_worker(worker_arg)
+                )
                 n_restarts_completed += 1
                 improved = loss < best_loss * (1.0 - params.restart_patience_reltol)
                 if loss < best_loss:
                     best_loss = loss
                     best_params = x_out
+                    best_params_unquantized = x_raw
                     best_iterations = nit
                     best_convergence_history = history
+                    best_null_history = null_history
                 if improved:
                     n_no_improve = 0
                 else:
@@ -440,7 +471,8 @@ class ChipOptimizationScipy(BaseStage):
                 method="SLSQP",
                 options={"maxiter": max(1, params.max_iter // 4)},
             )
-            polish_x = np.asarray(polish.x, dtype=np.float64)
+            polish_x_unquantized = np.asarray(polish.x, dtype=np.float64)
+            polish_x = polish_x_unquantized
             if params.dac_bits is not None:
                 polish_x = _quantize_phases(polish_x, params.dac_bits)
             polish_loss = float(
@@ -457,33 +489,40 @@ class ChipOptimizationScipy(BaseStage):
             )
             if polish_loss < loss_final:
                 optimal_params = polish_x
+                best_params_unquantized = polish_x_unquantized
                 loss_final = polish_loss
                 iterations += int(getattr(polish, "nit", 0))
 
+        # Publish the null from the leakage term alone: with
+        # throughput_penalty_alpha > 0 the objective carries the negative
+        # throughput reward, which is not a null depth (Issue 23).
+        leakage_final = _loss_numpy(
+            optimal_params, field_array=field_array,
+            wavelength_grid_um=wavelength_grid_um,
+            params=params, null_idx=null_idx, dark_idx=dark_idx,
+            aperture_positions_pupil_m=positions_pupil,
+            sub_diameters_m=sub_diameters_m,
+            stellar_radius_rad=stellar_radius_rad,
+            delay_state_fields=delay_state_fields,
+        )
         return _write_results(
             state=state,
             instance_id=self.context.instance_id,
             optimal_params=optimal_params,
+            optimal_params_unquantized=best_params_unquantized,
             loss_final=loss_final,
             iterations=iterations,
             backend_name="scipy",
             # scipy uses physics.clements layout natively — broadband
             # consistent with the kernel's per-wavelength rescaling.
             kernel_rescales_per_wavelength=True,
-            normalized_loss_final=_reported_null_depth_for_target(
-                loss_final,
-                target_field_array,
-                n_objective_rows=n_objective_rows,
-                n_states=n_delay_states,
-            ),
-            convergence_history=(
-                tuple(best_convergence_history)
-                if best_convergence_history is not None else None
-            ),
+            normalized_loss_final=leakage_final / null_denominator,
+            convergence_history=best_convergence_history,
+            convergence_history_normalized_null=best_null_history,
             n_restarts_completed=n_restarts_completed,
             backend_metadata={
                 "optimization_normalized_null_legacy_final": (
-                    _normalized_loss_for_target(loss_final, target_field_array)
+                    _normalized_loss_for_target(leakage_final, target_field_array)
                 ),
                 "disk_null_floor_note": (
                     "chip-realization dependent"
@@ -505,7 +544,7 @@ class ChipOptimizationScipy(BaseStage):
 def _run_restarts_with_pool_or_serial(
     worker_args: list[tuple],
     n_workers: int,
-) -> list[tuple[float, NDArray[np.float64], int, tuple[tuple[int, float], ...] | None]]:
+) -> list[_RestartResult]:
     """Run all restarts in a spawn pool, falling back to serial if unavailable."""
 
     ctx = mp.get_context("spawn")
