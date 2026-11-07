@@ -27,6 +27,7 @@ from nullsim.stages.characterization import (
 from nullsim.stages.characterization.spectro import (
     _band_evaluated_spectro_metrics,
     _characterization_wavelength_grid,
+    _find_mkid_detector_component,
     _find_sensitivity_component,
     _mc_piston_opd_covariance_m2,
     _realized_spectro_floor_for_stack,
@@ -1193,3 +1194,20 @@ def test_find_sensitivity_component_prefers_newest() -> None:
     name, _ = _find_sensitivity_component(state)
 
     assert name == "sensitivity.detection_curve.late"
+
+
+def test_newest_mkid_without_resolving_power_raises_instead_of_older_fallback() -> None:
+    """The newest MKID is the deployed detector; an older R-enabled one
+    must not silently supply the characterization detector budget."""
+
+    base = {"port_rates": (1.0,), "port_labels": ("dark_0",), "integration_time_s": 1.0}
+    results = Results(
+        components={
+            "detector.mkid": {**base, "resolving_power_ref": 24.0, "lambda_ref_um": 1.25},
+            "detector.mkid.broadband": dict(base),
+        }
+    )
+    state = replace(SimulationState.empty({"wavelength_grid_um": (1.25,)}), results=results)
+
+    with pytest.raises(ValueError, match="detector.mkid.broadband"):
+        _find_mkid_detector_component(state)

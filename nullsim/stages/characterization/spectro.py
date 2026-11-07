@@ -770,6 +770,7 @@ class SpectroCharacterization(BaseStage):
             "max_spectral_resolution": float(achievable_max_r),
             "snr_min_per_bin": float(params.snr_min_per_bin),
             "resolving_power_cap": float(params.resolving_power_cap),
+            "resolving_power_floor": float(params.resolving_power_floor),
             "band_lambda_m": float(wl_design_m),
             "band_bandwidth_m": float(band_bandwidth_m),
             "null_instability": float(null_instability),
@@ -1183,25 +1184,24 @@ def _find_sensitivity_component(state: SimulationState) -> tuple[str, dict[str, 
 def _find_mkid_detector_component(
     state: SimulationState,
 ) -> tuple[str, dict[str, Any]]:
-    missing_resolution: str | None = None
     for name, payload in reversed(tuple(state.results.components.items())):
         if not name.startswith("detector.mkid") or not isinstance(payload, dict):
             continue
         required_base = {"port_rates", "port_labels", "integration_time_s"}
         if not required_base.issubset(payload):
             continue
+        # The newest MKID is the deployed detector; an older R-enabled one
+        # must not stand in for it.
         if (
-            payload.get("resolving_power_ref") is not None
-            and payload.get("lambda_ref_um") is not None
+            payload.get("resolving_power_ref") is None
+            or payload.get("lambda_ref_um") is None
         ):
-            return name, payload
-        missing_resolution = name
-    if missing_resolution is not None:
-        raise ValueError(
-            'characterization.spectro with spectrograph="mkid" requires the '
-            f"upstream MKID detector component {missing_resolution!r} to be "
-            "R-enabled. Set detector.mkid resolving_power_ref and lambda_ref_um."
-        )
+            raise ValueError(
+                'characterization.spectro with spectrograph="mkid" requires the '
+                f"upstream MKID detector component {name!r} to be R-enabled. "
+                "Set detector.mkid resolving_power_ref and lambda_ref_um."
+            )
+        return name, payload
     raise ValueError(
         'characterization.spectro with spectrograph="mkid" requires an '
         "upstream detector.mkid stage with resolving_power_ref and lambda_ref_um."
