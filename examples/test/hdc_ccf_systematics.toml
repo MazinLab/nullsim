@@ -1,7 +1,7 @@
 # Systematics-dominated companion to `hdc_ccf_smoke.toml`: the case where
 # cross-correlation actually buys something. The smoke config is photon
 # limited, and there the matched filter LOSES to the broadband band SNR
-# (ccf_snr 126.23 against band 690.28) -- correctly, because it throws away
+# (ccf_snr 126.48 against band 691.61) -- correctly, because it throws away
 # most of the planet's photons to isolate the lines. Here the leaked
 # starlight carries a quasi-static instability. It costs the band a factor
 # 125 and the CCF a factor 2.36, and that asymmetry is the whole point.
@@ -25,22 +25,23 @@
 #
 # At THIS config's operating point the averaging branch cannot substitute:
 # with f_servo = 2 kHz, CCF systematic variance only overtakes CCF photon
-# noise for eps > 7.1 (dominance needs eps^2 / f_servo > 2.52e-2). That is a
+# noise for eps > 7.1 (dominance needs eps^2 / f_servo > 2.51e-2). That is a
 # statement about 2 kHz, not about the branch -- at a 30 Hz speckle
 # decorrelation bandwidth the same inequality needs eps > 0.87, which is
 # large. A config wanting the averaging branch would have to
 # argue for both numbers.
 #
-# Achieved at 3600 s (2026-11-07, single-telescope geometry, ~2 s wall clock):
+# Achieved at 3600 s (2026-11-07, single-telescope geometry, after the
+# 2026-11-07 review fixes, ~2 s wall clock):
 #
-#   spectro band SNR       5.52   (S = 2.20e7, B = 9.97e8 counts,
-#                                  systematic_var = 1.59e13 counts^2)
-#   ccf_snr               53.50   -> HDC wins by 9.68x
-#   ccf_snr_photon_limited 126.23
-#   ccf_systematic_var / ccf_photon_var = 7.269e4 / 1.592e4 = 4.57
+#   spectro band SNR       5.52   (S = 2.21e7, B = 1.00e9 counts,
+#                                  systematic_var = 1.60e13 counts^2)
+#   ccf_snr               53.52   -> HDC wins by 9.69x
+#   ccf_snr_photon_limited 126.48
+#   ccf_systematic_var / ccf_photon_var = 7.327e4 / 1.598e4 = 4.59
 #   ccf_systematic_rejection = 0.028
-#   RV localization "reliable": score margin 1.283 sigma, worst-case margin
-#     1.057 sigma under the modeled residual leak (rv_leak_contamination 44.0)
+#   RV localization "reliable": score margin 1.285 sigma, worst-case margin
+#     1.059 sigma under the modeled residual leak (rv_leak_contamination 44.0)
 #
 # These are plumbing numbers, not a sensitivity prediction. Until 2026-11-07
 # this chain declared a four-telescope array, kept its 314 m^2 collecting
@@ -51,18 +52,18 @@
 #
 # That last line is a verdict about the RV scan only, and the interesting part
 # is how it survives. A 4e-3 instability on a leak this bright shifts EVERY
-# trial's score by tens of sigma -- 43.64 at the truth, up to 44.93 elsewhere --
-# but almost entirely in common mode, so the ordering barely moves and 1.057
+# trial's score by tens of sigma -- 43.71 at the truth, up to 45.00 elsewhere --
+# but almost entirely in common mode, so the ordering barely moves and 1.059
 # sigma of the margin survives. Scoring those two shifts as independently
 # signed, which an earlier version of the verdict did, reported a worst case of
 # -110.6 and called the scan unusable; the residual is one signed vector and
 # has to be evaluated coherently. The photon-limited smoke companion, with
-# eps = 0, grades "reliable" on the same 1.283 sigma margin with no shift at
+# eps = 0, grades "reliable" on the same 1.285 sigma margin with no shift at
 # all.
 #
 # Read that rejection factor as one illustrative realization. It is
 # |sum w L~| / (sum |w| L) for ONE coherent scalar eps multiplying ONE smooth
-# leak spectrum: the continuum filter keeps 2.5% of what the band SNR
+# leak spectrum: the continuum filter keeps 2.8% of what the band SNR
 # swallows whole. There is no chromatic-speckle covariance model behind it. A
 # perturbation with structure at the line scale would project onto the
 # template differently -- possibly much more strongly, possibly less -- and

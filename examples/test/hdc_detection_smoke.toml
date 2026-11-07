@@ -10,16 +10,17 @@
 #     `sensitivity.detection_curve` instead, so the characterization branch is
 #     dead weight here -- dropping it also keeps the run to a couple of
 #     seconds.
-#   * The two systematics knobs from `hdc_ccf_systematics.toml`
+#   * The two systematics knobs of `hdc_ccf_systematics.toml` are set on
+#     `performance.standard`, at eps = 1e-3 rather than that config's 4e-3
 #     (`residual_speckle_stability_factor = 1e-3`, `with_fringe_tracking =
-#     false`) are set on `performance.standard`. That is a deliberate choice,
-#     and it is what makes this config worth shipping: in a purely photon
-#     limited regime the CCF LOSES to the broadband curve (gain < 1), because
-#     the matched filter throws away most of the planet's photons to isolate
-#     the lines. Nothing is wrong when that happens -- there is no systematic
-#     to reject -- but an example whose whole point is the overlay should show
-#     an overlay worth looking at. With the quasi-static leak instability in
-#     place the CCF wins at every anchor.
+#     false`). That is a deliberate choice, and it is what makes this config
+#     worth shipping: in a purely photon limited regime the CCF LOSES to the
+#     broadband curve (gain < 1), because the matched filter throws away most
+#     of the planet's photons to isolate the lines. Nothing is wrong when
+#     that happens -- there is no systematic to reject -- but an example whose
+#     whole point is the overlay should show an overlay worth looking at.
+#     With the quasi-static leak instability in place the CCF wins at every
+#     anchor.
 #
 # `with_fringe_tracking = false` selects the quasi-static branch of the
 # null-instability variance, (eps * leak_counts)^2, rather than the averaging
@@ -36,33 +37,33 @@
 # compares two curves describing the same observation. An explicit value that
 # disagreed would be refused rather than reconciled.
 #
-# Achieved (2026-11-07, single-telescope geometry, ~3 s wall clock), at every
-# anchor:
+# Achieved (2026-11-07, single-telescope geometry, after the 2026-11-07
+# review fixes, ~3 s wall clock), at every anchor:
 #
-#   ccf_contrast_gain      6.186   with the two knobs below
+#   ccf_contrast_gain      5.007   with the two knobs below
 #   ccf_contrast_gain      0.163   with them removed (photon limited)
 #
-# The switch costs the broadband curve a factor 46.3 at 10 mas (2.42e-6 ->
-# 1.12e-4) and the CCF curve only a factor 1.22 (1.49e-5 -> 1.81e-5). That
+# The switch costs the broadband curve a factor 34.9 at 10 mas (1.82e-6 ->
+# 6.34e-5) and the CCF curve only a factor 1.14 (1.12e-5 -> 1.27e-5). That
 # asymmetry is the entire result. These are plumbing numbers, not a
 # sensitivity prediction.
 #
 # Until 2026-11-07 this chain declared a four-telescope array, kept its
 # 314 m^2 collecting area, and placed the modes inside one 10 m pupil (review
-# 2026-11-07 Issue 22); the gains were 28.199 and 0.626 then. The history
-# below refers to that geometry. Both gains moved by 3.8x in the wave C stage-accounting pass (7.483 ->
-# 28.183 and 0.163 -> 0.618), then by a further 0.06% when the continuum
+# 2026-11-07 Issue 22); the gains were 28.199 and 0.626 before the
+# 2026-11-07 review fixes. The history below refers to that geometry. Both
+# gains moved by 3.8x in the wave C stage-accounting pass (7.483 -> 28.183
+# and 0.163 -> 0.618), then by a further 0.06% when the continuum
 # filter became blockwise over telluric islands (28.183 -> 28.199 and
 # 0.618 -> 0.626): `performance.hdc` now normalizes its
 # unit-contrast planet against the PHYSICAL stellar rate rather than the
 # MKID-saturation-capped readout total, and at J = 5 this four-mode chain
-# saturates the bright ports by 3.804x. The CCF contrasts here are therefore
-# the corrected ones. `performance.standard`'s broadband curve is still built
-# from the capped total -- changing that would move every contrast curve in
-# the repository -- so the RATIO carries the saturation factor and the stage
-# emits a RuntimeWarning saying so. Read the CCF curve as physical and the
-# gain as a comparison between two normalizations until the broadband side is
-# reconciled.
+# saturated the bright ports by 3.804x. The broadband side has since been
+# reconciled: `performance.standard` also normalizes to the physical stellar
+# rate, so both curves share one normalization and the saturation
+# RuntimeWarning is gone (28.199 -> 9.327 and 0.626 -> 0.1645 in the old
+# geometry). In the single-telescope geometry no port saturates; the bright
+# ports run at 0.68 of the MKID cap.
 #
 # The gain is the SAME at every anchor, and that is structural rather than a
 # coincidence -- but it is a property of `performance.hdc`'s inputs, not of the
@@ -236,10 +237,10 @@ n_bright_ports = 2
 n_dark_ports = 1
 n_spectro_ports = 1
 # Seven anchors instead of the three `hdc_ccf_smoke.toml` uses, chosen to stay
-# inside the y-array's usable field: the planet throughput peaks near 20 mas
-# and has collapsed to 8e-8 by 100 mas, where the 5-sigma contrast comes out
-# above 1 and `detection_space` drops the point as unphysical. Everything out
-# to 50 mas is a real anchor.
+# inside the pupil-mode array's usable field: the planet throughput peaks near
+# 25 mas (0.22), is 0.059 at 50 mas, and falls to 2.9e-4 by 100 mas, where the
+# broadband 5-sigma contrast is 1.7e-2. In the earlier four-telescope geometry
+# the 100 mas contrast came out above 1 and `detection_space` dropped it.
 separations_mas = [5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0]
 n_pa_samples = 12
 include_angular_coupling = true

@@ -169,7 +169,7 @@ the strings used in TOML under `[[pipeline.stages]]`.
 |---|---|---|---|---|
 | `scene.point_source` | `stages/scene/point_source.py` | none | `scene` | Source properties and pointing. |
 | `telescope.fixed_aperture` | `stages/telescope/fixed_aperture.py` | `scene` | `geometry`, `throughput` | Aperture area, ENU positions, baselines, telescope throughput. |
-| `telescope.pupil_modes` | `stages/telescope/pupil_modes.py` | `geometry` | `geometry` | Photonic input mode placement on a single circular pupil (single-primary geometry bridge). |
+| `telescope.pupil_modes` | `stages/telescope/pupil_modes.py` | `geometry` | `geometry` | Photonic input mode placement on a single circular pupil (single-primary geometry bridge). Raises when upstream `n_apertures > 1`; publishes per-mode `mode_areas_m2`, `mode_diameters_m`, and `mode_origin_positions_m`. |
 | `atmosphere.kolmogorov` | `stages/atmosphere/kolmogorov_screens.py` | `geometry` | `opd_budget`, `wavefront`, `throughput` | Seeing, atmospheric transmission, OPD/wavefront budgets. |
 | `ao.pyramid_wfs` | `stages/ao/pyramid_wfs.py` | `geometry`, `opd_budget`, `wavefront`, `scene` | `opd_budget`, `wavefront`, `geometry` | KILO-style pyramid WFS residuals and sub-aperture geometry. |
 | `wavefront.space_residual` | `stages/wavefront/space_residual.py` | none | `wavefront`, `opd_budget` | Scalar space-telescope WFE/Strehl and jitter residual budget. |
@@ -177,7 +177,7 @@ the strings used in TOML under `[[pipeline.stages]]`.
 | `injection.mode_splitter` | `stages/injection/mode_splitter.py` | `field`, `geometry` | `field`, `geometry` | Guided-mode fanout for duplicated-input Clements mesh studies. |
 | `injection.single_mode_fiber` | `stages/injection/single_mode_fiber.py` | `field`, `throughput`, `wavefront`, `geometry` | `field`, `throughput` | Ruilier-Cassaing SMF coupling. |
 | `delay_lines.geometric` | `stages/delay_lines/geometric.py` | `geometry`, `throughput`, `scene`, `field` | `throughput`, `field` | Delay-line path equalization loss; opt-in chromatic phase diagnostics. |
-| `transport.smf28` | `stages/transport/smf28.py` | `field`, `throughput`, `opd_budget` | `field`, `throughput`, `opd_budget` | SMF-28 loss, phase, and dispersion. |
+| `transport.smf28` | `stages/transport/smf28.py` | `field`, `throughput`, `opd_budget` | `field`, `throughput`, `opd_budget` | SMF-28 loss, phase, and dispersion; publishes the per-mode GVD phase as the field component `static_field_factor`. |
 | `transport.pm980` | `stages/transport/smf28.py` | `field`, `throughput`, `opd_budget` | `field`, `throughput`, `opd_budget` | PM980-XP PM fiber (SMF28Transport subclass). |
 | `transport.pm780` | `stages/transport/smf28.py` | `field`, `throughput`, `opd_budget` | `field`, `throughput`, `opd_budget` | PM780-HP PM fiber for ~800 nm bands (SMF28Transport subclass). |
 | `transport.photometric_pickoff` | `stages/transport/photometric_pickoff.py` | `field`, `throughput` | `field`, `throughput` | Fixed photometric tap before the science mesh for amplitude sensing. |
@@ -186,7 +186,7 @@ the strings used in TOML under `[[pipeline.stages]]`.
 | `background.space_zodi` | `stages/background/space_zodi.py` | `geometry`, `throughput`, `field`, `scene`, `results` | `results` | Space local-zodi and exozodi background rates per dark/spectro port. |
 | `polarization.hwp` | `stages/polarization/optics.py` | `field`, `throughput` | `field`, `throughput` | Half-wave plate Jones rotation per port. |
 | `polarization.pbs_split` | `stages/polarization/optics.py` | `field`, `throughput` | `field`, `throughput` | Polarizing beam splitter into two orthogonal polarization arms. |
-| `polarization.pm_fiber` | `stages/polarization/optics.py` | `field`, `throughput` | `field`, `throughput`, `results` | PM fiber Jones propagation with birefringence and leakage. |
+| `polarization.pm_fiber` | `stages/polarization/optics.py` | `field`, `throughput` | `field`, `throughput`, `results` | PM fiber Jones propagation with birefringence and leakage; publishes the per-mode, per-arm J00 as `static_field_factor`. |
 | `instrument.nayra_six_chip` | `stages/instrument/nayra_six_chip.py` | none | `results` | NAYRA Y/J/H × dual-pol six-chip channel manifest. |
 | `chip.identity` | `stages/chip/identity.py` | `field`, `throughput` | `field`, `throughput` | Pass-through chip for smoke tests. |
 | `chip.kernel_mzi_mesh` | `stages/chip/kernel_mzi_mesh.py` | `field`, `throughput` (+ `results` when `optimization_source` is set) | `field`, `throughput`, `results` | Kernel-nulling Clements MZI mesh; supports per-pol-arm deployment. |
@@ -197,7 +197,7 @@ the strings used in TOML under `[[pipeline.stages]]`.
 | `detector.ideal_counter` | `stages/detector/ideal_counter.py` | `field`, `throughput`, `scene`, `geometry` | `photon_rates`, `results` | Simple ideal detector for the vertical slice. |
 | `detector.mkid` | `stages/detector/mkid.py` | `field`, `throughput`, `scene`, `geometry` | `photon_rates`, `results`, `throughput` | MKID QE, saturation, count rates, opt-in energy-resolution redistribution. |
 | `detector.snspd` | `stages/detector/snspd.py` | `field`, `throughput`, `scene`, `geometry` | `photon_rates`, `results`, `throughput` | SNSPD QE, saturation, dark counts. |
-| `fringe_tracking.closed_loop` | `stages/fringe_tracking/closed_loop.py` | `photon_rates`, `opd_budget`, `wavefront`, `geometry` | `opd_budget`, `results` | Closed-loop piston residuals, classical or photon-Kalman; optional von Karman piston and vibration disturbances. |
+| `fringe_tracking.closed_loop` | `stages/fringe_tracking/closed_loop.py` | `photon_rates`, `opd_budget`, `wavefront`, `geometry` | `opd_budget`, `results` | Closed-loop piston residuals from the full KILO servo model (the legacy servo-lag model is removed; `use_full_piston_servo_residual = false` raises), classical or photon-Kalman control; optional aperture-filtered von Karman piston and vibration disturbances. |
 | `calibration.floor_lookup` | `stages/calibration/floor_lookup.py` | `results`, `scene` | `results` | Calibration systematic floor lookup/subtraction. |
 | `sensitivity.detection_curve` | `stages/sensitivity/detection_curve.py` | `results`, `geometry`, `wavefront`, `scene`, `field`, `throughput` | `results` | Planet throughput curve, stellar-disk floor, realized/effective null, leakage rates. |
 | `performance.standard` | `stages/performance/standard.py` | `results`, `scene` | `results` | SNR, integration time, and contrast curve. |
@@ -212,8 +212,10 @@ Contract notes (subtleties that are easy to get wrong):
 
 - `sensitivity.detection_curve` and `performance.standard` read `opd_budget`
   opportunistically as a `cache_key_extras` entry, not a validated consume.
-- `sensitivity.detection_curve` raises if the separation grid does not cover
-  the configured stellar radius.
+- `sensitivity.detection_curve`'s disk floor is the excess `<T(r) - T(0)>`
+  over 16 Gauss-Legendre nodes inside the stellar radius, so the separation
+  grid no longer has to cover the stellar radius. Its rebuilt fields carry
+  the product of upstream `static_field_factor` components.
 - `performance.standard` recomputes leakage from the sensitivity-published
   effective null (the published leakage-rate keys are debug-report inputs)
   and applies `nsc_systematic_reduction` only to the null-instability
@@ -235,26 +237,26 @@ pinning rationale live in `tests/physics/notes/*.md`.
 | File | Responsibility |
 |---|---|
 | `kolmogorov.py` | Kolmogorov turbulence constants, r0 scaling, phase variance, effective wind speed. |
-| `ruilier_cassaing.py` | Single-mode fiber coupling and angular coupling factors. |
+| `ruilier_cassaing.py` | Single-mode fiber coupling; exact off-axis overlap (`angular_coupling_amplitude`, signed, and `angular_coupling_factor`, by Gauss-Legendre quadrature); `DIFFUSE_SINGLE_MODE_ACCEPTANCE` (1 - exp(-2 rho^2) = 0.919) for diffuse backgrounds. |
 | `clements.py` | Clements unitary decomposition and reconstruction. |
 | `jones.py` | Jones matrices, waveplates, Stokes conversions, PM fiber birefringence/leakage, PBS arms, `DualPolField`. |
 | `photometry.py` | Vega zero points and photon-rate conversions. |
 | `pupil_geometry.py` | Keck/KILO/E-ELT sub-aperture packing, pupil constraints, seed strategies. |
 | `fresnel.py` | Angular-spectrum scalar propagation. |
 | `uv_coverage.py` | Baseline enumeration, ENU-to-UV projection, off-zenith sky-plane projection. |
-| `stellar_disk.py` | Uniform-disk null-floor integration. |
+| `stellar_disk.py` | Uniform-disk null floor as the disk excess over the on-axis throughput, on a Gauss-Legendre radial quadrature. |
 | `planet_throughput.py` | Off-axis input fields, chip throughput vs separation, dark-port transmission maps. |
-| `realized_null.py` | Monte Carlo AO-realized null-depth statistics, including IID + common-mode piston covariance. |
+| `realized_null.py` | Monte Carlo AO-realized null-depth statistics, including IID + common-mode piston covariance; photon-weighted band leakage mean and within-azimuth RMS (`band_leakage_statistics`). |
 | `quadrature_fringe_tracker.py` | Quadrature-reference mesh primitives and analytic observability/CRLB estimates. |
 | `scintillation.py` | Scintillation and amplitude-servo residual model. |
-| `fringe_tracking.py` | Piston-servo bandwidth, disturbance terms, photon-Kalman residual budget, AR(1) temporal-Kalman covariance surrogate. |
+| `fringe_tracking.py` | Piston-servo bandwidth, disturbance terms (aperture-filtered von Karman differential piston, Conan et al. 1995), photon-Kalman residual budget, AR(1) temporal-Kalman covariance surrogate. |
 | `systematic_bandwidth.py` | Effective bandwidth for null-instability noise. |
 | `spectroscopy.py` | Spectro-port SNR, max resolving power, AWG spectrograph model. |
 | `mkid.py` | MKID resolving power and energy-response matrix primitives. |
 | `spectra.py` | Template spectrum loading, constant-R grids, Doppler shift, resolving-power convolution, flux-conserving resampling. |
 | `hdc.py` | High dispersion coronagraphy matched-filter CCF budget: channelization, template weights, self-subtraction (global and per island), the RV scan (`ccf_rv_scan`) with its grid-wide localization verdict under a modeled residual leak, and the inverse solve `ccf_contrast_at_target_snr` (faintest contrast reaching a target SNR). |
 | `pdi.py` | Polarimetric differential imaging SNR primitives. |
-| `characterization.py` | Known-position chip optimization for spectro mode. |
+| `characterization.py` | Known-position chip optimization for spectro mode; piston-averaged port power (`piston_averaged_port_power`, `mode_piston_opd_covariance_m2`). |
 | `characterization_torch.py` | Torch autograd-Jacobian helper for characterization optimization. |
 | `imaging.py` | Aperture-synthesis image reconstruction: beam patterns, photon-count observations, SNR maps, NNLS. |
 | `fringe_observability.py` | Piston/amplitude observability primitives: response matrices, SVD/CRLB, Monte Carlo estimation, Gauss-Newton capture range, acquisition scans, cophasing handoff. |
@@ -355,7 +357,7 @@ Reference/instrument configs in the root of `examples/`:
   6-subaperture-per-pupil quadrature mesh extending `kilo_keck.toml`; source
   of the phasing-paper bundle.
 - `examples/nayra_eelt.toml` — single-pupil E-ELT NAYRA at Cerro Armazones;
-  N=48 sub-aperture J-primary baseline.
+  N=18 sub-aperture J-primary dual-pol baseline.
 - `examples/hwo_space.toml` — HWO-class space nuller, no atmosphere/AO
   stages.
 
@@ -366,20 +368,22 @@ Regression and smoke-test configs under `examples/test/`:
 - `nayra_eelt_baseline.toml` — fixed-point NAYRA regression reference (no
   sweeps).
 - `detection_space_example.toml` — minimal detection-space output exercise.
-- `mkid_native_spectro.toml` — MKID-native spectroscopy smoke config.
+- `mkid_native_spectro.toml` — MKID-native spectroscopy smoke config. This
+  and the three HDC configs below are one 10 m telescope with four pupil
+  modes (`telescope.pupil_modes`), no delay lines.
 - `hdc_ccf_smoke.toml` — HDC cross-correlation smoke config: four modes, M2V
   host, AWG spectro port at R = 5000, `characterization.hdc_ccf` + `hdc_ccf`
   plot. Runs in seconds. Photon limited, so the CCF loses to the broadband
   band SNR — correctly, there being no systematic to reject.
 - `hdc_ccf_systematics.toml` — the same chain with a quasi-static leak
-  instability (`residual_speckle_stability_factor = 1e-3`,
+  instability (`residual_speckle_stability_factor = 4e-3`,
   `with_fringe_tracking = false`), the regime where characterization-mode HDC
   wins. Companion to `hdc_ccf_smoke.toml`; the config header carries the
   budget and the caveats on the asserted correlation time.
-- `hdc_detection_smoke.toml` — detection-mode HDC: same systematics knobs on
-  `performance.standard`, `performance.hdc` over seven separation anchors, and
-  the `detection_space` overlay. `ccf_contrast_gain` 28.199 with the knobs,
-  0.626 without.
+- `hdc_detection_smoke.toml` — detection-mode HDC: the same systematics knobs
+  (eps = 1e-3) on `performance.standard`, `performance.hdc` over seven
+  separation anchors, and the `detection_space` overlay. `ccf_contrast_gain`
+  5.007 with the knobs, 0.163 without.
 - `kilo_vs_hwo_study.toml` — cross-config comparison study.
 - `kilo_keck_quadrature_mesh.toml` — KILO Keck with a 48-mode
   duplicated-input Clements mesh and cophasing diagnostics.
@@ -438,7 +442,7 @@ tests/examples/            end-to-end config checks
 Default test command:
 
 ```bash
-conda run -n py313 pytest
+uv run pytest -n auto
 ```
 
 Target subsets by appending a path: `tests/pipeline`, `tests/stages`,

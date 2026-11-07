@@ -1,7 +1,7 @@
 """Checks for the systematics-dominated HDC characterization example.
 
 The smoke config is photon limited, so cross-correlation has nothing to
-reject and loses to broadband (ccf_snr 70.22 against band SNR 387.41) --
+reject and loses to broadband (ccf_snr 126.48 against band SNR 691.61) --
 the matched filter discards the continuum photons the band SNR counts.
 This example is tuned into the opposite regime: the leaked-starlight
 systematic dominates the variance budget, and the matched filter now beats
@@ -82,12 +82,12 @@ def test_systematics_example_is_systematic_dominated_and_hdc_wins() -> None:
 
     # Systematics dominate the cross-correlation variance budget: without
     # this the comparison below would just be two photon-limited numbers.
-    # Achieved ratio is 4.04; the floor leaves room for retuning but fails
+    # Achieved ratio is 4.59; the floor leaves room for retuning but fails
     # loudly if the config drifts back toward the photon-limited regime.
     assert hdc["ccf_systematic_var_counts"] > 2.0 * hdc["ccf_photon_var_counts"]
 
     # HDC digs the planet out of the systematic wall that caps broadband.
-    # Achieved ratio is 10.07.
+    # Achieved ratio is 9.69.
     assert math.isfinite(hdc["ccf_snr"])
     assert hdc["ccf_snr"] > 0.0
     assert hdc["ccf_snr"] > 3.0 * spectro["snr"]
