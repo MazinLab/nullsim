@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -28,6 +29,8 @@ from nullsim.physics.fringe_observability import (
 from nullsim.pipeline import BaseStage, SimulationState, register_stage
 from nullsim.stages._mode_splitter import splitter_physical_indices
 from nullsim.stages._utils import detector_n_pol_arms, unique_component_name
+
+_LOGGER = logging.getLogger(__name__)
 
 _CHIP_PREFIX = "chip.kernel_mzi_mesh"
 _FT_PREFIX = "fringe_tracking.closed_loop"
@@ -204,7 +207,12 @@ class FringeObservability(BaseStage):
         )
         wavelengths_m = np.asarray(wavelengths_um, dtype=np.float64) * 1.0e-6
 
-        input_fields = _recover_chip_input_fields(state, u_stack, self.type_name)
+        arm_fields = _recover_chip_input_fields(state, u_stack, self.type_name)
+        # Nonlinear and amplitude diagnostics model the dominant-power arm
+        # with arm-summed counts; the piston Fisher information (SVD, CRLB,
+        # covariance, linear Monte Carlo) sums each arm's own field and rates.
+        dominant_arm = int(np.argmax(np.sum(np.abs(arm_fields) ** 2, axis=(0, 1))))
+        input_fields = arm_fields[:, :, dominant_arm : dominant_arm + 1]
         port_labels = _require_port_labels(state, n_ports, self.type_name)
         bright_indices, bright_labels = _bright_port_indices(
             port_labels,
@@ -264,19 +272,37 @@ class FringeObservability(BaseStage):
         )
 
         basis_set = _piston_basis_set(state, n_modes)
-        response, projected_counts, whitened, svd, crlb = _linear_observability(
+        response, projected_counts, whitened = _whitened_piston_response(
             u_stack=u_stack,
             input_fields=input_fields,
             wavelengths_m=wavelengths_m,
             bright_indices=bright_indices,
-            wavelength_indices=wavelength_indices,
             wavelength_groups=wavelength_groups,
             piston_basis=basis_set.chip_basis,
-            n_piston_modes=basis_set.n_physical_modes,
             signal_counts=signal_counts,
             signal_counts_by_wavelength=signal_counts_by_wavelength,
             variance_counts=variance_counts,
             params=params,
+        )
+        whitened_fisher, n_fisher_arms = _piston_fisher_whitened(
+            state=state,
+            arm_fields=arm_fields,
+            u_stack=u_stack,
+            wavelengths_m=wavelengths_m,
+            bright_indices=bright_indices,
+            wavelength_groups=wavelength_groups,
+            piston_basis=basis_set.chip_basis,
+            frame_time_s=frame_time_s,
+            params=params,
+            stage_name=self.type_name,
+        )
+        svd = svd_observability(
+            whitened_fisher,
+            relative_threshold=float(params.relative_singular_threshold),
+            absolute_threshold=float(params.absolute_singular_threshold),
+        )
+        crlb = cramer_rao_bound_from_svd(
+            svd, n_piston_modes=int(basis_set.n_physical_modes)
         )
         (
             amplitude_response,
@@ -322,7 +348,7 @@ class FringeObservability(BaseStage):
         channel_sweep = _channel_sweep_payload(
             state=state,
             u_stack=u_stack,
-            input_fields=input_fields,
+            arm_fields=arm_fields,
             wavelengths_m=wavelengths_m,
             bright_indices=bright_indices,
             piston_basis=basis_set.chip_basis,
@@ -345,7 +371,7 @@ class FringeObservability(BaseStage):
         # independent (different per-trial draw counts), so estimator
         # comparisons mixed both regimes (review 2026-06-10 Issue 30e).
         linear_mc = linearized_reconstruction_monte_carlo(
-            whitened_response_per_m=whitened,
+            whitened_response_per_m=whitened_fisher,
             piston_basis=basis_set.physical_basis,
             piston_rms_m=float(params.piston_rms_nm_for_mc) / _M_TO_NM,
             n_trials=int(params.n_monte_carlo),
@@ -455,7 +481,7 @@ class FringeObservability(BaseStage):
             cophasing_counts_by_wavelength=cophasing_counts_by_wavelength,
             wavelength_groups=wavelength_groups,
             piston_basis=basis_set.physical_basis,
-            science_whitened_response_per_m=whitened,
+            science_whitened_response_per_m=whitened_fisher,
             piston_rms_m=float(params.piston_rms_nm_for_mc) / _M_TO_NM,
             n_trials=int(params.cophasing_handoff_n_monte_carlo),
             rng=np.random.default_rng(int(params.mc_seed) + 30_000),
@@ -552,6 +578,7 @@ class FringeObservability(BaseStage):
                 np.int64,
                 copy=True,
             ),
+            "piston_fisher_polarization_arms": int(n_fisher_arms),
             "singular_values_per_m": svd.singular_values.astype(np.float64, copy=True),
             "singular_value_tolerance_per_m": float(svd.tolerance),
             "rank": int(svd.rank),
@@ -842,19 +869,11 @@ def _recover_chip_input_fields(
             f"{stage_name} requires post-chip field amplitudes with shape "
             f"({u_stack.shape[0]}, {u_stack.shape[2]}, n_pol); got {output.shape}."
         )
-    if output.shape[2] > 1:
-        # Dual-pol PBS-arm deployment: the arms are separate chips sharing the
-        # design unitary with small per-arm diagonal phase trims, so their
-        # fractional piston responses agree to first order. The audit models
-        # the dominant-power arm's coherent response; absolute count budgets
-        # come from photon_rates, which already sum both arms.
-        arm_powers = np.sum(np.abs(output) ** 2, axis=(0, 1))
-        dominant_arm = int(np.argmax(arm_powers))
-        output = output[:, :, dominant_arm : dominant_arm + 1]
-    recovered = np.zeros((u_stack.shape[1], u_stack.shape[2], 1), dtype=np.complex128)
-    for wave in range(u_stack.shape[2]):
-        recovered[:, wave, 0] = u_stack[:, :, wave].conj().T @ output[:, wave, 0]
-    return recovered
+    # Dual-pol PBS-arm deployment: the last axis holds one field per arm. The
+    # arms are separate chips sharing the design unitary with small per-arm
+    # diagonal phase trims, so each arm's input field is recovered through
+    # the shared u_stack.
+    return np.einsum("pmw,pwa->mwa", u_stack.conj(), output)
 
 
 def _require_port_labels(
@@ -890,20 +909,23 @@ def _require_port_labels(
     return labels
 
 
-def _sum_polarization_arm_rows(
+def _polarization_arm_rows(
     arr: NDArray[np.float64],
     n_pol_arms: int,
+    arm: int | None,
     stage_name: str,
 ) -> NDArray[np.float64]:
+    """Sum the port-major, arm-minor detector rows over arms, or pick one arm."""
+
     if n_pol_arms <= 1:
         return arr
     if arr.shape[0] % n_pol_arms != 0:
         raise ValueError(
-            f"{stage_name} cannot sum polarization arms: rate rows "
+            f"{stage_name} cannot split polarization arms: rate rows "
             f"({arr.shape[0]}) are not a multiple of n_pol_arms ({n_pol_arms})."
         )
-    n_physical = arr.shape[0] // n_pol_arms
-    return arr.reshape(n_physical, n_pol_arms, arr.shape[1]).sum(axis=1)
+    per_arm = arr.reshape(arr.shape[0] // n_pol_arms, n_pol_arms, arr.shape[1])
+    return per_arm.sum(axis=1) if arm is None else per_arm[:, arm, :]
 
 
 def _bright_port_indices(
@@ -1089,6 +1111,7 @@ def _expected_count_budget(
     frame_time_s: float,
     params: FringeObservability.Params,
     stage_name: str,
+    arm: int | None = None,
 ) -> tuple[
     NDArray[np.float64],
     NDArray[np.float64],
@@ -1103,6 +1126,7 @@ def _expected_count_budget(
         wavelength_groups=wavelength_groups,
         params=params,
         stage_name=stage_name,
+        arm=arm,
     )
     signal_counts = (signal_rates.T.reshape(-1) * float(frame_time_s)).astype(
         np.float64,
@@ -1232,11 +1256,13 @@ def _signal_rate_channels_hz(
     wavelength_groups: tuple[NDArray[np.intp], ...],
     params: FringeObservability.Params,
     stage_name: str,
+    arm: int | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], dict[str, Any]]:
     rate_arr, source_metadata = _detector_signal_rate_matrix(
         state,
         stage_name=stage_name,
         source_mode=str(params.count_rate_source),
+        arm=arm,
     )
     if np.any(port_indices < 0) or np.any(port_indices >= rate_arr.shape[0]):
         raise ValueError(f"{stage_name} selected port index is invalid.")
@@ -1325,16 +1351,31 @@ def _signal_rate_channels_hz(
     )
 
 
-def _upstream_detector_qe(state: SimulationState) -> tuple[float | None, str | None]:
-    for name, payload in state.results.components.items():
-        if not name.startswith(("detector.mkid", "detector.snspd")):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        value = payload.get("detector_qe")
-        if isinstance(value, (int, float)) and np.isfinite(float(value)):
-            return float(value), str(name)
+def _newest_detector_component(
+    state: SimulationState,
+) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    """Return the most recently added detector payload, the tracker detector.
+
+    QE and rates both come from this one component so a tracker budget never
+    pairs one detector's QE with another detector's rates.
+    """
+
+    for name, payload in reversed(tuple(state.results.components.items())):
+        if name.startswith(("detector.mkid", "detector.snspd")) and isinstance(
+            payload, dict
+        ):
+            return str(name), payload
     return None, None
+
+
+def _upstream_detector_qe(state: SimulationState) -> tuple[float | None, str | None]:
+    name, payload = _newest_detector_component(state)
+    if payload is None:
+        return None, None
+    value = payload.get("detector_qe")
+    if isinstance(value, (int, float)) and np.isfinite(float(value)):
+        return float(value), name
+    return None, name
 
 
 def _detector_signal_rate_matrix(
@@ -1342,8 +1383,13 @@ def _detector_signal_rate_matrix(
     *,
     stage_name: str,
     source_mode: str = "auto",
+    arm: int | None = None,
 ) -> tuple[NDArray[np.float64], dict[str, Any]]:
-    """Return the best available per-port, per-wavelength signal-rate budget."""
+    """Return the best available per-port, per-wavelength signal-rate budget.
+
+    ``arm`` selects one polarization arm's detector rows; ``None`` sums the
+    arms into physical chip ports.
+    """
 
     if source_mode not in {"auto", "photon_rates", "detector_uncapped"}:
         raise ValueError(
@@ -1351,42 +1397,48 @@ def _detector_signal_rate_matrix(
             "expected 'auto', 'photon_rates', or 'detector_uncapped'."
         )
 
-    detector_name: str | None = None
-    if source_mode != "photon_rates":
-        for name, payload in state.results.components.items():
-            if not name.startswith(("detector.mkid", "detector.snspd")):
+    n_pol_arms = detector_n_pol_arms(state)
+    detector_name, payload = _newest_detector_component(state)
+    if source_mode != "photon_rates" and payload is not None:
+        # The tracker measures physical photons at their true wavelengths, so
+        # the per-wavelength derivatives must pair with the true rates, never
+        # an MKID energy-redistributed spectrum (which detector.mkid stores
+        # under uncapped_port_rate_hz_per_wavelength when resolving_power_ref
+        # is set; its true rates go under true_rates_hz_per_port_wavelength).
+        for key in (
+            "true_rates_hz_per_port_wavelength",
+            "uncapped_port_rate_hz_per_wavelength",
+        ):
+            raw = payload.get(key)
+            if raw is None:
                 continue
-            if not isinstance(payload, dict):
-                continue
-            detector_name = str(name)
-            for key in (
-                "uncapped_port_rate_hz_per_wavelength",
-                "true_rates_hz_per_port_wavelength",
-            ):
-                raw = payload.get(key)
-                if raw is None:
-                    continue
-                arr = np.asarray(raw, dtype=np.float64)
-                if arr.ndim != 2:
-                    raise ValueError(
-                        f"{stage_name} expected detector payload {name!r} key "
-                        f"{key!r} to have shape (n_ports, n_wavelength), got "
-                        f"{arr.shape}."
-                    )
-                n_pol_arms = detector_n_pol_arms(state)
-                arr = _sum_polarization_arm_rows(arr, n_pol_arms, stage_name)
-                return arr, {
-                    "rate_source": f"{name}.{key}",
-                    "rate_source_component": detector_name,
-                    "rate_source_is_uncapped": True,
-                    "count_rate_source_mode": source_mode,
-                    "polarization_arms_summed": int(n_pol_arms),
-                }
-        if source_mode == "detector_uncapped":
-            raise ValueError(
-                f"{stage_name} count_rate_source='detector_uncapped' requires an "
-                "upstream detector payload with per-wavelength uncapped/true rates."
-            )
+            arr = np.asarray(raw, dtype=np.float64)
+            if arr.ndim != 2:
+                raise ValueError(
+                    f"{stage_name} expected detector payload {detector_name!r} "
+                    f"key {key!r} to have shape (n_ports, n_wavelength), got "
+                    f"{arr.shape}."
+                )
+            if payload.get("resolving_power_ref") is not None:
+                _LOGGER.info(
+                    "%s: tracker detector %s is energy resolving; its MKID "
+                    "redistribution is ignored and the true per-wavelength "
+                    "rates are used.",
+                    stage_name,
+                    detector_name,
+                )
+            return _polarization_arm_rows(arr, n_pol_arms, arm, stage_name), {
+                "rate_source": f"{detector_name}.{key}",
+                "rate_source_component": detector_name,
+                "rate_source_is_uncapped": True,
+                "count_rate_source_mode": source_mode,
+                "polarization_arms_summed": int(n_pol_arms if arm is None else 1),
+            }
+    if source_mode == "detector_uncapped":
+        raise ValueError(
+            f"{stage_name} count_rate_source='detector_uncapped' requires an "
+            "upstream detector payload with per-wavelength uncapped/true rates."
+        )
 
     rates = state.photon_rates.rates_hz
     if rates is None:
@@ -1400,14 +1452,13 @@ def _detector_signal_rate_matrix(
             f"{stage_name} expects photon_rates.rates_hz with shape "
             f"(n_ports, n_wavelength); got {arr.shape}."
         )
-    n_pol_arms = detector_n_pol_arms(state)
-    arr = _sum_polarization_arm_rows(arr, n_pol_arms, stage_name)
+    arr = _polarization_arm_rows(arr, n_pol_arms, arm, stage_name)
     return arr, {
         "rate_source": "state.photon_rates.rates_hz",
         "rate_source_component": detector_name,
         "rate_source_is_uncapped": False,
         "count_rate_source_mode": source_mode,
-        "polarization_arms_summed": int(n_pol_arms),
+        "polarization_arms_summed": int(n_pol_arms if arm is None else 1),
     }
 
 
@@ -1428,16 +1479,14 @@ def _background_counts_by_wavelength(
     return background
 
 
-def _linear_observability(
+def _whitened_piston_response(
     *,
     u_stack: NDArray[np.complex128],
     input_fields: NDArray[np.complex128],
     wavelengths_m: NDArray[np.float64],
     bright_indices: NDArray[np.intp],
-    wavelength_indices: NDArray[np.intp],
     wavelength_groups: tuple[NDArray[np.intp], ...],
     piston_basis: NDArray[np.float64],
-    n_piston_modes: int,
     signal_counts: NDArray[np.float64],
     signal_counts_by_wavelength: NDArray[np.float64],
     variance_counts: NDArray[np.float64],
@@ -1459,13 +1508,67 @@ def _linear_observability(
         variance_counts=variance_counts,
         noise_floor_counts=float(params.noise_floor_counts),
     )
-    svd = svd_observability(
-        whitened,
-        relative_threshold=float(params.relative_singular_threshold),
-        absolute_threshold=float(params.absolute_singular_threshold),
-    )
-    crlb = cramer_rao_bound_from_svd(svd, n_piston_modes=int(n_piston_modes))
-    return response, projected_counts, whitened, svd, crlb
+    return response, projected_counts, whitened
+
+
+def _piston_fisher_whitened(
+    *,
+    state: SimulationState,
+    arm_fields: NDArray[np.complex128],
+    u_stack: NDArray[np.complex128],
+    wavelengths_m: NDArray[np.float64],
+    bright_indices: NDArray[np.intp],
+    wavelength_groups: tuple[NDArray[np.intp], ...],
+    piston_basis: NDArray[np.float64],
+    frame_time_s: float,
+    params: FringeObservability.Params,
+    stage_name: str,
+) -> tuple[NDArray[np.float64], int]:
+    """Whitened piston response carrying the Fisher information of all arms.
+
+    Each polarization arm is an independent detector channel with its own
+    field and rates, so the Fisher matrices ``W_a^T W_a`` add; stacking the
+    per-arm whitened rows realizes the sum. When the detector does not
+    publish per-arm rows, the dominant-power arm's field is paired with the
+    arm-summed rates.
+    """
+
+    n_arms = arm_fields.shape[2]
+    if n_arms > 1 and detector_n_pol_arms(state) == n_arms:
+        arms: tuple[int | None, ...] = tuple(range(n_arms))
+        fields = [arm_fields[:, :, a : a + 1] for a in range(n_arms)]
+    else:
+        dominant = int(np.argmax(np.sum(np.abs(arm_fields) ** 2, axis=(0, 1))))
+        arms = (None,)
+        fields = [arm_fields[:, :, dominant : dominant + 1]]
+    blocks = []
+    for arm, input_fields in zip(arms, fields, strict=True):
+        signal_counts, variance_counts, _, signal_by_wavelength, _, _ = (
+            _expected_count_budget(
+                state=state,
+                port_indices=bright_indices,
+                wavelength_groups=wavelength_groups,
+                frame_time_s=frame_time_s,
+                params=params,
+                stage_name=stage_name,
+                arm=arm,
+            )
+        )
+        blocks.append(
+            _whitened_piston_response(
+                u_stack=u_stack,
+                input_fields=input_fields,
+                wavelengths_m=wavelengths_m,
+                bright_indices=bright_indices,
+                wavelength_groups=wavelength_groups,
+                piston_basis=piston_basis,
+                signal_counts=signal_counts,
+                signal_counts_by_wavelength=signal_by_wavelength,
+                variance_counts=variance_counts,
+                params=params,
+            )[2]
+        )
+    return np.vstack(blocks), len(blocks)
 
 
 def _amplitude_observability(
@@ -1874,7 +1977,7 @@ def _channel_sweep_payload(
     *,
     state: SimulationState,
     u_stack: NDArray[np.complex128],
-    input_fields: NDArray[np.complex128],
+    arm_fields: NDArray[np.complex128],
     wavelengths_m: NDArray[np.float64],
     bright_indices: NDArray[np.intp],
     piston_basis: NDArray[np.float64],
@@ -1896,35 +1999,24 @@ def _channel_sweep_payload(
 
     for i, n_channels in enumerate(channels):
         wave_idx, groups = _select_wavelength_channels(n_wavelengths, int(n_channels))
-        (
-            signal_counts,
-            variance_counts,
-            _background,
-            signal_counts_by_wavelength,
-            _background_by_wavelength,
-            _metadata,
-        ) = _expected_count_budget(
+        whitened, _n_arms = _piston_fisher_whitened(
             state=state,
-            port_indices=bright_indices,
+            arm_fields=arm_fields,
+            u_stack=u_stack,
+            wavelengths_m=wavelengths_m,
+            bright_indices=bright_indices,
             wavelength_groups=groups,
+            piston_basis=piston_basis,
             frame_time_s=frame_time_s,
             params=params,
             stage_name=stage_name,
         )
-        _response, _projected, _whitened, svd, crlb = _linear_observability(
-            u_stack=u_stack,
-            input_fields=input_fields,
-            wavelengths_m=wavelengths_m,
-            bright_indices=bright_indices,
-            wavelength_indices=wave_idx,
-            wavelength_groups=groups,
-            piston_basis=piston_basis,
-            n_piston_modes=n_piston_modes,
-            signal_counts=signal_counts,
-            signal_counts_by_wavelength=signal_counts_by_wavelength,
-            variance_counts=variance_counts,
-            params=params,
+        svd = svd_observability(
+            whitened,
+            relative_threshold=float(params.relative_singular_threshold),
+            absolute_threshold=float(params.absolute_singular_threshold),
         )
+        crlb = cramer_rao_bound_from_svd(svd, n_piston_modes=int(n_piston_modes))
         used[i] = int(wave_idx.size)
         rank[i] = int(svd.rank)
         observable[i] = float(svd.observable_fraction)

@@ -2221,12 +2221,17 @@ def _effective_group_wavelength(
     wavelengths_m: NDArray[np.floating],
     counts: NDArray[np.floating],
 ) -> float:
+    """Count-weighted harmonic mean wavelength, ``sum n / sum (n / lambda)``.
+
+    The pooled fringe phase of a group is ``2 pi OPD sum(n/lambda) / sum n``,
+    so this is the wavelength that converts it back to OPD.
+    """
+
     wavelengths = np.asarray(wavelengths_m, dtype=np.float64)
     weights = np.asarray(counts, dtype=np.float64)
-    total = float(np.sum(weights))
-    if total <= 0.0:
-        return float(np.mean(wavelengths))
-    return float(np.sum(wavelengths * weights) / total)
+    if float(np.sum(weights)) <= 0.0:
+        weights = np.ones_like(wavelengths)
+    return float(np.sum(weights) / np.sum(weights / wavelengths))
 
 
 def _measure_abcd_pair_edges(

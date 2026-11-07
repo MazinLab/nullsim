@@ -122,12 +122,12 @@ def k_band_zero_point_flux_density() -> float:
 def y_band_zero_point_flux_density() -> float:
     """Return the UKIDSS / MKO Y-band Vega zero-point flux density.
 
-    Hewett+ 2006, MNRAS 367, 454, Table 7: 5.913e-13 W cm^-2 um^-1 at
-    lambda = 1.020 um (effective wavelength), returned in SI
-    W m^-2 um^-1. KILO Keck Y-band runs key on this zeropoint
-    (``kilo/photometry.py``).
+    Hewett+ 2006, MNRAS 367, 454, Table 7: 5.71e-13 W cm^-2 um^-1
+    (2026 Jy) at the effective wavelength lambda = 1.0305 um, returned in
+    SI W m^-2 um^-1. KILO's ``VEGA_ZEROPOINTS_JY`` Y entry is the same
+    2026 Jy.
     """
-    return 5.913e-9
+    return 5.71e-9
 
 
 def i_band_zero_point_flux_density() -> float:

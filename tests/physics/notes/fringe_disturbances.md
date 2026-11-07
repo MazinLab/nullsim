@@ -5,21 +5,49 @@ for the inter-telescope piston and vibration residual primitives.
 
 ## Von Karman Differential Piston
 
-For baselines much longer than the atmospheric outer scale, the differential
-piston structure function saturates. Following Linfield, Colavita, and Lane
-(2001), the long-baseline substitution is `B -> L0`. Absil et al. (2006) give
-the RMS differential OPD coefficient
+The uncorrected piston difference between two circular apertures of diameter
+`D` whose centers are `B` apart follows from the von Karman phase spectrum
+(Conan, Rousset, and Madec 1995):
 
 ```text
-sigma_OPD = 2.62 * (lambda / 2pi) * (L0 / r0(lambda))^(5/6).
+W(f)    = 0.023 r0^(-5/3) (f^2 + L0^-2)^(-11/6)
+sigma^2 = 2 int W(f) [1 - J0(2 pi f B)] [2 J1(pi D f) / (pi D f)]^2 d^2f
+        = 4 pi 0.023 r0^(-5/3) int_0^inf f (f^2 + L0^-2)^(-11/6) A(f) [1 - J0] df
 ```
 
-Because `r0(lambda) ~ lambda^(6/5)`, the wavelength prefactor cancels exactly
-with the `r0` scaling. The implementation evaluates the expression at 500 nm:
+in rad^2 at 500 nm, converted to OPD with `lambda / 2pi`. Each aperture's
+piston is the mean over its full clear disk. Because `r0(lambda) ~
+lambda^(6/5)`, the OPD is achromatic and the 500 nm evaluation is exact.
 
-```text
-2.62 * (5e-7 / 2pi) * (25 / 0.15)^(5/6) = 14.81 um.
-```
+Limits pinned by the tests:
+
+- `B -> inf, D -> 0`: `[1 - J0] -> 1` and the radial integral is
+  `(3/5) L0^(5/3)`, so `sigma^2 = (12 pi / 5) 0.023 (L0/r0)^(5/3) =
+  0.1734 (L0/r0)^(5/3)` rad^2. At `r0 = 0.15 m, L0 = 25 m` that is
+  875.2 rad^2, `2.354 um` RMS.
+- `B << L0, D -> 0`: the Kolmogorov structure function `6.88 (B/r0)^(5/3)`.
+  At `B/L0 = 1e-9` the outer-scale correction is about `-1.5 (B/L0)^(1/3)
+  = -0.15%`, and the rounded 0.023 prefactor sits 0.44% above the 0.02290
+  that 6.88 implies, so the code returns about 1.003 times 6.88.
+- `r0 = 0.15 m, L0 = 25 m, B = 85 m` (Keck-Keck): `2.354 um` for points,
+  `1.688 um` for 10 m primaries, `2.292 um` for 1.4 m subapertures, from an
+  independent adaptive-quadrature integration (review 2026-11-07 Issue 3).
+  At 85 m the result is within 0.01% of the `B -> inf` value.
+
+The code integrates on a grid that is geometric below `1/max(B, D)` and
+linear above it, with 40 samples per Bessel period, and adds the closed-form
+point tail above the cutoff.
+
+The earlier implementation used `sigma_OPD = 2.62 (lambda/2pi)
+(L0/r0)^(5/6)`, the Kolmogorov structure function evaluated at `B = L0`
+(`2.62^2 = 6.88`). That is not the saturated von Karman value: it gave
+14.81 um, 39.6 times the point-aperture variance and 77 times the 10 m
+aperture variance.
+
+The `fringe_tracking.closed_loop` stage passes the horizontal pair separation
+from `geometry.aperture_positions_enu_m` and the full primary diameter
+`geometry.diameter_m`, and averages the variance over telescope pairs. With
+no aperture positions it uses `B -> inf`, the upper bound.
 
 ## Flat-Knee Servo Residual
 
@@ -70,8 +98,8 @@ so
 sigma_residual^2 = (7/12) * sigma^2 * (f_k / f_c)^2.
 ```
 
-With `sigma = 14.81 um`, `f_k = 0.6656 Hz`, and `f_c = 50 Hz`, the residual is
-`sqrt(7/12) * 14.81e3 nm * (0.6656/50) = 150.6 nm`.
+With the Keck-Keck `sigma = 1.688 um`, `f_k = 0.6656 Hz`, and `f_c = 50 Hz`,
+the residual is `sqrt(7/12) * 1688.1 nm * (0.6656/50) = 17.16 nm`.
 
 ## Vibration Lines And Broadband Floor
 

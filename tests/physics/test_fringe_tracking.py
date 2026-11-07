@@ -107,15 +107,100 @@ def test_optimal_bandwidth_in_kilo_keck_regime() -> None:
     assert 30.0 < f_opt < 3000.0
 
 
-def test_von_karman_differential_piston_saturates_at_outer_scale() -> None:
-    """B >> L0 differential piston saturates with B replaced by L0."""
+def _opd_m_to_rad2_at_500nm(sigma_m: float) -> float:
+    return (2.0 * math.pi * sigma_m / 500.0e-9) ** 2
+
+
+def test_von_karman_differential_piston_point_saturation_limit() -> None:
+    """B -> inf, D -> 0: 2 x 2 pi 0.023 r0^-5/3 int f (f^2+L0^-2)^-11/6 df.
+
+    The radial integral is (3/5) L0^(5/3), so sigma^2 = (12 pi/5) 0.023
+    (L0/r0)^(5/3) = 0.1734 (L0/r0)^(5/3) rad^2 (Conan et al. 1995). The old
+    code returned the Kolmogorov structure function at B = L0,
+    6.88 (L0/r0)^(5/3), 39.6x too much variance.
+    """
+
+    for r0_m, outer_scale_m in ((0.15, 25.0), (0.1, 60.0)):
+        sigma2_rad2 = _opd_m_to_rad2_at_500nm(
+            von_karman_differential_piston_rms_m(
+                r0_500nm_m=r0_m, outer_scale_m=outer_scale_m
+            )
+        )
+        assert sigma2_rad2 == pytest.approx(
+            0.1734 * (outer_scale_m / r0_m) ** (5.0 / 3.0), rel=2e-4
+        )
+    # A finite baseline far beyond L0 has decorrelated to the same limit.
+    far = von_karman_differential_piston_rms_m(
+        r0_500nm_m=0.15, outer_scale_m=25.0, baseline_m=2000.0
+    )
+    assert far == pytest.approx(
+        von_karman_differential_piston_rms_m(r0_500nm_m=0.15, outer_scale_m=25.0),
+        rel=1e-5,
+    )
+
+
+def test_von_karman_differential_piston_kolmogorov_limit() -> None:
+    """B << L0, D -> 0 recovers D_phi(B) = 6.88 (B/r0)^(5/3).
+
+    The outer-scale correction is about -1.5 (B/L0)^(1/3), 0.15% at
+    B/L0 = 1e-9; the 0.023 PSD prefactor is 0.44% above the 0.02290 that
+    6.88 implies, so the expected ratio is about 1.003.
+    """
+
+    for baseline_m in (1.0, 3.0):
+        sigma2_rad2 = _opd_m_to_rad2_at_500nm(
+            von_karman_differential_piston_rms_m(
+                r0_500nm_m=0.15, outer_scale_m=1.0e9, baseline_m=baseline_m
+            )
+        )
+        assert sigma2_rad2 / (6.88 * (baseline_m / 0.15) ** (5.0 / 3.0)) == (
+            pytest.approx(1.003, abs=2e-3)
+        )
+
+
+@pytest.mark.parametrize(
+    "aperture_diameter_m, expected_um",
+    [(0.0, 2.354), (10.0, 1.688), (1.4, 2.292)],
+)
+def test_von_karman_differential_piston_aperture_filtered_kilo_values(
+    aperture_diameter_m: float, expected_um: float
+) -> None:
+    """r0 = 0.15 m, L0 = 25 m, Keck-Keck B = 85 m: saturated OPD RMS.
+
+    Expected values are from an independent adaptive-quadrature integration
+    of the Conan et al. (1995) aperture-filtered spectrum (review
+    2026-11-07, Issue 3): points, 10 m primaries, 1.4 m subapertures.
+    """
 
     sigma_m = von_karman_differential_piston_rms_m(
         r0_500nm_m=0.15,
         outer_scale_m=25.0,
+        baseline_m=85.0,
+        aperture_diameter_m=aperture_diameter_m,
     )
+    assert sigma_m * 1.0e6 == pytest.approx(expected_um, abs=1.5e-3)
 
-    assert sigma_m == pytest.approx(14.81e-6, rel=1.0e-3)
+
+def test_effective_mode_baseline_matches_structure_function_variance() -> None:
+    """B_eff^(5/3) sum c^2 = -sum_{i!=j} c_i c_j r_ij^(5/3) for zero-sum c.
+
+    A pure pair difference returns its separation; an aperture with zero
+    coefficient adds nothing (the old (c_i - c_j)^2 weights counted it).
+    The three-aperture mode (1, 1, -2) at x = 0, 4, 86 m is a hand
+    calculation: -2 [4^(5/3) - 2 * 86^(5/3) - 2 * 82^(5/3)] / 6.
+    """
+
+    from nullsim.physics.fringe_tracking import _effective_mode_baseline_m
+
+    positions = np.array([[0.0, 0.0], [4.0, 0.0], [86.0, 0.0]])
+    pair = np.array([1.0, 0.0, -1.0]) / math.sqrt(2.0)
+    assert _effective_mode_baseline_m(pair, positions) == pytest.approx(86.0)
+    tripod = np.array([1.0, 1.0, -2.0])
+    expected = (
+        -2.0 * (4.0 ** (5 / 3) - 2.0 * 86.0 ** (5 / 3) - 2.0 * 82.0 ** (5 / 3)) / 6.0
+    ) ** 0.6
+    assert _effective_mode_baseline_m(tripod, positions) == pytest.approx(expected)
+    assert _effective_mode_baseline_m(np.ones(3) / math.sqrt(3.0), positions) == 0.0
 
 
 def test_piston_psd_knee_is_max_of_outer_scale_and_aperture_cutoffs() -> None:
@@ -142,18 +227,21 @@ def test_servo_residual_flat_knee_17_3_coefficient() -> None:
 
 
 def test_inter_telescope_residual_end_to_end_number() -> None:
-    """14.81 um open-loop piston at 0.6656 Hz leaves 150.6 nm after 50 Hz servo."""
+    """1.688 um Keck-Keck open-loop piston at 0.6656 Hz leaves 17.16 nm at 50 Hz.
+
+    sqrt(7/12) * 1688.1 nm * (0.6656 / 50) = 17.163 nm.
+    """
 
     rms_nm = 1.0e9 * math.sqrt(
         servo_residual_variance_flat_knee(
-            sigma2=(14.81e-6) ** 2,
+            sigma2=(1.6881e-6) ** 2,
             f_knee_hz=0.6656,
             f_3db_hz=50.0,
             predictive_gain_variance=1.0,
         )
     )
 
-    assert rms_nm == pytest.approx(150.6, rel=2.0e-3)
+    assert rms_nm == pytest.approx(17.163, rel=2.0e-4)
 
 
 def test_vibration_residual_lines_only() -> None:

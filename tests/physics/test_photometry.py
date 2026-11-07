@@ -36,9 +36,17 @@ def test_k_band_zero_point_pins_cohen_2003_si_value() -> None:
 
 
 def test_y_band_zero_point_pins_hewett_2006_si_value() -> None:
-    """Phase 4.5: Y-band Vega zero point (UKIDSS/MKO, Hewett+ 2006)."""
+    """Y-band Vega zero point, Hewett+ 2006 Table 7: 5.71e-13 W cm^-2 um^-1.
 
-    assert y_band_zero_point_flux_density() == pytest.approx(5.913e-9, rel=0.01)
+    Independent check: Table 7's 2026 Jy converted with
+    F_lambda = F_nu c / lambda_eff^2 at lambda_eff = 1.0305 um.
+    """
+
+    assert y_band_zero_point_flux_density() == pytest.approx(5.71e-9, rel=1e-12)
+    f_lambda_from_jy = 2026.0e-26 * 2.99792458e8 / (1.0305e-6) ** 2 * 1.0e-6
+    assert y_band_zero_point_flux_density() == pytest.approx(
+        f_lambda_from_jy, rel=5e-3
+    )
 
 
 def test_i_band_zero_point_pins_bessell_1998_si_value() -> None:

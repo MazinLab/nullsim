@@ -724,3 +724,192 @@ def test_fringe_observability_collapses_dual_pol_arms(tmp_path: Path) -> None:
     assert dual_payload["piston_crlb_covariance_m2"] == pytest.approx(
         reference_payload["piston_crlb_covariance_m2"]
     )
+
+
+def _with_detectors(
+    state: SimulationState, detectors: dict[str, dict[str, object]]
+) -> SimulationState:
+    components = {
+        name: payload
+        for name, payload in state.results.components.items()
+        if not name.startswith("detector.")
+    }
+    components.update(detectors)
+    return replace(state, results=Results(components=components))
+
+
+_OBSERVABILITY_PARAMS = {
+    "n_spectral_channels": 4,
+    "n_monte_carlo": 8,
+    "piston_rms_nm_for_mc": 10.0,
+    "mc_seed": 4,
+}
+
+
+def _observability_payload(state: SimulationState, tmp_path: Path) -> dict:
+    return (
+        FringeObservability(params=_OBSERVABILITY_PARAMS, context=_context(tmp_path))
+        .apply(state)
+        .results.components["fringe_observability"]
+    )
+
+
+def test_fringe_observability_ignores_mkid_energy_redistribution(
+    tmp_path: Path,
+) -> None:
+    """Issue 6: the tracker response pairs with the true per-wavelength rates.
+
+    detector.mkid with resolving_power_ref stores the energy-redistributed
+    spectrum under uncapped_port_rate_hz_per_wavelength. The CRLB must equal
+    the one computed from the true rates alone.
+    """
+
+    base = _state()
+    true_rates = np.asarray(
+        base.results.components["detector.mkid"]["uncapped_port_rate_hz_per_wavelength"]
+    )
+    redistributed = np.repeat(
+        true_rates.mean(axis=1, keepdims=True), true_rates.shape[1], axis=1
+    )
+    energy_resolving = _with_detectors(
+        base,
+        {
+            "detector.mkid": {
+                "detector_qe": 0.7,
+                "resolving_power_ref": 30.0,
+                "uncapped_port_rate_hz_per_wavelength": redistributed,
+                "true_rates_hz_per_port_wavelength": true_rates,
+            }
+        },
+    )
+
+    payload = _observability_payload(energy_resolving, tmp_path)
+    reference = _observability_payload(base, tmp_path)
+
+    assert payload["rate_source"] == "detector.mkid.true_rates_hz_per_port_wavelength"
+    assert payload["crlb_piston_rms_nm"] == pytest.approx(
+        reference["crlb_piston_rms_nm"], rel=1e-12
+    )
+
+
+def test_fringe_observability_takes_qe_and_rates_from_newest_detector(
+    tmp_path: Path,
+) -> None:
+    """Issue 25: an older detector's QE never pairs with a newer one's rates."""
+
+    base = _state()
+    rates = np.asarray(
+        base.results.components["detector.mkid"]["uncapped_port_rate_hz_per_wavelength"]
+    )
+    state = _with_detectors(
+        base,
+        {
+            "detector.mkid": {
+                "detector_qe": 0.7,
+                "uncapped_port_rate_hz_per_wavelength": 3.0 * rates,
+            },
+            "detector.snspd": {
+                "detector_qe": 0.85,
+                "uncapped_port_rate_hz_per_wavelength": rates,
+            },
+        },
+    )
+    params = {**_OBSERVABILITY_PARAMS, "tracker_qe": 0.85}
+
+    payload = (
+        FringeObservability(params=params, context=_context(tmp_path))
+        .apply(state)
+        .results.components["fringe_observability"]
+    )
+
+    assert payload["upstream_detector_component"] == "detector.snspd"
+    assert payload["upstream_detector_qe"] == pytest.approx(0.85)
+    assert payload["tracker_qe_scale"] == pytest.approx(1.0)
+    assert payload["rate_source"] == "detector.snspd.uncapped_port_rate_hz_per_wavelength"
+
+
+def test_fringe_observability_sums_fisher_over_distinct_pol_arms(
+    tmp_path: Path,
+) -> None:
+    """Row 49: each arm's own field and rates; the Fisher matrices add.
+
+    Arm B carries a different input-field pattern, so pairing the dominant
+    arm's field with arm-summed rates is wrong. The dual-arm CRLB precision
+    must equal the sum of the two single-arm precisions, each computed from
+    a scalar state built from that arm alone.
+    """
+
+    base = _state()
+    wavelengths = base.field.wavelength_grid_um
+    u_stack = np.asarray(base.results.components["chip.kernel_mzi_mesh"]["u_stack"])
+    arm_a = np.asarray(base.field.amplitudes, dtype=np.complex128)
+    rng = np.random.default_rng(5)
+    input_b = (
+        rng.normal(size=(4, len(wavelengths), 1))
+        + 1j * rng.normal(size=(4, len(wavelengths), 1))
+    )
+    arm_b = 0.7 * np.einsum("ijw,jwp->iwp", u_stack, input_b)
+    n_ports = arm_a.shape[0]
+
+    def scalar_state(arm: np.ndarray) -> SimulationState:
+        rates = np.abs(arm[:, :, 0]) ** 2 * 1.0e8
+        return replace(
+            _with_detectors(
+                base,
+                {
+                    "detector.mkid": {
+                        "detector_qe": 0.7,
+                        "uncapped_port_rate_hz_per_wavelength": rates,
+                    }
+                },
+            ),
+            field=Field(amplitudes=arm, wavelength_grid_um=wavelengths),
+            photon_rates=PhotonRates(
+                wavelength_grid_um=wavelengths,
+                port_labels=base.photon_rates.port_labels,
+                rates_hz=rates,
+            ),
+        )
+
+    dual_amplitudes = np.concatenate([arm_a, arm_b], axis=2)
+    dual_rates = np.transpose(
+        np.abs(dual_amplitudes) ** 2 * 1.0e8, (0, 2, 1)
+    ).reshape(2 * n_ports, len(wavelengths))
+    dual = replace(
+        _with_detectors(
+            base,
+            {
+                "detector.mkid": {
+                    "detector_qe": 0.7,
+                    "n_pol_arms": 2,
+                    "uncapped_port_rate_hz_per_wavelength": dual_rates,
+                }
+            },
+        ),
+        field=Field(amplitudes=dual_amplitudes, wavelength_grid_um=wavelengths),
+        photon_rates=PhotonRates(
+            wavelength_grid_um=wavelengths,
+            port_labels=tuple(
+                f"bright_{i}_{arm}" for i in range(n_ports) for arm in ("A", "B")
+            ),
+            rates_hz=dual_rates,
+        ),
+    )
+
+    dual_payload = _observability_payload(dual, tmp_path)
+    precision = [
+        np.linalg.pinv(
+            _observability_payload(scalar_state(arm), tmp_path)[
+                "piston_crlb_covariance_m2"
+            ]
+        )
+        for arm in (arm_a, arm_b)
+    ]
+
+    assert dual_payload["piston_fisher_polarization_arms"] == 2
+    np.testing.assert_allclose(
+        np.linalg.pinv(dual_payload["piston_crlb_covariance_m2"]),
+        precision[0] + precision[1],
+        rtol=1e-8,
+        atol=1e-8 * float(np.max(np.abs(precision[0] + precision[1]))),
+    )

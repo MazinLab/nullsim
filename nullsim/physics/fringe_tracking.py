@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 from numpy.typing import NDArray
@@ -33,8 +34,11 @@ __all__ = [
     "von_karman_differential_piston_rms_m",
 ]
 
-VON_KARMAN_PISTON_COEFFICIENT = 2.62
-"""sigma_OPD = 2.62 (lambda/2pi) (B/r0)^(5/6); B -> L0 for B >> L0."""
+VON_KARMAN_PISTON_COEFFICIENT = 12.0 * math.pi / 5.0 * 0.023
+"""Saturated point-aperture differential piston, 0.1734 (L0/r0)^(5/3) rad^2."""
+
+_VON_KARMAN_PSD_COEFFICIENT = 0.023
+"""Von Karman phase PSD prefactor, W(f) = 0.023 r0^(-5/3) (f^2 + L0^-2)^(-11/6)."""
 
 PISTON_PSD_APERTURE_CUTOFF_COEFFICIENT = 0.3
 """High-frequency aperture-averaging cutoff 0.3 v/D."""
@@ -94,8 +98,25 @@ def von_karman_differential_piston_rms_m(
     *,
     r0_500nm_m: float,
     outer_scale_m: float,
+    baseline_m: float = math.inf,
+    aperture_diameter_m: float = 0.0,
 ) -> float:
-    """Uncorrected inter-telescope differential piston RMS, B >> L0 regime.
+    """Uncorrected differential piston RMS between two apertures (von Karman).
+
+    Conan, Rousset & Madec (1995, JOSA A 12, 1559) aperture-filtered
+    differential piston for two circular apertures of diameter ``D`` whose
+    centers are ``B`` apart:
+
+        sigma^2 = 2 int W_phi(f) [1 - J0(2 pi f B)] [2 J1(pi D f)/(pi D f)]^2 d^2f
+        W_phi(f) = 0.023 r0^(-5/3) (f^2 + L0^(-2))^(-11/6)
+
+    in rad^2 at 500 nm, converted to OPD with ``lambda / 2 pi``. Each
+    aperture's piston is the average over its full clear disk (no central
+    obstruction). Limits: ``B -> inf, D -> 0`` gives
+    ``(12 pi / 5) 0.023 (L0/r0)^(5/3) = 0.1734 (L0/r0)^(5/3)``; ``B << L0,
+    D -> 0`` gives the Kolmogorov phase structure function
+    ``6.88 (B/r0)^(5/3)``. The defaults (``B = inf``, ``D = 0``) return the
+    saturated point-aperture value, an upper bound for any finite geometry.
 
     Achromatic: ``r0 ~ lambda^(6/5)`` cancels the wavelength prefactor, so
     evaluating at 500 nm is exact for any science band.
@@ -103,25 +124,89 @@ def von_karman_differential_piston_rms_m(
     Args:
         r0_500nm_m: Fried parameter at 500 nm, in meters.
         outer_scale_m: Von Karman atmospheric outer scale, in meters.
+        baseline_m: Aperture center separation in meters; ``inf`` for
+            fully decorrelated apertures.
+        aperture_diameter_m: Aperture diameter in meters; ``0`` for points.
 
     Returns:
         Differential piston RMS in meters.
 
     Raises:
-        ValueError: If either physical scale is not finite and positive.
+        ValueError: If a physical scale is outside its valid range.
     """
 
     if r0_500nm_m <= 0.0 or not math.isfinite(float(r0_500nm_m)):
         raise ValueError("r0_500nm_m must be finite and positive.")
     if outer_scale_m <= 0.0 or not math.isfinite(float(outer_scale_m)):
         raise ValueError("outer_scale_m must be finite and positive.")
+    if not baseline_m > 0.0:
+        raise ValueError("baseline_m must be positive (inf allowed).")
+    if aperture_diameter_m < 0.0 or not math.isfinite(float(aperture_diameter_m)):
+        raise ValueError("aperture_diameter_m must be finite and non-negative.")
 
-    wavelength_500nm_m = 500.0e-9
-    return float(
-        VON_KARMAN_PISTON_COEFFICIENT
-        * (wavelength_500nm_m / (2.0 * math.pi))
-        * (float(outer_scale_m) / float(r0_500nm_m)) ** (5.0 / 6.0)
+    sigma2_rad2 = (
+        4.0 * math.pi * _VON_KARMAN_PSD_COEFFICIENT * float(r0_500nm_m) ** (-5.0 / 3.0)
+        * _differential_piston_radial_integral(
+            outer_scale_m=float(outer_scale_m),
+            baseline_m=float(baseline_m),
+            aperture_diameter_m=float(aperture_diameter_m),
+        )
     )
+    wavelength_500nm_m = 500.0e-9
+    return float(math.sqrt(sigma2_rad2) * wavelength_500nm_m / (2.0 * math.pi))
+
+
+@lru_cache(maxsize=64)
+def _differential_piston_radial_integral(
+    *,
+    outer_scale_m: float,
+    baseline_m: float,
+    aperture_diameter_m: float,
+) -> float:
+    """``int_0^inf f (f^2 + k^2)^(-11/6) A(f) [1 - J0(2 pi f B)] df``.
+
+    ``A(f)`` is the squared Airy piston filter. The grid is geometric
+    (40 points per e-fold) below ``1/s`` and linear with step ``1/(40 s)``
+    above it, ``s = max(B, D)``, so every Bessel oscillation is sampled.
+    Above ``f_hi`` the ``J0`` term has averaged out; for points the
+    remaining ``int f (f^2+k^2)^(-11/6) df`` tail is added in closed form,
+    and for ``D > 0`` the ``f^(-17/3)`` filtered tail is negligible.
+    """
+
+    from scipy.special import j0, j1
+
+    k2 = outer_scale_m**-2
+    finite_baseline = math.isfinite(baseline_m)
+    if not finite_baseline and aperture_diameter_m == 0.0:
+        return 0.6 * k2 ** (-5.0 / 6.0)
+
+    scale_m = max(baseline_m if finite_baseline else 0.0, aperture_diameter_m)
+    f_lo = 1.0e-4 * min(1.0 / outer_scale_m, 1.0 / scale_m)
+    if aperture_diameter_m > 0.0:
+        f_hi = 200.0 / aperture_diameter_m
+    else:
+        f_hi = 200.0 * max(1.0 / outer_scale_m, 1.0 / baseline_m)
+    f_knee = min(1.0 / scale_m, f_hi)
+    f = np.concatenate(
+        (
+            np.geomspace(f_lo, f_knee, int(40.0 * math.log(f_knee / f_lo)) + 2),
+            np.arange(f_knee, f_hi, 1.0 / (40.0 * scale_m))[1:],
+        )
+    )
+    integrand = f * (f * f + k2) ** (-11.0 / 6.0)
+    if finite_baseline:
+        integrand = integrand * (1.0 - j0(2.0 * math.pi * f * baseline_m))
+    if aperture_diameter_m > 0.0:
+        x = math.pi * aperture_diameter_m * f
+        integrand = integrand * (2.0 * j1(x) / x) ** 2
+    total = float(np.trapezoid(integrand, f))
+    # Analytic contribution below f_lo: the integrand is O(f^3) there when
+    # B is finite and O(f) for B = inf.
+    if not finite_baseline:
+        total += 0.5 * f_lo**2 * k2 ** (-11.0 / 6.0)
+    if aperture_diameter_m == 0.0:
+        total += 0.6 * (f[-1] ** 2 + k2) ** (-5.0 / 6.0)
+    return total
 
 
 def piston_psd_knee_hz(
@@ -845,21 +930,27 @@ def _effective_mode_baseline_m(
     mode: NDArray[np.float64],
     positions_xy_m: NDArray[np.float64],
 ) -> float:
-    """Return weighted RMS separation for a common-piston-free mode."""
+    """Return the two-aperture baseline with the same Kolmogorov variance.
+
+    For a zero-sum piston mode ``c`` the phase variance is
+    ``-1/2 sum_ij c_i c_j D(r_ij)`` with ``D(r) = 6.88 (r/r0)^(5/3)``, so
+
+        B_eff = [sum_{i!=j} (-c_i c_j) r_ij^(5/3) / sum_i c_i^2]^(3/5)
+
+    is the baseline whose two-aperture differential ``(1, -1)/sqrt(2)``
+    has that variance per unit norm. The mean is projected out first, and
+    apertures with zero coefficient contribute nothing.
+    """
 
     coeff = np.asarray(mode, dtype=np.float64)
     coeff = coeff - float(np.mean(coeff))
-    diff = coeff[:, np.newaxis] - coeff[np.newaxis, :]
-    weights = diff * diff
-    if not np.any(weights > 0.0):
+    norm2 = float(np.sum(coeff * coeff))
+    if norm2 <= 1.0e-24 * max(float(np.sum(np.asarray(mode) ** 2)), 1.0e-300):
         return 0.0
     delta = positions_xy_m[:, np.newaxis, :] - positions_xy_m[np.newaxis, :, :]
-    dist2 = np.sum(delta * delta, axis=2)
-    upper = np.triu(np.ones_like(weights, dtype=bool), k=1)
-    denom = float(np.sum(weights[upper]))
-    if denom <= 0.0:
-        return 0.0
-    return float(math.sqrt(max(float(np.sum(weights[upper] * dist2[upper])) / denom, 0.0)))
+    dist_5_3 = np.sum(delta * delta, axis=2) ** (5.0 / 6.0)
+    weighted = -float(coeff @ dist_5_3 @ coeff)
+    return float(max(weighted / norm2, 0.0) ** 0.6)
 
 
 def _steady_state_scalar_kalman_variances(

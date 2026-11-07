@@ -52,6 +52,9 @@ def _stage(
     # file build minimal states with no upstream AO stage, so we pin
     # the bandwidth to the pre-Phase-2 default here.
     overrides.setdefault("servo_bw_hz", 2000.0)
+    # The piston servo residual needs the chip mode count for its sensing
+    # efficiency; these minimal states carry no field.
+    overrides.setdefault("n_modes", 24)
     return ClosedLoopFringeTracker(dict(overrides), context)
 
 
@@ -163,11 +166,15 @@ def _with_ao_residual(
     )
 
 
+def _with_small_ao(state: SimulationState) -> SimulationState:
+    return _with_ao_residual(state, temporal_nm=10.0, fitting_nm=3.0, wfs_noise_nm=2.0)
+
+
 def test_closed_loop_supersedes_upstream_and_adds_residual_component(
     tmp_path: Path,
 ) -> None:
     stage = _stage(_context(tmp_path))
-    state = _state()
+    state = _with_small_ao(_state())
 
     result = stage.apply(state)
 
@@ -185,7 +192,7 @@ def test_closed_loop_total_rms_excludes_superseded_atmos_piston(
     tmp_path: Path,
 ) -> None:
     stage = _stage(_context(tmp_path))
-    state = _state(atmos_piston_rms_opd_nm=200.0)
+    state = _with_small_ao(_state(atmos_piston_rms_opd_nm=200.0))
 
     result = stage.apply(state)
 
@@ -215,9 +222,11 @@ def test_closed_loop_respects_explicit_superseded_component(
     # Mark atmos_piston superseded as pyramid_wfs would
     components = dict(state.opd_budget.components)
     components["atmos_piston"] = replace(components["atmos_piston"], superseded=True)
-    state = replace(
-        state,
-        opd_budget=replace(state.opd_budget, components=components),
+    state = _with_small_ao(
+        replace(
+            state,
+            opd_budget=replace(state.opd_budget, components=components),
+        )
     )
 
     stage = _stage(
@@ -249,9 +258,11 @@ def test_closed_loop_supersedes_all_replaced_ao_piston_components(
             reduction_stage="transport.smf28",
         ),
     }
-    state = _state(
-        atmos_piston_rms_opd_nm=100.0,
-        extra_components=extra,
+    state = _with_small_ao(
+        _state(
+            atmos_piston_rms_opd_nm=100.0,
+            extra_components=extra,
+        )
     )
     stage = _stage(_context(tmp_path))
 
@@ -273,9 +284,14 @@ def test_closed_loop_high_bandwidth_drives_residual_to_shot_noise_floor(
 ) -> None:
     """In the photon-rich limit, raising servo_bw cuts the lag-dominated total."""
 
-    base_state = _state(
-        atmos_piston_rms_opd_nm=500.0,
-        bright_port_rate_hz=1.0e18,  # photon-rich so shot noise is negligible
+    base_state = _with_ao_residual(
+        _state(
+            atmos_piston_rms_opd_nm=500.0,
+            bright_port_rate_hz=1.0e18,  # photon-rich so shot noise is negligible
+        ),
+        temporal_nm=500.0,
+        fitting_nm=0.0,
+        wfs_noise_nm=0.0,
     )
 
     stage_high_bw = _stage(
@@ -306,13 +322,17 @@ def test_closed_loop_shot_noise_vanishes_in_photon_rich_limit(
 ) -> None:
     """Very high photon rate should leave only the servo-lag floor."""
 
-    state_rich = _state(
-        atmos_piston_rms_opd_nm=500.0,
-        bright_port_rate_hz=1.0e18,  # photon-rich regime
+    state_rich = _with_small_ao(
+        _state(
+            atmos_piston_rms_opd_nm=500.0,
+            bright_port_rate_hz=1.0e18,  # photon-rich regime
+        )
     )
-    state_starved = _state(
-        atmos_piston_rms_opd_nm=500.0,
-        bright_port_rate_hz=1.0e2,  # photon-starved regime
+    state_starved = _with_small_ao(
+        _state(
+            atmos_piston_rms_opd_nm=500.0,
+            bright_port_rate_hz=1.0e2,  # photon-starved regime
+        )
     )
 
     stage = _stage(_context(tmp_path))
@@ -334,18 +354,26 @@ def test_closed_loop_predictive_kalman_reduces_residual_in_lag_regime(
 ) -> None:
     """predictive_lag_reduction=0.05 cuts residual sqrt(20)~4.47x in lag regime."""
 
-    # Lag-dominated regime: low signal, narrow servo bandwidth, large piston
-    state = _state(
-        atmos_piston_rms_opd_nm=500.0,
-        bright_port_rate_hz=1.0e15,  # photon-rich so shot noise is negligible
+    # Lag-only regime: photon-rich, no irreducible AO piston, and n_modes=2
+    # so the sensing efficiency is 1 and no temporal piston is uncorrectable.
+    state = _with_ao_residual(
+        _state(
+            atmos_piston_rms_opd_nm=500.0,
+            bright_port_rate_hz=1.0e18,
+        ),
+        temporal_nm=500.0,
+        fitting_nm=0.0,
+        wfs_noise_nm=0.0,
     )
 
     stage_leaky = _stage(
         _context(tmp_path),
+        n_modes=2,
         predictive_lag_reduction=1.0,
     )
     stage_kalman = _stage(
         _context(tmp_path),
+        n_modes=2,
         predictive_lag_reduction=0.05,
     )
 
@@ -356,14 +384,9 @@ def test_closed_loop_predictive_kalman_reduces_residual_in_lag_regime(
         "fringe_tracking.closed_loop_residual"
     ].rms_opd_nm
 
-    # Variance ratio = 0.05 => sigma ratio = sqrt(20) ~= 4.472 in the strict
-    # lag limit. With the post-Tier-2 standalone (f_piston/f_servo)^(5/3)
-    # the lag variance is much smaller in absolute terms than under the
-    # (mis-)multiplied old formula, so a tiny residual shot contribution
-    # nudges the observed sigma ratio ~0.15% below sqrt(20). Tolerance
-    # widened from 1e-3 to 5e-3 — still tight enough to pin the LQG scaling.
+    # Variance ratio = 0.05 => sigma ratio = sqrt(20) ~= 4.472.
     ratio = residual_leaky / residual_kalman
-    assert ratio == pytest.approx(math.sqrt(20.0), rel=5.0e-3)
+    assert ratio == pytest.approx(math.sqrt(20.0), rel=1.0e-6)
 
 
 @pytest.mark.stats
@@ -372,13 +395,18 @@ def test_closed_loop_shot_variance_halves_when_photon_rate_doubles(
 ) -> None:
     """Doubling the photon rate halves sigma^2_shot (Shao-Colavita)."""
 
-    state_low = _state(
-        atmos_piston_rms_opd_nm=0.0,  # zero atmosphere so lag term vanishes
-        bright_port_rate_hz=1.0e6,
+    # Zero AO piston breakdown: the residual is pure shot noise.
+    state_low = _with_ao_residual(
+        _state(atmos_piston_rms_opd_nm=0.0, bright_port_rate_hz=1.0e6),
+        temporal_nm=0.0,
+        fitting_nm=0.0,
+        wfs_noise_nm=0.0,
     )
-    state_high = _state(
-        atmos_piston_rms_opd_nm=0.0,
-        bright_port_rate_hz=2.0e6,
+    state_high = _with_ao_residual(
+        _state(atmos_piston_rms_opd_nm=0.0, bright_port_rate_hz=2.0e6),
+        temporal_nm=0.0,
+        fitting_nm=0.0,
+        wfs_noise_nm=0.0,
     )
 
     stage = _stage(_context(tmp_path))
@@ -391,13 +419,8 @@ def test_closed_loop_shot_variance_halves_when_photon_rate_doubles(
     ].rms_opd_nm
 
     # sigma^2_shot halves -> sigma_shot reduces by sqrt(2).
-    # Pre-Tier-2 the lag term was multiplied by σ²_atmos so setting
-    # atmos_piston=0 killed lag entirely; with the corrected standalone
-    # (f_piston/f_servo)^(5/3) a tiny lag residual remains even at
-    # atmos_piston=0. Loosen rtol from 1e-6 to 1e-4 — still tight enough
-    # to pin the Shao-Colavita 1/N_s scaling.
     ratio = residual_low / residual_high
-    assert ratio == pytest.approx(math.sqrt(2.0), rel=1.0e-4)
+    assert ratio == pytest.approx(math.sqrt(2.0), rel=1.0e-9)
 
 
 @pytest.mark.stats
@@ -411,19 +434,26 @@ def test_closed_loop_lag_variance_drops_by_2_pow_5over3_when_servo_doubles(
     # `bright_0` port now contributes to FT shot noise (after the bright-port
     # masking fix), so bump the rate enough that shot-noise contribution stays
     # negligible vs the lag-dominated 2^(5/3) variance ratio.
-    state = _state(
-        atmos_piston_rms_opd_nm=500.0,
-        bright_port_rate_hz=1.0e18,
+    state = _with_ao_residual(
+        _state(
+            atmos_piston_rms_opd_nm=500.0,
+            bright_port_rate_hz=1.0e18,
+        ),
+        temporal_nm=500.0,
+        fitting_nm=0.0,
+        wfs_noise_nm=0.0,
     )
 
     stage_baseline = _stage(
         _context(tmp_path),
         servo_bw_hz=1.0e3,
+        n_modes=2,
         predictive_lag_reduction=1.0,
     )
     stage_doubled = _stage(
         _context(tmp_path),
         servo_bw_hz=2.0e3,
+        n_modes=2,
         predictive_lag_reduction=1.0,
     )
 
@@ -440,42 +470,17 @@ def test_closed_loop_lag_variance_drops_by_2_pow_5over3_when_servo_doubles(
 
 
 
-def test_closed_loop_lag_matches_kilo_standalone_formula(tmp_path: Path) -> None:
-    """Regression test for Tier 2.1 Conan-lag fix.
+def test_closed_loop_rejects_legacy_servo_lag_model(tmp_path: Path) -> None:
+    """use_full_piston_servo_residual=false selected a lag model with no r0.
 
-    KILO ``fringe_tracking_phase_noise`` (kilo/fringe_tracking.py:180-182)
-    uses ``sigma2_bw = (f_piston / f_servo) ** (5/3)`` standalone — no
-    ``× σ²_atmos`` multiplication. Pre-fix nullsim multiplied by the
-    full-aperture atmospheric piston variance, inflating the lag term
-    by 2-3 orders of magnitude (this is why ``ao_piston_scale=0.064``
-    existed in kilo_keck.toml). Pin the formula directly so any
-    regression to the pre-fix multiplication shows up immediately.
+    Its (f_piston/f_servo)^(5/3) rad^2 lag variance ignored r0 and the
+    upstream piston, so the OPD residual scaled with wavelength. The flag now
+    defaults to true and false is refused with the reason.
     """
-    wind_speed = 10.0
-    eff_diameter = 10.0
-    servo_bw = 2000.0
-    state = _state(
-        atmos_piston_rms_opd_nm=500.0,  # value irrelevant after the fix
-        bright_port_rate_hz=1.0e22,     # photon-noise free
-        diameter_m=eff_diameter,
-    )
-    stage = _stage(
-        _context(tmp_path),
-        servo_bw_hz=servo_bw,
-        wind_speed_m_s=wind_speed,
-        predictive_lag_reduction=1.0,
-    )
-    residual_nm = stage.apply(state).opd_budget.components[
-        "fringe_tracking.closed_loop_residual"
-    ].rms_opd_nm
 
-    # KILO standalone lag: (f_piston / f_servo)^(5/3) (radians^2)
-    f_piston = 0.134 * wind_speed / eff_diameter
-    sigma2_lag_rad2 = (f_piston / servo_bw) ** (5.0 / 3.0)
-    expected_rms_nm = math.sqrt(sigma2_lag_rad2) * (
-        _representative_wavelength_m_default() * 1.0e9 / (2.0 * math.pi)
-    )
-    assert residual_nm == pytest.approx(expected_rms_nm, rel=5.0e-3)
+    assert _stage(_context(tmp_path)).params_model.use_full_piston_servo_residual
+    with pytest.raises(ValidationError, match="ignores r0"):
+        _stage(_context(tmp_path), use_full_piston_servo_residual=False)
 
 
 def test_closed_loop_shao_colavita_matches_kilo_formula(tmp_path: Path) -> None:
@@ -496,10 +501,15 @@ def test_closed_loop_shao_colavita_matches_kilo_formula(tmp_path: Path) -> None:
     visibility = 0.9
     n_spectral_channels = 10
     servo_bw = 2000.0
-    state = _state(
-        atmos_piston_rms_opd_nm=0.0,  # lag will still be small but finite
-        bright_port_rate_hz=total_rate_hz,
-        n_ports=n_ports,
+    state = _with_ao_residual(
+        _state(
+            atmos_piston_rms_opd_nm=0.0,
+            bright_port_rate_hz=total_rate_hz,
+            n_ports=n_ports,
+        ),
+        temporal_nm=0.0,  # zero AO piston: the residual is pure shot noise
+        fitting_nm=0.0,
+        wfs_noise_nm=0.0,
     )
     stage = _stage(
         _context(tmp_path),
@@ -522,11 +532,7 @@ def test_closed_loop_shao_colavita_matches_kilo_formula(tmp_path: Path) -> None:
     # ``kilo/fringe_tracking.py:439-443``).
     sigma2_shot_rad2 = (math.pi / 2.0) * sigma2_per_channel / n_spectral_channels
 
-    # Conan lag at default v=10 m/s, D=10 m, servo=2 kHz (small contribution).
-    f_piston = 0.134 * 10.0 / 10.0
-    sigma2_lag_rad2 = (f_piston / servo_bw) ** (5.0 / 3.0)
-
-    expected_rms_nm = math.sqrt(sigma2_shot_rad2 + sigma2_lag_rad2) * (
+    expected_rms_nm = math.sqrt(sigma2_shot_rad2) * (
         _representative_wavelength_m_default() * 1.0e9 / (2.0 * math.pi)
     )
     assert residual_nm == pytest.approx(expected_rms_nm, rel=1.0e-6)
@@ -840,11 +846,13 @@ def test_closed_loop_control_model_classical_preserves_default_results(
 def test_closed_loop_classical_accelerometer_fusion_reduces_vibration_variance(
     tmp_path: Path,
 ) -> None:
-    state = _state(
-        atmos_piston_rms_opd_nm=200.0,
-        diameter_m=10.0,
-        bright_port_rate_hz=1.0e8,
-        n_ports=4,
+    state = _with_small_ao(
+        _state(
+            atmos_piston_rms_opd_nm=200.0,
+            diameter_m=10.0,
+            bright_port_rate_hz=1.0e8,
+            n_ports=4,
+        )
     )
     common_params = {
         "servo_bw_hz": 100.0,
@@ -852,6 +860,7 @@ def test_closed_loop_classical_accelerometer_fusion_reduces_vibration_variance(
         "vibration_broadband_rms_nm": 30.0,
         "fusion_coherent_fraction": 0.7,
         "fusion_broadband_suppression": 10.0,
+        "n_modes": 24,
     }
 
     raw_payload = _fringe_tracking_payload(
@@ -1044,16 +1053,23 @@ def test_closed_loop_uses_effective_baseline_param_override(
 ) -> None:
     """Effective baseline Param overrides geometry.diameter_m for f_piston."""
 
-    state = _state(
-        atmos_piston_rms_opd_nm=500.0,
-        diameter_m=10.0,
-        bright_port_rate_hz=1.0e15,
+    state = _with_ao_residual(
+        _state(
+            atmos_piston_rms_opd_nm=500.0,
+            diameter_m=10.0,
+            bright_port_rate_hz=1.0e18,
+        ),
+        temporal_nm=500.0,
+        fitting_nm=0.0,
+        wfs_noise_nm=0.0,
+        subaperture_diameter_m=10.0,
     )
 
-    stage_geom = _stage(_context(tmp_path), predictive_lag_reduction=1.0)
+    stage_geom = _stage(_context(tmp_path), n_modes=2, predictive_lag_reduction=1.0)
     stage_override = _stage(
         _context(tmp_path),
         effective_baseline_m=20.0,  # 2x baseline => f_piston halved
+        n_modes=2,
         predictive_lag_reduction=1.0,
     )
 
@@ -1065,12 +1081,8 @@ def test_closed_loop_uses_effective_baseline_param_override(
     ].rms_opd_nm
 
     # f_piston halved => sigma^2_lag drops by 2^(5/3); sigma by 2^(5/6).
-    # Post-Tier-2 the lag variance is much smaller in absolute terms
-    # (standalone (f_piston/f_servo)^(5/3) instead of × σ²_atmos), so the
-    # residual photon-noise floor shifts the observed ratio ~0.02% from
-    # the analytic limit. Loosen rtol from 1e-4 to 5e-3.
     assert residual_geom / residual_override == pytest.approx(
-        2.0 ** (5.0 / 6.0), rel=5.0e-3
+        2.0 ** (5.0 / 6.0), rel=1.0e-6
     )
 
 
@@ -1349,7 +1361,12 @@ def test_closed_loop_simultaneous_bands_scale_ft_photon_budget(
 ) -> None:
     """J/H/K simultaneous operation improves the FT shot-noise budget."""
 
-    state = _state(atmos_piston_rms_opd_nm=0.0, bright_port_rate_hz=1.0e6)
+    state = _with_ao_residual(
+        _state(atmos_piston_rms_opd_nm=0.0, bright_port_rate_hz=1.0e6),
+        temporal_nm=0.0,
+        fitting_nm=0.0,
+        wfs_noise_nm=0.0,
+    )
     state = replace(state, scene=Scene(star_jmag=5.0))
 
     single = _stage(_context(tmp_path), servo_bw_hz=2000.0)
@@ -1377,6 +1394,36 @@ def test_closed_loop_simultaneous_bands_scale_ft_photon_budget(
     assert payload["simultaneous_science_bands"] == ("J", "H", "K")
     assert payload["simultaneous_science_band_rate_scale"] > 1.0
     assert multi_residual < single_residual
+
+    # OPD information per photon scales as 1/lambda^2 (row 44): each band
+    # counts N_b T_b (lambda_ref / lambda_b)^2 photons at the 1.25 um
+    # reference, over the unweighted current-grid rate.
+    from nullsim.physics.photometry import photon_rate_per_m2_per_bin
+    from nullsim.stages._science_bands import grid_photon_rate_per_m2
+
+    current = grid_photon_rate_per_m2(
+        magnitude=5.0,
+        wavelength_grid_um=_DEFAULT_WAVELENGTH_GRID_UM,
+        band="J",
+        stage_name="test",
+    ) * 0.985
+    information = sum(
+        photon_rate_per_m2_per_bin(5.0, center_um, width_um, band=band)
+        * transmission
+        * (1.25 / center_um) ** 2
+        for band, center_um, width_um, transmission in (
+            ("J", 1.25, 0.16, 0.985),
+            ("H", 1.65, 0.30, 0.97),
+            ("K", 2.20, 0.40, 0.92),
+        )
+    )
+    assert payload["simultaneous_science_band_information_scale"] == pytest.approx(
+        information / current, rel=1e-12
+    )
+    # Pure shot noise: the residual variance ratio is the inverse scale.
+    assert (single_residual / multi_residual) ** 2 == pytest.approx(
+        payload["simultaneous_science_band_information_scale"], rel=1e-9
+    )
 
 
 def test_closed_loop_classical_starved_photons_keep_shot_noise_in_residual(
@@ -1522,3 +1569,67 @@ def test_tracker_photon_budget_pools_dual_pol_arm_channels(tmp_path: Path) -> No
     # Two arm chips carry two tracker detector sets, so the per-port
     # capacity doubles.
     assert dual_budget.rate_cap_hz == pytest.approx(2.0 * scalar_budget.rate_cap_hz)
+
+
+def test_inter_telescope_piston_uses_geometry_baseline_and_primary(
+    tmp_path: Path,
+) -> None:
+    """Keck-Keck (85 m, 10 m primaries, r0 0.15 m, L0 25 m): 1.688 um RMS.
+
+    The value is the independent Conan et al. (1995) quadrature of review
+    2026-11-07 Issue 3; the old code returned 14.81 um. Without aperture
+    positions the pair is treated as decorrelated (B -> inf).
+    """
+
+    from nullsim.stages.fringe_tracking.closed_loop import (
+        _inter_telescope_piston_variance_m2,
+    )
+
+    params = _stage(_context(tmp_path), inter_telescope_piston=True).params_model
+    state = _with_small_ao(_state(diameter_m=10.0))
+    keck = replace(
+        state,
+        geometry=replace(
+            state.geometry,
+            aperture_positions_enu_m=np.array([[0.0, 0.0, 0.0], [85.0, 0.0, 1.0]]),
+        ),
+    )
+
+    sigma_um = math.sqrt(
+        _inter_telescope_piston_variance_m2(keck, params, "test")
+    ) * 1.0e6
+    assert sigma_um == pytest.approx(1.688, abs=1.5e-3)
+    unknown_um = math.sqrt(
+        _inter_telescope_piston_variance_m2(state, params, "test")
+    ) * 1.0e6
+    assert unknown_um == pytest.approx(sigma_um, rel=1e-3)
+
+
+def test_closed_loop_counts_logical_bright_ports_for_dual_pol_arms(
+    tmp_path: Path,
+) -> None:
+    """Row 45: bright_0_A/bright_0_B are one logical port, not two."""
+
+    n_wl = len(_DEFAULT_WAVELENGTH_GRID_UM)
+    labels = ("bright_0_A", "bright_0_B", "bright_1_A", "bright_1_B") + tuple(
+        f"dark_{idx}_{arm}" for idx in range(2) for arm in ("A", "B")
+    )
+    state = _with_small_ao(_state())
+    state = replace(
+        state,
+        photon_rates=PhotonRates(
+            wavelength_grid_um=_DEFAULT_WAVELENGTH_GRID_UM,
+            port_labels=labels,
+            rates_hz=np.full((len(labels), n_wl), 1.0e6),
+        ),
+        results=state.results.add_component("detector.mkid", {"n_pol_arms": 2}),
+    )
+
+    payload = _fringe_tracking_payload(
+        _stage(_context(tmp_path), n_modes=24).apply(state)
+    )
+
+    assert payload["n_bright_ports"] == 2
+    assert payload["piston_sensing_efficiency"] == pytest.approx(
+        min(2.0 * 2 * 2.5, 23.0) / 23.0
+    )

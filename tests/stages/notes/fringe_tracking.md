@@ -73,6 +73,12 @@ term by `predictive_lag_reduction` and the temporal piston variance:
 with `f_char = 0.134 * v_wind / d_sub_m` for the per-sub-aperture case
 and `d_sub_m = D_eff` for the per-telescope case.
 
+nullsim no longer implements the standalone `fringe_tracking_phase_noise`
+lag (review 2026-11-07 row 43): `(f_piston / f_servo)^(5/3)` rad^2 carries
+no r0 or upstream piston amplitude, and a fixed phase variance makes the
+OPD scale with wavelength. `use_full_piston_servo_residual` now defaults to
+true and false is rejected; only the `piston_servo_residual` form remains.
+
 The nullsim stage applies the lag formula to the upstream atmospheric
 piston RMS (`atmos_piston` OPDComponent) rather than the AO-residual
 `ao_temporal` because the fringe tracker corrects the residual *after*

@@ -869,3 +869,38 @@ def test_reconstruction_monte_carlo_leaves_degenerate_modes_unrecovered() -> Non
     )
 
     np.testing.assert_allclose(mc.residual_rms_m, mc.input_rms_m, rtol=1.0e-12)
+
+
+def test_abcd_pair_estimate_uses_count_weighted_harmonic_wavelength() -> None:
+    """Pooled ABCD phase over [1, 2] um converts back to the true OPD.
+
+    For small OPD the pooled phase is 2 pi OPD sum(n/lambda)/sum(n), so the
+    conversion wavelength must be sum(n)/sum(n/lambda) = 4/3 um here; the
+    old count-weighted arithmetic mean (1.5 um) read the OPD 12.5% high.
+    """
+
+    from nullsim.physics.fringe_observability import (
+        _effective_group_wavelength,
+        _measure_abcd_pair_edges,
+    )
+
+    wavelengths_m = np.array([1.0e-6, 2.0e-6])
+    assert _effective_group_wavelength(wavelengths_m, np.ones(2)) == pytest.approx(
+        4.0e-6 / 3.0
+    )
+    opd_m = 1.0e-10
+    edge_opd, _weight = _measure_abcd_pair_edges(
+        pistons_m=np.array([opd_m, 0.0]),
+        edges=np.array([[0, 1]]),
+        wavelengths_m=wavelengths_m,
+        wavelength_groups=(np.array([0, 1]),),
+        counts_per_wavelength=np.array([1.0e6, 1.0e6]),
+        visibility=1.0,
+        phase_offsets_rad=np.array([0.0, 0.5, 1.0, 1.5]) * np.pi,
+        edge_count_weights=np.ones(1),
+        dark_counts_per_output=0.0,
+        count_cap_per_output=None,
+        rng=np.random.default_rng(0),
+        shot_noise=False,
+    )
+    assert edge_opd[0] == pytest.approx(opd_m, rel=1e-6)

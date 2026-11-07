@@ -1,37 +1,13 @@
 """Closed-loop fringe-tracking residual piston OPD stage (SPEC §15.3 Pass 4b).
 
-Two paths are supported; ``use_full_piston_servo_residual`` on
-``Params`` picks between them.
+The residual follows the full KILO ``piston_servo_residual`` model below.
+The former legacy path (``use_full_piston_servo_residual=False``: bare
+Shao-Colavita shot noise plus a standalone Conan lag term) is rejected at
+validation: its lag variance ``(f_piston/f_servo)^(5/3)`` rad^2 carries no
+r0 or upstream piston amplitude, and a fixed phase variance makes the OPD
+scale with wavelength.
 
-Legacy path (``use_full_piston_servo_residual=False``, default) — the
-simpler KILO ``fringe_tracking_phase_noise`` (``kilo/fringe_tracking.py:
-98-183``) closed form. Two terms add in quadrature:
-
-1. Per-channel Shao-Colavita 1992 shot noise on the bright ports,
-   multiplied by π/2 (KILO_PARITY_PLAN §2.5 — the noise-equivalent
-   gain integral for a first-order servo with bandwidth ``f_s`` and
-   per-frame integration ``τ = 1/(2 f_s)``):
-
-       σ²_shot = (π/2) · Shao-Colavita(N_ph_per_channel) / N_channels
-
-   ``N_ph_per_channel`` is derived from ``state.photon_rates.rates_hz``,
-   restricted to bright-labeled ports, divided by ``n_bright_ports``
-   (so each baseline phase estimator sees per-port × per-channel
-   photons), and rescaled by ``τ_frame = 1/(2 f_s)``.
-
-2. Conan 1995 standalone servo-lag variance against the upstream
-   piston component:
-
-       f_piston    = 0.134 · v_wind / D_eff           (Conan et al. 1995)
-       σ²_lag      = (f_piston / f_servo)^{5/3}
-                     · predictive_lag_reduction
-
-   ``predictive_lag_reduction`` is the Kalman/LQG variance-reduction
-   multiplier. KILO ``FringeTrackingConfig`` defaults to ``1.0`` (leaky
-   integrator); NAYRA's E-ELT preset uses ``0.05`` (20× reduction).
-
-Full-physics path (``use_full_piston_servo_residual=True``,
-KILO_PARITY_PLAN §2.3) — reproduces KILO ``piston_servo_residual``
+Full-physics path (KILO_PARITY_PLAN §2.3) — reproduces KILO ``piston_servo_residual``
 (``kilo/fringe_tracking.py:335-471``) using the per-component AO piston
 breakdown the upstream ``ao.pyramid_wfs`` publishes on
 ``state.wavefront.components['ao_residual']['piston_opd_nm']``:
@@ -46,7 +22,7 @@ piston-filtered AO temporal variance, and ``σ²_irreducible`` =
 piston-filtered AO fitting + WFS-noise variance. Capped at the
 uncorrected total so the servo never makes things worse.
 
-In both paths the result is written to ``state.opd_budget.components``
+The result is written to ``state.opd_budget.components``
 as the named component ``fringe_tracking.closed_loop_residual`` with
 
     rms_opd_nm = sqrt(σ²_residual) · λ_center_m / (2 π) · 1e9
@@ -71,7 +47,6 @@ References:
 - Conan, Rousset & Madec 1995, JOSA-A 12, 1559 — piston-specific
   Greenwood frequency ``f_piston = 0.134 · v_wind / D_eff``.
 - KILO ``fringe_tracking.py`` lines 67-95 (Shao-Colavita primitive),
-  98-183 (``fringe_tracking_phase_noise`` legacy-path reference),
   335-471 (``piston_servo_residual`` full-physics reference).
 - NAYRA ``fringe_tracking.py`` predictive-default overrides.
 - ``tests/stages/notes/fringe_tracking.md`` for the full source survey.
@@ -214,16 +189,12 @@ class ClosedLoopFringeTracker(BaseStage):
             ),
             min_length=1,
         )
-        # KILO_PARITY_PLAN §2.3: when True, derive the residual from the
-        # full KILO ``piston_servo_residual`` decomposition
-        # (lag_reduced + photon + uncorrectable_temporal + irreducible
-        # piston-filtered fitting+WFS noise) read from the upstream
-        # ``ao_residual`` component. The legacy mode uses the simpler
-        # ``fringe_tracking_phase_noise`` (shot + bare Conan lag) — fine
-        # for configs without an AO breakdown but under-estimates
-        # σ_OPD by ~7× at Keck J=4 (0.19 nm vs KILO 1.35 nm) because
-        # the irreducible fitting+WFS-noise piston floor is missing.
-        use_full_piston_servo_residual: bool = False
+        # KILO_PARITY_PLAN §2.3: the residual is the full KILO
+        # ``piston_servo_residual`` decomposition (lag_reduced + photon +
+        # uncorrectable_temporal + irreducible piston-filtered fitting+WFS
+        # noise) read from the upstream ``ao_residual`` component. Kept as a
+        # field so existing configs validate; False is rejected below.
+        use_full_piston_servo_residual: bool = True
         # Total number of chip-input modes. Used by
         # ``piston_sensing_efficiency`` when the full residual mode is
         # enabled. Falls back to ``geometry.n_apertures × n_subapertures``
@@ -239,6 +210,15 @@ class ClosedLoopFringeTracker(BaseStage):
 
         @model_validator(mode="after")
         def _validate_vibration_lines(self) -> Self:
+            if not self.use_full_piston_servo_residual:
+                raise ValueError(
+                    "use_full_piston_servo_residual=false selected the removed "
+                    "legacy servo-lag model, whose lag variance "
+                    "(f_piston/f_servo)^(5/3) rad^2 ignores r0 and the upstream "
+                    "AO piston and so scales the OPD residual with wavelength. "
+                    "Drop the key (the full KILO piston_servo_residual model is "
+                    "the only one) and add an ao.pyramid_wfs stage upstream."
+                )
             if len(self.vibration_line_frequencies_hz) != len(self.vibration_line_rms_nm):
                 raise ValueError(
                     "vibration_line_frequencies_hz and vibration_line_rms_nm "
@@ -290,42 +270,24 @@ class ClosedLoopFringeTracker(BaseStage):
             # in the same payload — review 2026-06-10).
             sample_rate_hz = 1.0 / float(params.loop_latency_s)
             servo_bandwidth_source = "photon_kalman"
-            if params.use_full_piston_servo_residual:
-                # Accounting convention (review 2026-06-10 Issue 16):
-                # ALL tracker measurement noise is charged to the rank-1
-                # inter-telescope common mode (the photon-Kalman estimation
-                # term inside common_terms); the per-mode IID budget keeps
-                # sigma2_shot=0 under the assumption that per-mode pistons
-                # are slow/small and tracked with long effective windows.
-                # The lag term below still uses the fast common-mode
-                # f_3db — conservative for slow per-mode loops since the
-                # lag contribution is negligible at f_char << f_3db.
-                sigma2_iid_per_mode, breakdown = _piston_servo_residual_rad2(
-                    state=state,
-                    params=params,
-                    wavelength_center_m=wavelength_center_m,
-                    f_3db_hz=f_3db_hz,
-                    f_char_hz=f_char_hz,
-                    sigma2_shot=0.0,
-                    stage_name=self.type_name,
-                )
-            else:
-                sigma2_lag = _conan_servo_lag_variance_rad2(
-                    wind_speed_m_s=v_char_m_s,
-                    effective_baseline_m=effective_baseline_m,
-                    servo_bw_hz=f_3db_hz,
-                    predictive_lag_reduction=params.predictive_lag_reduction,
-                )
-                sigma2_iid_per_mode = sigma2_lag
-                breakdown = {
-                    "mode": "fringe_tracking_phase_noise_legacy",
-                    "sigma2_photon_rad2": 0.0,
-                    "sigma2_lag_reduced_rad2": float(sigma2_lag),
-                    "sigma2_uncorrectable_temporal_rad2": 0.0,
-                    "sigma2_irreducible_rad2": 0.0,
-                    "sigma2_residual_rad2": float(sigma2_iid_per_mode),
-                    "f_piston_hz": float(f_char_hz),
-                }
+            # Accounting convention (review 2026-06-10 Issue 16):
+            # ALL tracker measurement noise is charged to the rank-1
+            # inter-telescope common mode (the photon-Kalman estimation
+            # term inside common_terms); the per-mode IID budget keeps
+            # sigma2_shot=0 under the assumption that per-mode pistons
+            # are slow/small and tracked with long effective windows.
+            # The lag term below still uses the fast common-mode
+            # f_3db — conservative for slow per-mode loops since the
+            # lag contribution is negligible at f_char << f_3db.
+            sigma2_iid_per_mode, breakdown = _piston_servo_residual_rad2(
+                state=state,
+                params=params,
+                wavelength_center_m=wavelength_center_m,
+                f_3db_hz=f_3db_hz,
+                f_char_hz=f_char_hz,
+                sigma2_shot=0.0,
+                stage_name=self.type_name,
+            )
             breakdown.update(photon_kalman_breakdown)
         else:
             sample_rate_hz, servo_bandwidth_source = _resolve_sample_rate_hz(
@@ -343,33 +305,15 @@ class ClosedLoopFringeTracker(BaseStage):
                 sample_rate_hz=sample_rate_hz,
             )
 
-            if params.use_full_piston_servo_residual:
-                sigma2_iid_per_mode, breakdown = _piston_servo_residual_rad2(
-                    state=state,
-                    params=params,
-                    wavelength_center_m=wavelength_center_m,
-                    f_3db_hz=f_3db_hz,
-                    f_char_hz=f_char_hz,
-                    sigma2_shot=sigma2_shot,
-                    stage_name=self.type_name,
-                )
-            else:
-                sigma2_lag = _conan_servo_lag_variance_rad2(
-                    wind_speed_m_s=v_char_m_s,
-                    effective_baseline_m=effective_baseline_m,
-                    servo_bw_hz=f_3db_hz,
-                    predictive_lag_reduction=params.predictive_lag_reduction,
-                )
-                sigma2_iid_per_mode = sigma2_shot + sigma2_lag
-                breakdown = {
-                    "mode": "fringe_tracking_phase_noise_legacy",
-                    "sigma2_photon_rad2": float(sigma2_shot),
-                    "sigma2_lag_reduced_rad2": float(sigma2_lag),
-                    "sigma2_uncorrectable_temporal_rad2": 0.0,
-                    "sigma2_irreducible_rad2": 0.0,
-                    "sigma2_residual_rad2": float(sigma2_iid_per_mode),
-                    "f_piston_hz": float(f_char_hz),
-                }
+            sigma2_iid_per_mode, breakdown = _piston_servo_residual_rad2(
+                state=state,
+                params=params,
+                wavelength_center_m=wavelength_center_m,
+                f_3db_hz=f_3db_hz,
+                f_char_hz=f_char_hz,
+                sigma2_shot=sigma2_shot,
+                stage_name=self.type_name,
+            )
             common_terms = _common_disturbance_terms_rad2(
                 state=state,
                 params=params,
@@ -418,6 +362,11 @@ class ClosedLoopFringeTracker(BaseStage):
         breakdown["simultaneous_science_bands"] = simultaneous_bands
         breakdown["simultaneous_science_band_rate_scale"] = float(
             simultaneous_rate_scale
+        )
+        breakdown["simultaneous_science_band_information_scale"] = float(
+            _simultaneous_science_band_scale(
+                state, params, self.type_name, information_weighted=True,
+            )[0]
         )
         residual_rms_opd_nm = _phase_variance_rad2_to_opd_nm(
             sigma2_residual, wavelength_center_m
@@ -654,25 +603,15 @@ def _total_residual_variance_for_sample_rate_rad2(
         stage_name=stage_name,
         sample_rate_hz=sample_rate_hz,
     )
-    if params.use_full_piston_servo_residual:
-        sigma2_iid_per_mode, _breakdown = _piston_servo_residual_rad2(
-            state=state,
-            params=params,
-            wavelength_center_m=wavelength_center_m,
-            f_3db_hz=f_3db_hz,
-            f_char_hz=f_char_hz,
-            sigma2_shot=sigma2_photon,
-            stage_name=stage_name,
-        )
-    else:
-        effective_baseline_m = _effective_baseline_m(state, params, stage_name)
-        sigma2_lag = _conan_servo_lag_variance_rad2(
-            wind_speed_m_s=_effective_wind_speed_m_s(state, params),
-            effective_baseline_m=effective_baseline_m,
-            servo_bw_hz=f_3db_hz,
-            predictive_lag_reduction=params.predictive_lag_reduction,
-        )
-        sigma2_iid_per_mode = sigma2_photon + sigma2_lag
+    sigma2_iid_per_mode, _breakdown = _piston_servo_residual_rad2(
+        state=state,
+        params=params,
+        wavelength_center_m=wavelength_center_m,
+        f_3db_hz=f_3db_hz,
+        f_char_hz=f_char_hz,
+        sigma2_shot=sigma2_photon,
+        stage_name=stage_name,
+    )
 
     common_terms = _common_disturbance_terms_rad2(
         state=state,
@@ -815,22 +754,32 @@ def _tracker_photon_budget(
     else:
         n_pol_arms = 1
         n_bright_ports = n_bright_channels
-    scale, _bands, _current_band = _simultaneous_science_band_scale(
+    # Physical photons set the detector cap; information-equivalent photons
+    # at the reference wavelength set the phase noise (see
+    # simultaneous_band_rate_scale). The cap clips every band alike.
+    photon_scale, _bands, _current_band = _simultaneous_science_band_scale(
         state, params, stage_name,
     )
-    bright_rate_hz *= scale
-    rate_per_port_hz = bright_rate_hz / max(n_bright_ports, 1)
+    information_scale, _bands, _current_band = _simultaneous_science_band_scale(
+        state, params, stage_name, information_weighted=True,
+    )
+    rate_per_port_hz = bright_rate_hz * photon_scale / max(n_bright_ports, 1)
+    information_rate_per_port_hz = (
+        bright_rate_hz * information_scale / max(n_bright_ports, 1)
+    )
     if params.control_model == "photon_kalman":
         rate_cap_hz = (
             float(params.tracker_n_detectors_per_port)
             * n_pol_arms
             * _SNSPD_MAX_RATE_HZ
         )
-        usable_rate_per_port_hz = min(rate_per_port_hz, rate_cap_hz)
         rate_clipped = rate_per_port_hz > rate_cap_hz
+        usable_rate_per_port_hz = information_rate_per_port_hz * min(
+            1.0, rate_cap_hz / rate_per_port_hz if rate_per_port_hz > 0.0 else 1.0
+        )
     else:
         rate_cap_hz = 0.0
-        usable_rate_per_port_hz = rate_per_port_hz
+        usable_rate_per_port_hz = information_rate_per_port_hz
         rate_clipped = False
     tau_frame_s = 1.0 / float(sample_rate_hz)
     rate_per_channel_hz = usable_rate_per_port_hz / params.n_spectral_channels
@@ -847,8 +796,15 @@ def _simultaneous_science_band_scale(
     state: SimulationState,
     params: ClosedLoopFringeTracker.Params,
     stage_name: str,
+    *,
+    information_weighted: bool = False,
 ) -> tuple[float, tuple[str, ...], str]:
-    """Return bright-rate scaling for simultaneous science-band FT photons."""
+    """Return bright-rate scaling for simultaneous science-band FT photons.
+
+    ``information_weighted`` weights each band by ``(lambda_ref/lambda_b)^2``
+    with ``lambda_ref`` the closed-loop reference wavelength (the grid
+    middle bin), giving information-equivalent photons for OPD estimation.
+    """
 
     if state.scene.star_jmag is None:
         if params.simultaneous_science_bands:
@@ -865,12 +821,19 @@ def _simultaneous_science_band_scale(
     )
     if not params.simultaneous_science_bands:
         return 1.0, (), _infer_current_band(wavelength_grid_um, stage_name)
+    reference_wavelength_um = (
+        _representative_wavelength_m(_require_wavelength_grid_um(state, stage_name))
+        / _MICRON_TO_M
+        if information_weighted
+        else None
+    )
     return simultaneous_band_rate_scale(
         magnitude=float(state.scene.star_jmag),
         current_wavelength_grid_um=wavelength_grid_um,
         science_bands=params.simultaneous_science_bands,
         band_transmissions=params.simultaneous_science_band_transmissions,
         stage_name=stage_name,
+        reference_wavelength_um=reference_wavelength_um,
     )
 
 
@@ -914,34 +877,6 @@ def _shao_colavita_shot_variance_rad2(
     if denom <= 0.0:
         return float("inf")
     return float((n_signal + n_dark) / denom)
-
-
-def _conan_servo_lag_variance_rad2(
-    *,
-    wind_speed_m_s: float,
-    effective_baseline_m: float,
-    servo_bw_hz: float,
-    predictive_lag_reduction: float,
-) -> float:
-    """Conan 1995 piston servo-lag phase variance in rad^2.
-
-    Direct port of KILO ``fringe_tracking_phase_noise``'s lag term
-    (kilo/fringe_tracking.py:180-182):
-
-        f_piston   = 0.134 * v_wind / D_eff
-        sigma2_lag = (f_piston / f_servo) ** (5/3)
-
-    KILO's lag formula is standalone (the (f_piston/f_servo)^(5/3) factor
-    already carries the absolute lag variance — no separate σ²_atmos
-    multiplication). The optional ``predictive_lag_reduction`` is the
-    KILO ``piston_servo_residual`` LQG/Kalman variance-reduction
-    multiplier (default 1.0 → no reduction); applied here when the
-    predictive-servo extension is enabled.
-    """
-
-    f_piston_hz = _CONAN_PISTON_COEFFICIENT * wind_speed_m_s / effective_baseline_m
-    bandwidth_ratio = f_piston_hz / servo_bw_hz
-    return predictive_lag_reduction * bandwidth_ratio ** _FIVE_THIRDS
 
 
 def _piston_sensing_efficiency(
@@ -997,7 +932,7 @@ def _piston_servo_residual_rad2(
     ao_payload = state.wavefront.components.get("ao_residual")
     if not isinstance(ao_payload, dict):
         raise ValueError(
-            f"{stage_name}: use_full_piston_servo_residual=True requires an "
+            f"{stage_name}: the piston servo residual requires an "
             "upstream ao.pyramid_wfs stage that publishes the piston "
             "breakdown on the 'ao_residual' wavefront component."
         )
@@ -1092,13 +1027,8 @@ def _photon_kalman_common_terms_rad2(
     atm_sigma2_m2 = 0.0
     atm_f_knee_hz = 0.0
     if params.inter_telescope_piston:
-        r0_500nm_m = _resolve_r0_500nm_m(state, stage_name)
         primary_diameter_m = _primary_diameter_m(state, stage_name)
-        sigma_it_m = von_karman_differential_piston_rms_m(
-            r0_500nm_m=r0_500nm_m,
-            outer_scale_m=float(params.outer_scale_m),
-        )
-        atm_sigma2_m2 = sigma_it_m**2
+        atm_sigma2_m2 = _inter_telescope_piston_variance_m2(state, params, stage_name)
         atm_f_knee_hz = piston_psd_knee_hz(
             wind_speed_m_s=float(wind_speed_m_s),
             outer_scale_m=float(params.outer_scale_m),
@@ -1204,19 +1134,15 @@ def _common_disturbance_terms_rad2(
     rad_per_m = 2.0 * math.pi / float(wavelength_center_m)
     sigma2_inter_rad2 = 0.0
     if params.inter_telescope_piston:
-        r0_500nm_m = _resolve_r0_500nm_m(state, stage_name)
         primary_diameter_m = _primary_diameter_m(state, stage_name)
-        sigma_it_m = von_karman_differential_piston_rms_m(
-            r0_500nm_m=r0_500nm_m,
-            outer_scale_m=float(params.outer_scale_m),
-        )
+        sigma2_it_m2 = _inter_telescope_piston_variance_m2(state, params, stage_name)
         f_knee_hz = piston_psd_knee_hz(
             wind_speed_m_s=float(wind_speed_m_s),
             outer_scale_m=float(params.outer_scale_m),
             aperture_diameter_m=primary_diameter_m,
         )
         sigma2_inter_m2 = servo_residual_variance_flat_knee(
-            sigma2=sigma_it_m**2,
+            sigma2=sigma2_it_m2,
             f_knee_hz=f_knee_hz,
             f_3db_hz=float(f_3db_hz),
             predictive_gain_variance=1.0 / float(params.predictive_lag_reduction),
@@ -1267,6 +1193,45 @@ def _resolve_r0_500nm_m(state: SimulationState, stage_name: str) -> float:
     )
 
 
+def _inter_telescope_piston_variance_m2(
+    state: SimulationState,
+    params: ClosedLoopFringeTracker.Params,
+    stage_name: str,
+) -> float:
+    """Uncorrected inter-telescope differential piston variance in m^2.
+
+    Conan et al. (1995) aperture-filtered von Karman differential piston for
+    each telescope pair, at its horizontal (E, N) baseline from
+    ``geometry.aperture_positions_enu_m`` and the full primary diameter
+    ``geometry.diameter_m`` (each telescope's piston averages its whole
+    pupil), then averaged over pairs. Without aperture positions the pair is
+    treated as fully decorrelated (B -> inf), the saturated upper bound.
+    """
+
+    r0_500nm_m = _resolve_r0_500nm_m(state, stage_name)
+    diameter_m = _primary_diameter_m(state, stage_name)
+    positions = state.geometry.aperture_positions_enu_m
+    baselines_m: list[float] = [math.inf]
+    if positions is not None and len(positions) >= 2:
+        xy = np.asarray(positions, dtype=np.float64)[:, :2]
+        i, j = np.triu_indices(xy.shape[0], k=1)
+        baselines_m = [float(b) for b in np.linalg.norm(xy[i] - xy[j], axis=1)]
+    return float(
+        np.mean(
+            [
+                von_karman_differential_piston_rms_m(
+                    r0_500nm_m=r0_500nm_m,
+                    outer_scale_m=float(params.outer_scale_m),
+                    baseline_m=baseline_m,
+                    aperture_diameter_m=diameter_m,
+                )
+                ** 2
+                for baseline_m in baselines_m
+            ]
+        )
+    )
+
+
 def _primary_diameter_m(state: SimulationState, stage_name: str) -> float:
     diameter_m = state.geometry.diameter_m
     if diameter_m is None:
@@ -1311,6 +1276,12 @@ def _resolve_n_bright_ports(state: SimulationState, stage_name: str) -> int:
         raise ValueError(
             f"{stage_name}: photon_rates.port_labels has no 'bright' ports."
         )
+    # Dual-pol PBS-arm detectors publish each logical port once per arm
+    # (bright_0_A, bright_0_B, ...); the sensing efficiency counts logical
+    # ports, the same pooling _tracker_photon_budget applies.
+    n_pol_arms = detector_n_pol_arms(state)
+    if n_pol_arms > 1 and n_bright % n_pol_arms == 0:
+        return n_bright // n_pol_arms
     return n_bright
 
 

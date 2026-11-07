@@ -39,6 +39,7 @@ def simultaneous_band_rate_scale(
     science_bands: Sequence[str],
     band_transmissions: Sequence[float],
     stage_name: str,
+    reference_wavelength_um: float | None = None,
 ) -> tuple[float, tuple[str, ...], str]:
     """Scale a single-band photon budget to a simultaneous-band budget.
 
@@ -53,6 +54,15 @@ def simultaneous_band_rate_scale(
     its zero point and the explicit bin widths from the resolved grid.
     When no transmissions are supplied, all transmissions are treated as
     unity.
+
+    With ``reference_wavelength_um`` set, each band's photons count as
+    information-equivalent photons at the reference wavelength,
+    ``N_b (lambda_ref / lambda_b)^2``: a phase estimate from N photons has
+    variance ~1/N, and the OPD is ``lambda phase / 2 pi``, so the OPD Fisher
+    information per photon scales as ``1/lambda^2``. Use it for piston (OPD)
+    estimation, not for intensity budgets. The current-grid denominator is
+    left unweighted because the caller treats those photons as being at the
+    reference wavelength.
     """
 
     normalized_bands = _normalize_bands(science_bands, stage_name)
@@ -83,6 +93,11 @@ def simultaneous_band_rate_scale(
     total_rate = 0.0
     for band, transmission in zip(normalized_bands, transmissions, strict=True):
         center_um, bandwidth_um = BANDPASS_UM[band]
+        information_weight = (
+            1.0
+            if reference_wavelength_um is None
+            else (float(reference_wavelength_um) / center_um) ** 2
+        )
         total_rate += (
             photon_rate_per_m2_per_bin(
                 magnitude,
@@ -91,6 +106,7 @@ def simultaneous_band_rate_scale(
                 band=band,
             )
             * transmission
+            * information_weight
         )
     return float(total_rate / current_rate), normalized_bands, current_band
 
