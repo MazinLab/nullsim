@@ -169,6 +169,52 @@ def test_pupil_modes_requires_upstream_diameter(tmp_path: Path) -> None:
         stage.apply(SimulationState.empty())
 
 
+def test_pupil_modes_rejects_multi_telescope_array(tmp_path: Path) -> None:
+    state = replace(
+        SimulationState.empty(),
+        geometry=Geometry(diameter_m=10.0, area_m2=np.pi * 5.0**2, n_apertures=4),
+    )
+    stage = PupilModes(params={"n_modes": 4}, context=_context(tmp_path))
+
+    with pytest.raises(ValueError, match="n_apertures = 4"):
+        stage.apply(state)
+
+
+def test_pupil_modes_publishes_per_mode_vectors_and_origins(tmp_path: Path) -> None:
+    """HWO-like case: a length-1 telescope vector upstream must not win the
+    per-mode lookup over the pupil modes (review 2026-11-07 Issues 1, 22)."""
+
+    from nullsim.stages._mode_splitter import (
+        component_mode_areas_m2,
+        component_mode_diameters_m,
+    )
+    from nullsim.stages._utils import mode_origin_positions_m
+
+    geometry = Geometry(
+        diameter_m=8.0, area_m2=np.pi * 4.0**2, n_apertures=1
+    ).add_component(
+        "telescope",
+        {"mode_areas_m2": np.array([np.pi * 4.0**2]), "mode_diameters_m": np.array([8.0])},
+    )
+    state = replace(SimulationState.empty(), geometry=geometry)
+
+    out = PupilModes(
+        params={"n_modes": 12, "layout": "packed_circular"},
+        context=_context(tmp_path),
+    ).apply(state)
+
+    d_mode = out.geometry.components["pupil_modes"]["mode_diameter_m"]
+    areas, area_source = component_mode_areas_m2(out, 12)
+    diameters, diameter_source = component_mode_diameters_m(out, 12)
+    np.testing.assert_allclose(diameters, np.full(12, d_mode))
+    np.testing.assert_allclose(areas, np.full(12, math.pi * (d_mode / 2.0) ** 2))
+    assert area_source == diameter_source.replace("diameters_m", "areas_m2")
+    assert area_source.startswith("geometry.pupil_modes")
+    np.testing.assert_array_equal(
+        mode_origin_positions_m(out.geometry, 12), np.zeros((12, 2))
+    )
+
+
 def _pairwise_distances(positions: np.ndarray) -> np.ndarray:
     diffs = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
     dists = np.sqrt(np.sum(diffs * diffs, axis=-1))

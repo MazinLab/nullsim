@@ -252,6 +252,8 @@ def test_keck_pupil_boundary_is_hexagon() -> None:
 def test_eelt_pupil_matches_nayra_geometry_constants() -> None:
     p = eelt_pupil()
     assert p.boundary_vertices is None
+    # ESO ELT design: 11.1 m central obstruction (review 2026-11-07 Issue 7).
+    assert p.central_obstruction_diameter_m == pytest.approx(11.1)
     assert p.central_obstruction_diameter_m == pytest.approx(
         EELT_OBSCURATION_FRAC * EELT_DIAMETER_M
     )
@@ -266,12 +268,19 @@ def test_eelt_pupil_matches_nayra_geometry_constants() -> None:
 
 
 def test_optimize_eelt_n18_returns_feasible_subapertures() -> None:
+    """NAYRA J-primary packing. 7.133 m and 719.3 m^2 are the review
+    2026-11-07 Issue 7 values for the 11.1 m obstruction (7.770 m and
+    853.4 m^2 with the old 4.3 m one)."""
+
     pupil = eelt_pupil()
     positions, d_sub = optimize_subaperture_positions(18, EELT_DIAMETER_M, pupil)
     assert positions.shape == (18, 2)
-    assert d_sub > 0.0
+    assert d_sub == pytest.approx(7.133, abs=2.0e-3)
+    assert 18 * math.pi * (d_sub / 2.0) ** 2 == pytest.approx(719.3, abs=0.5)
 
     r_sub = d_sub / 2.0
+    inner_edges_m = np.hypot(positions[:, 0], positions[:, 1]) - r_sub
+    assert float(np.min(inner_edges_m)) >= 11.1 / 2.0 - 1.0e-8
     for x, y in positions:
         assert is_valid_position(x, y, r_sub, pupil, EELT_DIAMETER_M)
 
@@ -280,7 +289,9 @@ def test_optimize_eelt_n48_grows_packed_layout() -> None:
     pupil = eelt_pupil()
     positions, d_sub = optimize_subaperture_positions(48, EELT_DIAMETER_M, pupil)
     assert positions.shape == (48, 2)
-    assert d_sub > 4.5
+    # 4.346 m with the 11.1 m obstruction; below the hexagonal-packing bound
+    # sqrt(0.9069 * annulus area / (48 pi / 4)) = 5.16 m.
+    assert 4.3 < d_sub < 5.16
 
     r_sub = d_sub / 2.0
     for x, y in positions:

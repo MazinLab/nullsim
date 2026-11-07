@@ -6,9 +6,11 @@ import math
 from dataclasses import replace
 
 import numpy as np
+from scipy.integrate import quad
+from scipy.special import j0
 
 from nullsim.physics.ruilier_cassaing import (
-    KILO_MODE_FIELD_RADIUS_TO_SUBAP_RADIUS_RATIO as MFD_RATIO,
+    OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO as RHO,
 )
 from nullsim.pipeline import Geometry, SimulationState
 from nullsim.stages.chip_optimization import (
@@ -43,6 +45,15 @@ def _state(mode_area_m2: float, mode_diameter_m: float) -> SimulationState:
     )
 
 
+def _exact_coupling(separation_rad: float, diameter_m: float) -> float:
+    """Off-axis SMF coupling ratio by direct quadrature of the overlap."""
+
+    s = separation_rad * diameter_m / (_WL_UM * 1e-6)
+    num = quad(lambda u: u * math.exp(-RHO**2 * u**2) * j0(math.pi * s * u), 0.0, 1.0)[0]
+    den = quad(lambda u: u * math.exp(-RHO**2 * u**2), 0.0, 1.0)[0]
+    return (num / den) ** 2
+
+
 def _planet_power(state: SimulationState, field: np.ndarray) -> np.ndarray:
     fields = _throughput_penalty_fields(
         state=state,
@@ -63,9 +74,10 @@ def test_throughput_reward_uses_physical_mode_diameter() -> None:
     power = _planet_power(_state(area_m2, diameter_m), field)
 
     theta = _SEP_MAS * math.pi / (180.0 * 3600.0 * 1000.0)
-    x = math.pi * MFD_RATIO * diameter_m / 2.0 * theta / (_WL_UM * 1e-6)
-    np.testing.assert_allclose(power, math.exp(-x * x), rtol=1e-12)
-    assert math.exp(-x * x) < 0.9  # the envelope matters at this separation
+    expected = _exact_coupling(theta, diameter_m)
+    np.testing.assert_allclose(power, expected, rtol=1e-9)
+    equal_area = _exact_coupling(theta, math.sqrt(4.0 * area_m2 / math.pi))
+    assert expected < 0.9 and equal_area - expected > 0.05
 
 
 def test_throughput_reward_sums_polarization_arms() -> None:

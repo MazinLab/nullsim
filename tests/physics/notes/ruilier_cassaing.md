@@ -75,8 +75,50 @@ overlap integral for the supplied obstruction ratio and validates
 
 The source `coupling_efficiency()` functions have no direct wavelength
 argument. Wavelength dependence enters upstream through the AO Strehl
-calculation and, for off-axis coupling, through the Gaussian mode size in
-`angular_coupling_factor()`. KILO and NAYRA use
-`OPTIMAL_MODE_FIELD_RATIO = 0.6436` in that angular rolloff helper. The pure
-on-axis nullsim primitive keeps Fresnel and fiber-transport wavelength effects
-out of this module; those belong in later transport/stage work.
+calculation and, for off-axis coupling, through `theta D_sub / lambda` in
+`angular_coupling_factor()`. The pure on-axis nullsim primitive keeps Fresnel
+and fiber-transport wavelength effects out of this module; those belong in
+later transport/stage work.
+
+## Off-axis coupling: exact overlap, a deliberate KILO parity break
+
+KILO and NAYRA model the off-axis rolloff as a Gaussian envelope,
+`eta(theta)/eta(0) = exp(-(pi w theta / lambda)^2)` with
+`w = 0.6436 D_sub / 2`. That is the far-field form of a Gaussian beam, not
+the overlap of a tilted plane wave with the fiber mode over a hard-edged
+sub-aperture. The two agree only near axis.
+
+nullsim evaluates the exact overlap with the same pupil-plane mode used on
+axis (`rho = 1.1209`). A tilt `theta` puts the phase
+`2 pi theta r cos(phi) / lambda` across the pupil, and the azimuthal
+integral gives `J0`. With `u = r / R` and `s = theta D_sub / lambda`:
+
+```text
+a(s) = int_eps^1 u exp(-rho^2 u^2) J0(pi s u) du
+       / int_eps^1 u exp(-rho^2 u^2) du
+eta(theta)/eta(0) = a(s)^2
+```
+
+`angular_coupling_amplitude()` returns the signed `a(s)` and
+`angular_coupling_factor()` its square. `eps` is the receiving
+sub-aperture's own obstruction ratio, 0 for clear packed sub-apertures. The
+integral uses 96-node Gauss-Legendre on `[eps, 1]`, which matches scipy
+adaptive quadrature to about 1e-16 for `s` up to at least 80.
+
+Anchors at `D_sub = 3.14 m`, `lambda = 1.25 um` (kilo_keck_6, J):
+
+| theta (mas) | exact | KILO Gaussian | exact / Gaussian |
+|---|---|---|---|
+| 10  | 0.97124  | 0.98496 | 0.986 |
+| 30  | 0.76590  | 0.87247 | 0.878 |
+| 60  | 0.32274  | 0.57943 | 0.557 |
+| 100 | 0.020506 | 0.21962 | 0.093 |
+| 150 | 0.0029927 | 0.033018 | 0.091 |
+
+The first zero of `a(s)` is at `s = 1.4948`; beyond it the amplitude is
+negative (a sidelobe), where the Gaussian keeps decaying smoothly. The
+Gaussian therefore overstates planet coupling beyond about
+`0.5 lambda / D_sub` (1.8x at 60 mas and 10.7x at 100 mas above), and near
+a sidelobe it can understate it. Planet throughput curves past that
+separation no longer reproduce KILO's (review 2026-11-07 Issue 4).
+Monochromatic zeros fill in when callers average over the band.

@@ -21,6 +21,8 @@ class PupilModes(BaseStage):
     This is a geometry bridge for first-pass single-primary configs, such as
     HWO, that intentionally do not run an AO/sub-aperture stage but still need
     per-mode pupil coordinates for separation-dependent planet throughput.
+    It accepts exactly one upstream telescope; multi-telescope arrays get
+    their per-telescope modes from ``ao.pyramid_wfs`` sub-aperture packing.
     """
 
     type_name = "telescope.pupil_modes"
@@ -78,6 +80,14 @@ class PupilModes(BaseStage):
     def apply(self, state: SimulationState) -> SimulationState:
         params = self.params_model
         diameter_m = _require_diameter_m(state)
+        n_apertures = int(state.geometry.n_apertures or 1)
+        if n_apertures > 1:
+            raise ValueError(
+                "telescope.pupil_modes places modes inside one monolithic pupil, "
+                f"but the upstream geometry has n_apertures = {n_apertures}. "
+                "Use a single telescope, or place per-telescope modes with "
+                "ao.pyramid_wfs n_subapertures_per_aperture."
+            )
         span_m = float(params.span_fraction) * diameter_m
         positions, mode_diameter_m = _positions_for_layout(params, span_m)
         geometry = _updated_geometry(
@@ -250,10 +260,11 @@ def _updated_geometry(
         if preserve_area or effective_area_m2 is None
         else effective_area_m2
     )
+    n_modes = int(params.n_modes)
     mode_area_m2 = (
         None
         if effective_collecting_area_m2 is None
-        else float(effective_collecting_area_m2) / int(params.n_modes)
+        else float(effective_collecting_area_m2) / n_modes
     )
     return replace(
         geometry,
@@ -286,6 +297,22 @@ def _updated_geometry(
             "effective_area_source": (
                 "upstream" if preserve_area else "packed_mode_circles"
             ),
+            # Per-mode vectors (length n_modes) so readers take the vector
+            # path instead of an upstream telescope's scalar (review
+            # 2026-11-07 Issue 1).
+            "mode_areas_m2": (
+                None
+                if mode_area_m2 is None
+                else np.full(n_modes, mode_area_m2, dtype=np.float64)
+            ),
+            "mode_diameters_m": (
+                None
+                if mode_diameter_m is None
+                else np.full(n_modes, float(mode_diameter_m), dtype=np.float64)
+            ),
+            # Every mode sits in the one telescope at the pupil-frame origin,
+            # so sky projection keeps the pupil offsets rigid (Issue 22).
+            "mode_origin_positions_m": np.zeros((n_modes, 2), dtype=np.float64),
             "aperture_positions_pupil_m": positions.copy(),
             "baselines_m": baselines_m.copy(),
             "source_model": (

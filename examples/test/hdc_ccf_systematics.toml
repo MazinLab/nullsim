@@ -1,22 +1,22 @@
 # Systematics-dominated companion to `hdc_ccf_smoke.toml`: the case where
 # cross-correlation actually buys something. The smoke config is photon
 # limited, and there the matched filter LOSES to the broadband band SNR
-# (ccf_snr 70.22 against band 387.41) -- correctly, because it throws away
+# (ccf_snr 126.23 against band 690.28) -- correctly, because it throws away
 # most of the planet's photons to isolate the lines. Here the leaked
 # starlight carries a quasi-static instability. It costs the band a factor
-# 125 and the CCF a factor 2.2, and that asymmetry is the whole point.
+# 125 and the CCF a factor 2.36, and that asymmetry is the whole point.
 #
 # The only changes from the smoke config are two knobs, set identically on
 # `characterization.spectro` and `performance.standard`:
 #
-#   residual_speckle_stability_factor = 1.0e-3   (eps_systematic = 1e-3)
+#   residual_speckle_stability_factor = 4.0e-3   (eps_systematic = 4e-3)
 #   with_fringe_tracking              = false
 #
 # `with_fringe_tracking = false` is not a claim that the fringe tracker is
 # switched off -- `fringe_tracking.closed_loop` still runs. It selects the
 # quasi-static branch of the null-instability variance,
 # (eps * leak_counts)^2 rather than eps^2 * leak_rate^2 * t / (2 f_servo).
-# That branch asserts the 1e-3 fluctuation is perfectly coherent across the
+# That branch asserts the 4e-3 fluctuation is perfectly coherent across the
 # whole 3600 s exposure: no averaging at all, correlation time >= t. Nothing
 # upstream in the pipeline derives that correlation time -- it is hand set
 # here, and it is the assumption the entire demonstration rests on. A
@@ -25,38 +25,40 @@
 #
 # At THIS config's operating point the averaging branch cannot substitute:
 # with f_servo = 2 kHz, CCF systematic variance only overtakes CCF photon
-# noise for eps > 2.0 (dominance needs eps^2 / f_servo > 2.04e-3). That is a
+# noise for eps > 7.1 (dominance needs eps^2 / f_servo > 2.52e-2). That is a
 # statement about 2 kHz, not about the branch -- at a 30 Hz speckle
-# decorrelation bandwidth the same inequality needs only eps > 0.25, which is
-# large but not absurd. A config wanting the averaging branch would have to
+# decorrelation bandwidth the same inequality needs eps > 0.87, which is
+# large. A config wanting the averaging branch would have to
 # argue for both numbers.
 #
-# Achieved at 3600 s (run 20260809-181500, ~2 s wall clock):
+# Achieved at 3600 s (2026-11-07, single-telescope geometry, ~2 s wall clock):
 #
-#   spectro band SNR       3.11   (S = 4.84e7, B = 1.56e10 counts,
-#                                  systematic_var = 2.43e14 counts^2)
-#   ccf_snr               31.29   -> HDC wins by 10.07x
-#   ccf_snr_photon_limited 70.22
-#   ccf_systematic_var / ccf_photon_var = 1.976e4 / 4895 = 4.04
-#   ccf_systematic_rejection = 0.026
-#   RV localization "reliable": score margin 0.640 sigma, worst-case margin
-#     0.491 sigma under the modeled residual leak (rv_leak_contamination 357.7)
+#   spectro band SNR       5.52   (S = 2.20e7, B = 9.97e8 counts,
+#                                  systematic_var = 1.59e13 counts^2)
+#   ccf_snr               53.50   -> HDC wins by 9.68x
+#   ccf_snr_photon_limited 126.23
+#   ccf_systematic_var / ccf_photon_var = 7.269e4 / 1.592e4 = 4.57
+#   ccf_systematic_rejection = 0.028
+#   RV localization "reliable": score margin 1.283 sigma, worst-case margin
+#     1.057 sigma under the modeled residual leak (rv_leak_contamination 44.0)
+#
+# These are plumbing numbers, not a sensitivity prediction. Until 2026-11-07
+# this chain declared a four-telescope array, kept its 314 m^2 collecting
+# area, and placed the modes inside one 10 m pupil (review 2026-11-07
+# Issue 22). The honest single-pupil geometry collects 54 m^2, so the leak
+# counts fell about 6x and the systematic share of the variance with them;
+# eps rose from 1e-3 to 4e-3 to keep the config systematics dominated.
 #
 # That last line is a verdict about the RV scan only, and the interesting part
-# is how it survives. A 1e-3 instability on a leak this bright shifts EVERY
-# trial's score by tens of sigma -- 55.07 at the truth, up to 56.15 elsewhere --
-# but almost entirely in common mode, so the ordering barely moves and 0.491
+# is how it survives. A 4e-3 instability on a leak this bright shifts EVERY
+# trial's score by tens of sigma -- 43.64 at the truth, up to 44.93 elsewhere --
+# but almost entirely in common mode, so the ordering barely moves and 1.057
 # sigma of the margin survives. Scoring those two shifts as independently
 # signed, which an earlier version of the verdict did, reported a worst case of
 # -110.6 and called the scan unusable; the residual is one signed vector and
 # has to be evaluated coherently. The photon-limited smoke companion, with
-# eps = 0, grades "reliable" on the same 0.640 sigma margin with no shift at
+# eps = 0, grades "reliable" on the same 1.283 sigma margin with no shift at
 # all.
-#
-# The header read 3.76 for the variance ratio until round 4; that number
-# predates the covariance and blockwise-island fixes and was never refreshed.
-# No metric in this config has moved since: ccf_snr, the band SNR and both
-# variances are bit-identical across rounds 3, 4 and 5.
 #
 # Read that rejection factor as one illustrative realization. It is
 # |sum w L~| / (sum |w| L) for ONE coherent scalar eps multiplying ONE smooth
@@ -132,13 +134,17 @@ type = "scene.point_source"
 altitude_deg = 80.0
 azimuth_deg = 180.0
 
+# One 10 m telescope whose pupil hosts the four input modes. An earlier
+# version declared a four-telescope Y array (40 m spacing) here and then
+# overwrote its positions with these pupil modes while keeping the array's
+# collecting area; `telescope.pupil_modes` now rejects multi-telescope
+# geometry (review 2026-11-07 Issue 22). The mode positions are unchanged;
+# the inter-telescope delay lines went with the array.
 [[pipeline.stages]]
 id = "array"
 type = "telescope.fixed_aperture"
 diameter_m = 10.0
-n_apertures = 4
-array_layout = "y_array"
-spacing_m = 40.0
+n_apertures = 1
 mirror_transmission = 0.80
 
 [[pipeline.stages]]
@@ -147,7 +153,6 @@ type = "telescope.pupil_modes"
 n_modes = 4
 layout = "packed_circular"
 span_fraction = 1.0
-preserve_collecting_area = true
 
 [[pipeline.stages]]
 id = "atmosphere"
@@ -188,11 +193,6 @@ id = "smf28"
 type = "transport.smf28"
 length_m = 10.0
 phi_rms_rad = 0.01
-
-[[pipeline.stages]]
-id = "delay_lines"
-type = "delay_lines.geometric"
-max_delay_m = 90.0
 
 [[pipeline.stages]]
 id = "chip_opt"
@@ -286,7 +286,7 @@ resolving_power_cap = 10000.0
 # The two systematics knobs; see the header for the resulting budget. The HDC
 # stage reads eps_systematic and the fringe-tracking branch straight off this
 # payload, so the CCF and the band SNR are compared under one noise model.
-residual_speckle_stability_factor = 1.0e-3
+residual_speckle_stability_factor = 4.0e-3
 with_fringe_tracking = false
 
 [[pipeline.stages]]
@@ -308,7 +308,7 @@ type = "performance.standard"
 target_snr = 5.0
 # Same systematic in detection mode, so the broadband detection numbers in
 # performance_summary describe the same instrument as the spectro row.
-residual_speckle_stability_factor = 1.0e-3
+residual_speckle_stability_factor = 4.0e-3
 with_fringe_tracking = false
 
 [output]

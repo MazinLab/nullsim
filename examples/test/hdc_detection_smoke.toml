@@ -36,16 +36,21 @@
 # compares two curves describing the same observation. An explicit value that
 # disagreed would be refused rather than reconciled.
 #
-# Achieved (run 20260809-150204, ~3.6 s wall clock), at every anchor:
+# Achieved (2026-11-07, single-telescope geometry, ~3 s wall clock), at every
+# anchor:
 #
-#   ccf_contrast_gain     28.199   with the two knobs below
-#   ccf_contrast_gain      0.626   with them removed (photon limited)
+#   ccf_contrast_gain      6.186   with the two knobs below
+#   ccf_contrast_gain      0.163   with them removed (photon limited)
 #
-# The switch costs the broadband curve a factor 62.5 at 10 mas (2.43e-6 ->
-# 1.52e-4) and the CCF curve only a factor 1.39 (3.88e-6 -> 5.38e-6). That
-# asymmetry is the entire result.
+# The switch costs the broadband curve a factor 46.3 at 10 mas (2.42e-6 ->
+# 1.12e-4) and the CCF curve only a factor 1.22 (1.49e-5 -> 1.81e-5). That
+# asymmetry is the entire result. These are plumbing numbers, not a
+# sensitivity prediction.
 #
-# Both gains moved by 3.8x in the wave C stage-accounting pass (7.483 ->
+# Until 2026-11-07 this chain declared a four-telescope array, kept its
+# 314 m^2 collecting area, and placed the modes inside one 10 m pupil (review
+# 2026-11-07 Issue 22); the gains were 28.199 and 0.626 then. The history
+# below refers to that geometry. Both gains moved by 3.8x in the wave C stage-accounting pass (7.483 ->
 # 28.183 and 0.163 -> 0.618), then by a further 0.06% when the continuum
 # filter became blockwise over telluric islands (28.183 -> 28.199 and
 # 0.618 -> 0.626): `performance.hdc` now normalizes its
@@ -112,13 +117,17 @@ type = "scene.point_source"
 altitude_deg = 80.0
 azimuth_deg = 180.0
 
+# One 10 m telescope whose pupil hosts the four input modes. An earlier
+# version declared a four-telescope Y array (40 m spacing) here and then
+# overwrote its positions with these pupil modes while keeping the array's
+# collecting area; `telescope.pupil_modes` now rejects multi-telescope
+# geometry (review 2026-11-07 Issue 22). The mode positions are unchanged;
+# the inter-telescope delay lines went with the array.
 [[pipeline.stages]]
 id = "array"
 type = "telescope.fixed_aperture"
 diameter_m = 10.0
-n_apertures = 4
-array_layout = "y_array"
-spacing_m = 40.0
+n_apertures = 1
 mirror_transmission = 0.80
 
 [[pipeline.stages]]
@@ -127,7 +136,6 @@ type = "telescope.pupil_modes"
 n_modes = 4
 layout = "packed_circular"
 span_fraction = 1.0
-preserve_collecting_area = true
 
 [[pipeline.stages]]
 id = "atmosphere"
@@ -168,11 +176,6 @@ id = "smf28"
 type = "transport.smf28"
 length_m = 10.0
 phi_rms_rad = 0.01
-
-[[pipeline.stages]]
-id = "delay_lines"
-type = "delay_lines.geometric"
-max_delay_m = 90.0
 
 [[pipeline.stages]]
 id = "chip_opt"

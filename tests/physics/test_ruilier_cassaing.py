@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from scipy.integrate import quad
+from scipy.optimize import brentq
+from scipy.special import j0
 
 from nullsim.physics.ruilier_cassaing import (
     OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO,
+    angular_coupling_amplitude,
+    angular_coupling_factor,
     coupling_efficiency,
     geometric_coupling_limit,
 )
@@ -117,3 +122,58 @@ def test_geometric_coupling_limit_preserves_obscuration_shape() -> None:
     limits = geometric_coupling_limit(central_obscuration_ratio)
 
     assert limits.shape == central_obscuration_ratio.shape
+
+
+_MAS_TO_RAD = np.pi / (180.0 * 3600.0e3)
+
+
+def test_angular_coupling_factor_matches_exact_overlap_anchors() -> None:
+    """kilo_keck_6 sub-apertures (3.14 m) at J (1.25 um). Anchors are the
+    squared overlap ratio from scipy adaptive quadrature (review 2026-11-07
+    Issue 4); KILO's Gaussian envelope gave 0.985, 0.872, 0.579, 0.220, and
+    0.033 here."""
+
+    separations_rad = np.array([10.0, 30.0, 60.0, 100.0, 150.0]) * _MAS_TO_RAD
+    power = angular_coupling_factor(separations_rad, 3.14, 1.25e-6)
+
+    np.testing.assert_allclose(
+        power, [0.97124, 0.76590, 0.32274, 0.020506, 0.0029927], rtol=1e-4
+    )
+
+
+def test_angular_coupling_amplitude_first_zero_and_sign_change() -> None:
+    first_zero = brentq(lambda s: angular_coupling_amplitude(s, 1.0, 1.0), 1.0, 2.0)
+
+    assert first_zero == pytest.approx(1.4948, abs=1e-4)
+    assert angular_coupling_amplitude(1.3, 1.0, 1.0) > 0.0
+    assert angular_coupling_amplitude(1.7, 1.0, 1.0) < 0.0
+    assert angular_coupling_factor(first_zero, 1.0, 1.0) < 1e-20
+
+
+@pytest.mark.parametrize("obscuration", [0.0, 0.3])
+@pytest.mark.parametrize("s", [0.0, 0.5, 5.0, 40.0])
+def test_angular_coupling_amplitude_matches_adaptive_quadrature(
+    obscuration: float, s: float
+) -> None:
+    rho = OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO
+    profile = lambda u: u * np.exp(-((rho * u) ** 2))  # noqa: E731
+    num = quad(lambda u: profile(u) * j0(np.pi * s * u), obscuration, 1.0, limit=400)[0]
+    den = quad(profile, obscuration, 1.0)[0]
+
+    got = angular_coupling_amplitude(s, 1.0, 1.0, obscuration)
+
+    assert got == pytest.approx(num / den, rel=1e-10, abs=1e-14)
+
+
+def test_angular_coupling_factor_broadcasts_and_scales_with_theta_d_over_lambda() -> None:
+    theta = np.linspace(0.0, 2.0e-7, 7)[:, None]
+    diameters = np.array([1.0, 2.0, 3.0])[None, :]
+
+    power = angular_coupling_factor(theta, diameters, 1.0e-6)
+
+    assert power.shape == (7, 3)
+    np.testing.assert_allclose(
+        power[:, 1], angular_coupling_factor(2.0 * theta[:, 0], 1.0, 1.0e-6)
+    )
+    assert isinstance(angular_coupling_factor(0.0, 1.0, 1.0e-6), float)
+    assert angular_coupling_factor(0.0, 1.0, 1.0e-6) == pytest.approx(1.0)

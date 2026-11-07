@@ -9,8 +9,11 @@ Strehl scaling convention used by Coudé du Foresto et al. (2000).
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from scipy.special import j0
 
 
 OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO = 1.120906422778534
@@ -30,18 +33,12 @@ land closer to 0.5-1%; the 3.5% value is the conservative paper-baseline.
 """
 
 
-KILO_MODE_FIELD_RADIUS_TO_SUBAP_RADIUS_RATIO = 0.6436
-"""Mode-field radius / sub-aperture radius used by KILO's angular-coupling formula.
+_OFF_AXIS_QUADRATURE_NODES = 96
+"""Gauss-Legendre nodes for the off-axis overlap; matches adaptive quadrature
+to ~1e-16 for ``theta D / lambda`` up to at least 80."""
 
-KILO defines ``w = 0.6436 * (D_sub / 2)`` in
-``kilo/injection.py:106`` for the off-axis Gaussian-mode rolloff
-``exp(-(pi w theta / lambda)^2)``. We preserve the same value so the
-nullsim sensitivity stage reproduces KILO's planet-throughput-vs-
-separation curve. This is a *different* w/R than the on-axis maximum-
-overlap optimum encoded in
-``OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO`` above -- KILO uses
-two distinct conventions for on-axis coupling vs angular envelope.
-"""
+_OFF_AXIS_CHUNK = 8192
+"""Separations evaluated per block, bounding the (chunk, nodes) work array."""
 
 
 def coupling_efficiency(
@@ -135,47 +132,98 @@ def geometric_coupling_limit(
     return _as_scalar_if_zero_dim(np.asarray(coupling_limit, dtype=np.float64))
 
 
-def angular_coupling_factor(
+def angular_coupling_amplitude(
     separation_rad: float | ArrayLike,
     sub_diameter_m: float | ArrayLike,
     wavelength_m: float | ArrayLike,
+    central_obscuration_ratio: float = 0.0,
 ) -> float | NDArray[np.float64]:
-    """Off-axis SMF coupling rolloff (power factor in ``[0, 1]``).
+    """Off-axis SMF coupling field amplitude relative to on-axis (signed).
 
-    A tilted wavefront across a sub-aperture reduces the overlap integral
-    with the fiber's Gaussian mode:
+    The coupled field is the overlap of a tilted plane wave on the clear
+    (annular) sub-aperture with the fiber mode written in the pupil plane,
+    the same Gaussian ``exp(-(rho r / R)^2)`` used for on-axis coupling.
+    Azimuthal integration of the tilt phase gives J0, so with ``u = r / R``
+    and ``s = theta D_sub / lambda``
 
-        eta(theta) / eta(0) = exp(-(pi w theta / lambda)^2)
+        a(s) = int_eps^1 u exp(-rho^2 u^2) J0(pi s u) du
+               / int_eps^1 u exp(-rho^2 u^2) du
 
-    where ``w = KILO_MODE_FIELD_RADIUS_TO_SUBAP_RADIUS_RATIO * D_sub / 2``.
+    (the pupil-plane overlap of Ruilier & Cassaing 2001, JOSA A 18, 143,
+    evaluated for a tilted input field; Shaklan & Roddier 1988, Appl. Opt.
+    27, 2334). ``rho`` is ``OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO``.
+    The amplitude changes sign past its first zero at ``s = 1.4948``
+    (unobstructed); the sign matters when modes of different diameter
+    combine coherently.
 
     Args:
         separation_rad: Angular offset from on-axis in radians.
         sub_diameter_m: Sub-aperture diameter in meters.
         wavelength_m: Wavelength in meters.
+        central_obscuration_ratio: Linear obstruction ratio of the receiving
+            sub-aperture, in [0, 1). Packed sub-apertures are clear: 0.
 
     Returns:
-        Multiplicative power factor in ``[0, 1]``. Shape follows numpy
-        broadcasting of the inputs.
-
-    Reference:
-        Ruilier & Cassaing (2001), JOSA A 18, 143, Eqs. 18-20; KILO
-        ``injection.angular_coupling_factor`` (``kilo/injection.py``
-        L76-108).
+        Amplitude ratio in ``[-1, 1]``, shaped by numpy broadcasting of the
+        first three inputs.
     """
 
-    w = (
-        KILO_MODE_FIELD_RADIUS_TO_SUBAP_RADIUS_RATIO
+    s = np.abs(
+        np.asarray(separation_rad, dtype=np.float64)
         * np.asarray(sub_diameter_m, dtype=np.float64)
-        / 2.0
-    )
-    x = (
-        np.pi
-        * w
-        * np.asarray(separation_rad, dtype=np.float64)
         / np.asarray(wavelength_m, dtype=np.float64)
     )
-    return _as_scalar_if_zero_dim(np.asarray(np.exp(-(x * x)), dtype=np.float64))
+    nodes, weights = _off_axis_quadrature(float(central_obscuration_ratio))
+    flat = s.ravel()
+    out = np.empty_like(flat)
+    for start in range(0, flat.size, _OFF_AXIS_CHUNK):
+        block = flat[start : start + _OFF_AXIS_CHUNK]
+        out[start : start + block.size] = j0(np.pi * np.outer(block, nodes)) @ weights
+    return _as_scalar_if_zero_dim(out.reshape(s.shape))
+
+
+def angular_coupling_factor(
+    separation_rad: float | ArrayLike,
+    sub_diameter_m: float | ArrayLike,
+    wavelength_m: float | ArrayLike,
+    central_obscuration_ratio: float = 0.0,
+) -> float | NDArray[np.float64]:
+    """Off-axis SMF coupling power relative to on-axis, ``eta(theta)/eta(0)``.
+
+    The square of :func:`angular_coupling_amplitude`, the exact overlap of a
+    tilted plane wave with the fiber mode. At ``D_sub = 3.14 m`` and
+    ``lambda = 1.25 um`` it is 0.971, 0.766, 0.323, 0.0205, and 0.0030 at
+    10, 30, 60, 100, and 150 mas. This replaces KILO's Gaussian envelope
+    ``exp(-(pi w theta / lambda)^2)``, which overstates coupling beyond about
+    0.5 lambda/D_sub (see ``tests/physics/notes/ruilier_cassaing.md``).
+
+    Returns:
+        Power factor in ``[0, 1]``, shaped by numpy broadcasting.
+    """
+
+    amplitude = np.asarray(
+        angular_coupling_amplitude(
+            separation_rad, sub_diameter_m, wavelength_m, central_obscuration_ratio
+        ),
+        dtype=np.float64,
+    )
+    return _as_scalar_if_zero_dim(amplitude * amplitude)
+
+
+@lru_cache(maxsize=8)
+def _off_axis_quadrature(
+    central_obscuration_ratio: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Gauss-Legendre nodes on ``[eps, 1]`` with weights that fold in the mode
+    profile ``u exp(-rho^2 u^2)`` and are normalized to sum to one."""
+
+    eps = central_obscuration_ratio
+    _validate_half_open_unit_interval(np.asarray(eps), "central_obscuration_ratio")
+    x, w = np.polynomial.legendre.leggauss(_OFF_AXIS_QUADRATURE_NODES)
+    u = eps + 0.5 * (1.0 - eps) * (x + 1.0)
+    rho = OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO
+    weights = w * u * np.exp(-((rho * u) ** 2))
+    return u, weights / weights.sum()
 
 
 def _as_float64_array(value: float | ArrayLike, name: str) -> NDArray[np.float64]:
@@ -217,7 +265,7 @@ def _as_scalar_if_zero_dim(array: NDArray[np.float64]) -> float | NDArray[np.flo
 __all__ = [
     "OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO",
     "UNOBSTRUCTED_GEOMETRIC_COUPLING_LIMIT",
-    "KILO_MODE_FIELD_RADIUS_TO_SUBAP_RADIUS_RATIO",
+    "angular_coupling_amplitude",
     "angular_coupling_factor",
     "coupling_efficiency",
     "geometric_coupling_limit",

@@ -49,9 +49,10 @@ __all__ = [
 # Small tolerance for floating-point geometry comparisons.
 _GEOM_TOL = 1e-10
 
-# NAYRA eelt_telescope constants.
+# ELT pupil constants. NAYRA's 0.11 obscuration fraction gave a 4.3 m central
+# obstruction; ESO's telescope design gives 11.1 m (review 2026-11-07 Issue 7).
 EELT_DIAMETER_M = 39.146
-EELT_OBSCURATION_FRAC = 0.11
+EELT_OBSCURATION_FRAC = 11.1 / EELT_DIAMETER_M
 EELT_N_SPIDERS = 6
 EELT_SPIDER_WIDTH_M = 0.5
 
@@ -1084,7 +1085,8 @@ def eelt_pupil() -> PupilGeometry:
     """Pupil geometry for the ELT primary used by NAYRA.
 
     Ported from nayra ``nayra.config.eelt_pupil_geometry``:
-    39.146 m circular pupil, 11% central obscuration, and six 0.5 m-wide
+    39.146 m circular pupil, 11.1 m central obstruction (ESO; NAYRA used
+    4.3 m), and six 0.5 m-wide
     radial spider vanes from the obscuration edge to the outer pupil.
     """
 

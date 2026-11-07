@@ -468,21 +468,21 @@ type = "fringe_tracking.closed_loop"
     assert stages["array"]["n_apertures"] == 1
     assert stages["array"]["mirror_transmission"] == pytest.approx(0.85)
     assert stages["array"]["ao_bench_transmission"] == pytest.approx(0.85)
-    assert stages["array"]["central_obstruction_ratio"] == pytest.approx(0.11)
+    assert stages["array"]["central_obstruction_ratio"] == pytest.approx(11.1 / 39.146, rel=1e-5)
 
     assert stages["atmosphere"]["r0_500nm_m"] == pytest.approx(0.157)
     assert stages["atmosphere"]["L0_m"] == pytest.approx(22.0)
     assert stages["atmosphere"]["wind_speed_m_s"] == pytest.approx(9.0)
     assert stages["atmosphere"]["atmospheric_transmission"] == pytest.approx(0.985)
 
-    assert stages["ao"]["central_obstruction"] == pytest.approx(0.11)
+    assert stages["ao"]["central_obstruction"] == pytest.approx(11.1 / 39.146, rel=1e-5)
     assert stages["ao"]["tau0_500nm_s"] == pytest.approx(5.5e-3)
     assert stages["ao"]["theta0_500nm_arcsec"] == pytest.approx(2.5)
     assert stages["ao"]["v_wind_m_s"] == pytest.approx(9.0)
-    assert stages["ao"]["pupil_central_obstruction_diameter_m"] == pytest.approx(4.306)
+    assert stages["ao"]["pupil_central_obstruction_diameter_m"] == pytest.approx(11.1)
 
-    assert stages["injection"]["central_obscuration_ratio"] == pytest.approx(0.11)
-    assert stages["fiber"]["central_obscuration_ratio"] == pytest.approx(0.11)
+    assert stages["injection"]["central_obscuration_ratio"] == pytest.approx(11.1 / 39.146, rel=1e-5)
+    assert stages["fiber"]["central_obscuration_ratio"] == pytest.approx(11.1 / 39.146, rel=1e-5)
     assert stages["background"]["site_profile"] == "cerro_armazones"
     assert stages["fringe_tracking"]["wind_speed_m_s"] == pytest.approx(9.0)
 
@@ -539,7 +539,7 @@ r0_500nm_m = 0.2
     }
 
     assert stages["array"]["diameter_m"] == pytest.approx(12.0)
-    assert stages["array"]["central_obstruction_ratio"] == pytest.approx(0.11)
+    assert stages["array"]["central_obstruction_ratio"] == pytest.approx(11.1 / 39.146, rel=1e-5)
     assert stages["atmosphere"]["r0_500nm_m"] == pytest.approx(0.2)
     assert stages["atmosphere"]["L0_m"] == pytest.approx(22.0)
 

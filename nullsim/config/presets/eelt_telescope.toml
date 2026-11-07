@@ -4,8 +4,8 @@ n_apertures = 1
 
 [aperture]
 diameter_m = 39.146
-obscuration_fraction = 0.11
-central_obstruction_diameter_m = 4.306
+obscuration_fraction = 0.283554  # 11.1 / 39.146
+central_obstruction_diameter_m = 11.1  # ESO ELT design; NAYRA's 4.306 m was 0.11 x D
 
 [optics]
 mirror_transmission = 0.85
