@@ -1574,17 +1574,14 @@ def _first_record(collection: RunCollection) -> RunRecord | None:
 
 
 def _find_component(record: RunRecord | None, prefix: str) -> dict[str, Any] | None:
-    if record is None:
-        return None
-    prefix_match: dict[str, Any] | None = None
-    for name, payload in record.result.state.results.components.items():
-        if not isinstance(payload, Mapping):
-            continue
-        if name == prefix:
-            return dict(payload)
-        if prefix_match is None and name.startswith(prefix):
-            prefix_match = dict(payload)
-    return prefix_match
+    """The newest component whose name starts with ``prefix``.
+
+    Newest first, like the stages' selectors: a later stage instance
+    supersedes an earlier one whether or not its name carries a suffix.
+    """
+
+    name = None if record is None else _component_name(record, prefix)
+    return None if name is None else dict(record.result.state.results.components[name])
 
 
 def _chip_payload_summary(collection: RunCollection) -> dict[str, Any]:
@@ -1841,6 +1838,11 @@ def _survey_rows(collection: RunCollection) -> list[dict[str, Any]]:
                 and not min(sweep_jmags) <= target_jmag <= max(sweep_jmags)
             ),
             "char_floor_scaled_from_jmag": float(char_floor_scaled_from_jmag),
+            # The donor had no realized floor: every anchor took the host
+            # cell's scene floor.
+            "char_floor_from_host_scene": int(
+                bool(char_curve is not None and char_curve.get("floor_from_host_scene"))
+            ),
             "char_spectro_throughput": _first_float(
                 char, "spectro_throughput", default=0.0
             ),
@@ -1932,6 +1934,7 @@ def _exoplanet_table_columns() -> list[str]:
         "dark_rate_per_dark_port",
         "host_jmag_outside_sweep",
         "char_floor_scaled_from_jmag",
+        "char_floor_from_host_scene",
         "char_spectro_throughput",
         "char_spectro_null_depth",
         "char_spectro_design_null_depth",
@@ -2523,14 +2526,15 @@ def _char_max_resolving_power(
     integration_time_s: float,
     eps_systematic: float,
     servo_bw_hz: float,
-    spectro_throughput: float,
+    char: Mapping[str, Any] | None,
 ) -> float:
-    """Largest resolving power with per-bin SNR >= 3 (AWG Nyquist binning).
+    """Largest resolving power with per-bin SNR >= ``snr_min_per_bin``.
 
-    The characterization planet/leakage rates handed in are pre-spectrograph,
-    so ``spectro_throughput`` is the AWG optical throughput in AWG mode and 1
-    otherwise, as ``characterization.spectro`` charges it. Capped at the
-    R = 1e4 AWG hardware limit referenced by the paper's headline table.
+    Mirrors ``characterization.spectro``'s own max-R call, read back from its
+    payload: the rates are pre-spectrograph, so the AWG optical throughput
+    applies in AWG mode; sky is summed over the spectro ports; the detector
+    pixels per port and the pixels per resolution element (1 for MKID) are
+    the stage's.
     """
 
     from nullsim.physics.spectroscopy import max_spectral_resolution
@@ -2546,18 +2550,32 @@ def _char_max_resolving_power(
             band_bandwidth_m = float(grid.wavelength_bandwidth_um) * 1.0e-6
     if band_lambda_m <= 0.0 or band_bandwidth_m <= 0.0:
         return float("nan")
+    n_ports = max(int(n_spectro_ports), 1)
+    spectrograph = None if char is None else char.get("spectrograph")
+    if spectrograph == "awg":
+        awg = char.get("awg") or {}
+        n_spectro_pixels = int(awg.get("n_detector_pixels_per_bin", n_ports)) // n_ports
+        pixels_per_resolution_element = int(awg.get("pixels_per_resolution_element", 2))
+    elif spectrograph == "mkid":
+        n_spectro_pixels = int(char.get("mkid_n_spectro_pixels", 1))
+        pixels_per_resolution_element = 1
+    else:
+        n_spectro_pixels, pixels_per_resolution_element = 1, 2
     return max_spectral_resolution(
         planet_rate_total_hz=float(planet_rate_hz),
         leakage_rate_total_hz=max(float(leakage_rate_hz), 0.0),
-        spectro_throughput=float(spectro_throughput),
+        spectro_throughput=_awg_throughput(char),
         band_lambda_m=band_lambda_m,
         band_bandwidth_m=band_bandwidth_m,
         integration_time_s=float(integration_time_s),
         dark_rate_hz_per_pixel=max(float(dark_rate_hz_per_port), 0.0),
-        n_spectro_pixels=max(int(n_spectro_ports), 1),
+        n_spectro_pixels=max(n_spectro_pixels, 1),
         null_instability=max(float(eps_systematic), 0.0),
         servo_bandwidth_hz=max(float(servo_bw_hz), 0.0),
-        sky_rate_hz_per_spectro_port=max(float(sky_rate_hz_per_port), 0.0),
+        snr_min=_first_float(char, "snr_min_per_bin", default=3.0),
+        resolving_power_cap=_first_float(char, "resolving_power_cap", default=1.0e4),
+        pixels_per_resolution_element=pixels_per_resolution_element,
+        sky_rate_hz_per_spectro_port=max(float(sky_rate_hz_per_port), 0.0) * n_ports,
     )
 
 
@@ -2684,7 +2702,7 @@ def _characterization_rates_for_planet(
         integration_time_s=integration_time_s,
         eps_systematic=eps_systematic,
         servo_bw_hz=servo_bw_hz,
-        spectro_throughput=_awg_throughput(char),
+        char=char,
     )
     return (
         float(planet_rate_hz),
@@ -2792,7 +2810,7 @@ def _characterization_curve_estimate_for_planet(
         integration_time_s=integration_time_s,
         eps_systematic=eps_systematic,
         servo_bw_hz=servo_bw_hz,
-        spectro_throughput=_awg_throughput(char),
+        char=char,
     )
     return (
         float(planet_rate_hz),
@@ -2811,14 +2829,23 @@ def _char_curve_rescaled_to_cell(
     """Carry a characterization curve from a donor J cell to the host's cell.
 
     The retuned chip's throughput and static leak transfer between cells. The
-    realized floor, eps, and the systematic bandwidth do not: they follow the
-    fringe tracker's photon budget and the setpoint trim. Each cell's
-    ``characterization.spectro`` retunes the chip at its own J, so:
+    realized floor, the leakage fluctuation, and the systematic bandwidth do
+    not: they follow the fringe tracker's photon budget and the setpoint
+    trim. Each cell's ``characterization.spectro`` retunes the chip at its
+    own J, so:
 
-    - floor: scaled by the ratio of the cells' spectro ``realized_spectro_floor``
-      (direct retuned measurements, setpoint-trim leakage included).
-    - eps: the host cell's spectro ``eps_systematic`` (the retuned port's own
-      leak CV); the donor's per-anchor eps is dropped.
+    - floor: each anchor's floor is scaled by the ratio of the cells' spectro
+      ``realized_spectro_floor``. Both zero gives ratio 1; a zero donor floor
+      under a nonzero host floor puts the host's scene floor at every anchor
+      and sets ``floor_from_host_scene``.
+    - eps: a CV relative to each anchor's own leakage, so the fluctuation
+      amplitude is what moves. The stage forms ``eps = hypot(ni / nsc, s)``
+      with ``ni = leak_rms / leak``; each anchor's ``leak_rms`` (from
+      ``null_instability_per_anchor`` times its leakage) is scaled by the
+      ratio of the cells' spectro ``spectro_leak_rms_fraction``, the speckle
+      CV ``s`` is kept (its amplitude follows the new leakage), and eps is
+      recomposed over the new leakage. Without those keys, the host spectro's
+      scalar eps replaces the curve's.
     - bandwidth: the host cell's spectro ``servo_bw_hz`` (0 without fringe
       tracking) and ``with_fringe_tracking``.
     """
@@ -2826,21 +2853,58 @@ def _char_curve_rescaled_to_cell(
     curve = dict(donor_curve)
     if donor_spectro is None or cell_spectro is None:
         return curve
-
-    donor_floor = _first_float(donor_spectro, "realized_spectro_floor")
-    ratio = _first_float(cell_spectro, "realized_spectro_floor") / donor_floor
-    if np.isfinite(ratio) and donor_floor > 0.0:
-        floor = _payload_vector(curve, "realized_spectro_floor_per_anchor")
-        static = _payload_vector(curve, "spectro_static_leak_fraction_per_anchor")
-        if floor is not None and static is not None:
-            curve["realized_spectro_floor_per_anchor"] = floor * ratio
-            curve["spectro_leak_fraction_per_anchor"] = static + floor * ratio
-        if curve.get("realized_spectro_floor") is not None:
-            curve["realized_spectro_floor"] = float(curve["realized_spectro_floor"]) * ratio
-
-    for key in ("eps_systematic", "servo_bw_hz", "with_fringe_tracking"):
+    for key in ("servo_bw_hz", "with_fringe_tracking"):
         if cell_spectro.get(key) is not None:
             curve[key] = cell_spectro[key]
+
+    old_leak = _payload_vector(curve, "spectro_leak_fraction_per_anchor")
+    new_leak = old_leak
+    floor = _payload_vector(curve, "realized_spectro_floor_per_anchor")
+    static = _payload_vector(curve, "spectro_static_leak_fraction_per_anchor")
+    donor_floor = _first_float(donor_spectro, "realized_spectro_floor")
+    cell_floor = _first_float(cell_spectro, "realized_spectro_floor")
+    if floor is not None and static is not None and np.isfinite(donor_floor + cell_floor):
+        if donor_floor > 0.0:
+            new_floor = floor * (cell_floor / donor_floor)
+        elif cell_floor == 0.0:
+            new_floor = floor
+        else:
+            new_floor = np.full_like(floor, cell_floor)
+            curve["floor_from_host_scene"] = True
+        new_leak = static + new_floor
+        curve["realized_spectro_floor_per_anchor"] = new_floor
+        curve["spectro_leak_fraction_per_anchor"] = new_leak
+        curve["realized_spectro_floor"] = float(np.nanmedian(new_floor))
+
+    ni = _payload_vector(curve, "null_instability_per_anchor")
+    eps = _payload_vector(curve, "eps_systematic_per_anchor")
+    donor_rms = _first_float(donor_spectro, "spectro_leak_rms_fraction")
+    cell_rms = _first_float(cell_spectro, "spectro_leak_rms_fraction")
+    rms_ratio = (
+        cell_rms / donor_rms
+        if donor_rms > 0.0
+        else (1.0 if cell_rms == 0.0 else float("nan"))
+    )
+    if (
+        old_leak is not None
+        and ni is not None
+        and eps is not None
+        and ni.shape == eps.shape == old_leak.shape
+        and np.isfinite(rms_ratio)
+    ):
+        nsc = _first_float(curve, "nsc_systematic_reduction", default=1.0)
+        speckle_cv = np.sqrt(np.maximum(eps**2 - (ni / nsc) ** 2, 0.0))
+        leak_rms = ni * old_leak * rms_ratio
+        with np.errstate(divide="ignore", invalid="ignore"):
+            new_ni = np.where(new_leak > 0.0, leak_rms / new_leak, 0.0)
+        new_eps = np.hypot(new_ni / nsc, speckle_cv)
+        curve["null_instability_per_anchor"] = new_ni
+        curve["eps_systematic_per_anchor"] = new_eps
+        curve["eps_systematic"] = float(np.nanmedian(new_eps))
+        return curve
+
+    if cell_spectro.get("eps_systematic") is not None:
+        curve["eps_systematic"] = cell_spectro["eps_systematic"]
     curve.pop("eps_systematic_per_anchor", None)
     return curve
 
@@ -3004,15 +3068,36 @@ def _char_dark_rate_hz_per_port(
 
 
 def _sky_rate_per_dark_port(record: RunRecord | None) -> float:
+    """Background per dark port: sky plus the thermal and exozodi additions.
+
+    ``performance.standard`` publishes the rate its SNR charged (an explicit
+    parameter, else the newest background stage's
+    ``background_rate_hz_per_dark_port``, else its sky). Without it, read the
+    background stages the same way, newest first.
+    """
+
     if record is None:
         return 0.0
-    for payload in record.result.state.results.components.values():
-        if not isinstance(payload, Mapping):
-            continue
-        if payload.get("sky_rate_hz_per_dark_port") is not None:
-            return float(payload["sky_rate_hz_per_dark_port"])
-        if payload.get("sky_rate_per_dark_port_hz") is not None:
-            return float(payload["sky_rate_per_dark_port_hz"])
+    rate = _first_float(
+        _find_component(record, "performance.standard"),
+        "sky_rate_hz_per_port",
+        default=float("nan"),
+    )
+    if np.isfinite(rate):
+        return float(rate)
+    payloads = [
+        payload
+        for payload in reversed(record.result.state.results.components.values())
+        if isinstance(payload, Mapping)
+    ]
+    for key in (
+        "background_rate_hz_per_dark_port",
+        "sky_rate_hz_per_dark_port",
+        "sky_rate_per_dark_port_hz",
+    ):
+        for payload in payloads:
+            if payload.get(key) is not None:
+                return float(payload[key])
     return 0.0
 
 
@@ -3210,7 +3295,7 @@ def _range_or_none(values: np.ndarray) -> list[float] | None:
 
 
 def _component_name(record: RunRecord, prefix: str) -> str | None:
-    for name, payload in record.result.state.results.components.items():
+    for name, payload in reversed(record.result.state.results.components.items()):
         if name.startswith(prefix) and isinstance(payload, Mapping):
             return name
     return None

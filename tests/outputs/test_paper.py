@@ -100,7 +100,7 @@ def test_latex_tables_use_paper_prose_class_labels() -> None:
         assert "Super-Earth" not in table
 
 
-def test_find_component_prefers_exact_diagnostic_name(tmp_path: Path) -> None:
+def test_find_component_returns_newest_matching_component(tmp_path: Path) -> None:
     config = _config()
     state = _state()
     full_payload = {"rank": 2}
@@ -117,6 +117,20 @@ def test_find_component_prefers_exact_diagnostic_name(tmp_path: Path) -> None:
     record = collection.records[0]
 
     assert _find_component(record, "fringe_observability") == full_payload
+
+    # Newest first with no exact-name preference: a later suffixed instance
+    # supersedes an earlier exact-named one (review 2026-11-07 Codex item 5).
+    state = replace(
+        state,
+        results=Results(
+            components={
+                "chip.kernel_mzi_mesh": {"rank": 0},
+                "chip.kernel_mzi_mesh.deployed": {"rank": 1},
+            },
+        ),
+    )
+    record = _collection(config, state, tmp_path).records[0]
+    assert _find_component(record, "chip.kernel_mzi_mesh") == {"rank": 1}
 
 
 def test_paper_registered_product_regenerates_instead_of_copying_stale(
@@ -430,8 +444,9 @@ def test_char_curve_rescaled_to_cell_moves_floor_eps_and_bandwidth() -> None:
 
     Hand values: spectro floors 3e-6 (donor) and 1.2e-5 (host) scale the
     per-anchor floor 4x, so leak = static + 4 floor = [8.1e-6, 16.2e-6].
-    eps and bandwidth are copied from the host spectro; the donor's
-    per-anchor eps must not survive.
+    Bandwidth comes from the host spectro. Without the leak RMS keys there is
+    no anchor-wise decomposition, so the host's scalar eps replaces the
+    curve's and the donor's per-anchor eps must not survive.
     """
 
     from nullsim.outputs.paper import _char_curve_rescaled_to_cell
@@ -471,6 +486,129 @@ def test_char_curve_rescaled_to_cell_moves_floor_eps_and_bandwidth() -> None:
     np.testing.assert_allclose(
         donor_curve["spectro_leak_fraction_per_anchor"], [2.1e-6, 4.2e-6]
     )
+
+
+def _eps_probe_curve() -> dict:
+    """Reviewer's probe: anchor leakages [1e-6, 1e-7], eps [0.01, 0.1].
+
+    nsc = 2, null instability [0.016, 0.16] and speckle CV [0.006, 0.06]:
+    hypot(0.008, 0.006) = 0.01 and hypot(0.08, 0.06) = 0.1, so
+    eps x leakage = [1e-8, 1e-8].
+    """
+
+    return {
+        "spectro_static_leak_fraction_per_anchor": np.array([5.0e-7, 5.0e-8]),
+        "realized_spectro_floor_per_anchor": np.array([5.0e-7, 5.0e-8]),
+        "spectro_leak_fraction_per_anchor": np.array([1.0e-6, 1.0e-7]),
+        "null_instability_per_anchor": np.array([0.016, 0.16]),
+        "eps_systematic_per_anchor": np.array([0.01, 0.1]),
+        "eps_systematic": 0.055,
+        "nsc_systematic_reduction": 2.0,
+    }
+
+
+def test_char_curve_rescale_keeps_eps_times_leakage_for_unchanged_budgets() -> None:
+    """Review 2026-11-07 Codex item 1: eps is a CV against each anchor's own
+    leakage. With donor and host budgets equal, eps x leakage must stay
+    [1e-8, 1e-8]; copying one scene eps to every anchor made it
+    [1e-7, 1e-8]."""
+
+    from nullsim.outputs.paper import _char_curve_rescaled_to_cell
+
+    spectro = {
+        "realized_spectro_floor": 2.0e-6,
+        "spectro_leak_rms_fraction": 3.0e-8,
+        "eps_systematic": 0.03,
+    }
+    curve = _char_curve_rescaled_to_cell(
+        _eps_probe_curve(), donor_spectro=spectro, cell_spectro=dict(spectro)
+    )
+
+    np.testing.assert_allclose(
+        curve["eps_systematic_per_anchor"] * curve["spectro_leak_fraction_per_anchor"],
+        [1.0e-8, 1.0e-8],
+    )
+
+
+def test_char_curve_rescale_scales_fluctuation_amplitude_not_cv() -> None:
+    """Floor ratio 3 and leak RMS ratio 1, by hand: new leakage
+    static + 3 floor = [2e-6, 2e-7]; dynamic RMS ni x old leak = [1.6e-8,
+    1.6e-8] unchanged, so ni = [8e-3, 0.08] and eps = hypot(ni / 2, speckle)
+    = hypot(0.004, 0.006) = 0.0072111 and hypot(0.04, 0.06) = 0.072111.
+    A leak RMS ratio of 2 instead doubles the dynamic term at fixed floor:
+    hypot(0.016, 0.006) = 0.017088 and hypot(0.16, 0.06) = 0.17088."""
+
+    from nullsim.outputs.paper import _char_curve_rescaled_to_cell
+
+    donor = {"realized_spectro_floor": 1.0e-6, "spectro_leak_rms_fraction": 1.0e-8}
+    curve = _char_curve_rescaled_to_cell(
+        _eps_probe_curve(),
+        donor_spectro=donor,
+        cell_spectro={"realized_spectro_floor": 3.0e-6, "spectro_leak_rms_fraction": 1.0e-8},
+    )
+    np.testing.assert_allclose(curve["spectro_leak_fraction_per_anchor"], [2.0e-6, 2.0e-7])
+    np.testing.assert_allclose(
+        curve["eps_systematic_per_anchor"], [0.0072111, 0.072111], rtol=1.0e-4
+    )
+
+    curve = _char_curve_rescaled_to_cell(
+        _eps_probe_curve(),
+        donor_spectro=donor,
+        cell_spectro={"realized_spectro_floor": 1.0e-6, "spectro_leak_rms_fraction": 2.0e-8},
+    )
+    np.testing.assert_allclose(
+        curve["eps_systematic_per_anchor"], [0.017088, 0.17088], rtol=1.0e-4
+    )
+    assert curve["eps_systematic"] == pytest.approx(
+        float(np.median(curve["eps_systematic_per_anchor"]))
+    )
+
+
+def test_char_curve_rescale_survives_zero_donor_floor() -> None:
+    """Review 2026-11-07 Codex item 2: a noiseless donor (floor 0) must not
+    divide by zero. Both zero: unchanged. Host 4e-6: every anchor takes the
+    host's scene floor and the curve is flagged."""
+
+    from nullsim.outputs.paper import _char_curve_rescaled_to_cell
+
+    zero = {"realized_spectro_floor": 0.0}
+    curve = _char_curve_rescaled_to_cell(
+        _eps_probe_curve(), donor_spectro=zero, cell_spectro=dict(zero)
+    )
+    np.testing.assert_allclose(curve["spectro_leak_fraction_per_anchor"], [1.0e-6, 1.0e-7])
+    assert "floor_from_host_scene" not in curve
+
+    curve = _char_curve_rescaled_to_cell(
+        _eps_probe_curve(),
+        donor_spectro=zero,
+        cell_spectro={"realized_spectro_floor": 4.0e-6},
+    )
+    np.testing.assert_allclose(curve["realized_spectro_floor_per_anchor"], [4.0e-6, 4.0e-6])
+    np.testing.assert_allclose(curve["spectro_leak_fraction_per_anchor"], [4.5e-6, 4.05e-6])
+    assert curve["floor_from_host_scene"] is True
+
+
+def test_sky_rate_prefers_background_total_over_sky(tmp_path: Path) -> None:
+    """Review 2026-11-07 Codex item 4: the PDI background is sky plus thermal
+    and exozodi: the rate performance.standard charged, else a background
+    stage's background_rate_hz_per_dark_port before its sky."""
+
+    from nullsim.outputs.paper import _sky_rate_per_dark_port
+
+    background = {"sky_rate_hz_per_dark_port": 2.0, "background_rate_hz_per_dark_port": 5.0}
+    state = replace(
+        _state(),
+        results=Results().add_component("background.space_zodi", background),
+    )
+    assert _sky_rate_per_dark_port(_collection(_config(), state, tmp_path).records[0]) == 5.0
+
+    state = replace(
+        state,
+        results=state.results.add_component(
+            "performance.standard", {"sky_rate_hz_per_port": 7.0}
+        ),
+    )
+    assert _sky_rate_per_dark_port(_collection(_config(), state, tmp_path).records[0]) == 7.0
 
 
 def test_char_curve_eps_is_interpolated_per_anchor(
@@ -523,16 +661,20 @@ def test_char_curve_eps_is_interpolated_per_anchor(
 def test_char_max_r_charges_awg_throughput(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Review 2026-11-07 row 31: the paper's max R uses the AWG throughput in
-    AWG mode (pre-spectrograph rates), and 1 otherwise."""
+    """Review 2026-11-07 row 31 and Codex item 3: the paper's max R repeats
+    characterization.spectro's call. AWG: its throughput, detector pixels per
+    port n_detector_pixels_per_bin / n_ports = 6 / 3 = 2, its pixels per
+    resolution element, sky 2 Hz per port x 3 ports = 6 Hz, and the stage's
+    snr_min and cap. MKID: throughput 1, mkid_n_spectro_pixels, 1 pixel per
+    resolution element."""
 
     import nullsim.physics.spectroscopy as spectroscopy
     from nullsim.outputs.paper import _awg_throughput
 
-    seen: list[float] = []
+    seen: list[dict] = []
 
     def fake_max_r(**kwargs: object) -> float:
-        seen.append(float(kwargs["spectro_throughput"]))
+        seen.append(kwargs)
         return 100.0
 
     monkeypatch.setattr(spectroscopy, "max_spectral_resolution", fake_max_r)
@@ -543,11 +685,15 @@ def test_char_max_r_charges_awg_throughput(
         "spectro_band_leak_fraction": 1.0e-5,
         "D": 0.0,
         "servo_bw_hz": 0.0,
-        "spectro_indices": np.array([1], dtype=np.intp),
+        "spectro_indices": np.array([1, 2, 3], dtype=np.intp),
+        "sky_rate_hz_per_spectro_port": 2.0,
+        "snr_min_per_bin": 5.0,
+        "resolving_power_cap": 5000.0,
     }
+    awg = {"throughput": 0.7, "n_detector_pixels_per_bin": 6, "pixels_per_resolution_element": 3}
     for char in (
-        {**base, "spectrograph": "awg", "awg": {"throughput": 0.7}},
-        {**base, "spectrograph": "mkid"},
+        {**base, "spectrograph": "awg", "awg": awg},
+        {**base, "spectrograph": "mkid", "mkid_n_spectro_pixels": 4},
     ):
         _characterization_rates_for_planet(
             record=record,
@@ -558,7 +704,16 @@ def test_char_max_r_charges_awg_throughput(
             fallback_leakage_rate_hz=0.0,
         )
 
-    assert seen == [pytest.approx(0.7), pytest.approx(1.0)]
+    awg_call, mkid_call = seen
+    assert awg_call["spectro_throughput"] == pytest.approx(0.7)
+    assert awg_call["n_spectro_pixels"] == 2
+    assert awg_call["pixels_per_resolution_element"] == 3
+    assert awg_call["sky_rate_hz_per_spectro_port"] == pytest.approx(6.0)
+    assert awg_call["snr_min"] == pytest.approx(5.0)
+    assert awg_call["resolving_power_cap"] == pytest.approx(5000.0)
+    assert mkid_call["spectro_throughput"] == pytest.approx(1.0)
+    assert mkid_call["n_spectro_pixels"] == 4
+    assert mkid_call["pixels_per_resolution_element"] == 1
     assert _awg_throughput(None) == 1.0
 
 
