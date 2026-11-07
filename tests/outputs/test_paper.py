@@ -658,6 +658,121 @@ def test_char_curve_eps_is_interpolated_per_anchor(
     assert captured["eps"] == pytest.approx(0.5)
 
 
+def test_char_curve_sky_is_the_planet_anchor_sky(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review 2026-11-07 second Codex pass, item 1: each anchor's retuned row
+    routes its own sky. Anchors at 10 and 20 mas carry 10 and 90 Hz (median
+    50 Hz): a planet at 10 mas is charged 10 Hz in the SNR and 10 Hz x 1 port
+    in max R, and one at 15 mas the interpolated 50 Hz. Without the
+    per-anchor array the scalar is used."""
+
+    import nullsim.physics.spectroscopy as spectroscopy
+    import nullsim.stages.performance.standard as standard
+
+    snr_sky: list[float] = []
+    max_r_sky: list[float] = []
+    real = standard._compute_snr
+
+    def spy(**kwargs: object) -> dict:
+        snr_sky.append(float(kwargs["sky_rate_hz_per_port"]))
+        return real(**kwargs)
+
+    def fake_max_r(**kwargs: object) -> float:
+        max_r_sky.append(float(kwargs["sky_rate_hz_per_spectro_port"]))
+        return 100.0
+
+    monkeypatch.setattr(standard, "_compute_snr", spy)
+    monkeypatch.setattr(spectroscopy, "max_spectral_resolution", fake_max_r)
+    record = _collection(_config(), _state(), tmp_path).records[0]
+    char_curve = {
+        "detected_stellar_rate_hz": 1.0e6,
+        "separations_mas": np.array([10.0, 20.0]),
+        "spectro_throughput_per_anchor": np.array([0.5, 0.5]),
+        "spectro_leak_fraction_per_anchor": np.array([1.0e-5, 1.0e-5]),
+        "sky_rate_hz_per_spectro_port": 50.0,
+        "sky_rate_hz_per_spectro_port_per_anchor": np.array([10.0, 90.0]),
+        "servo_bw_hz": 0.0,
+    }
+    kwargs = dict(
+        record=record,
+        char=None,
+        planet_contrast=1.0e-4,
+        fallback_planet_rate_hz=0.0,
+        fallback_leakage_rate_hz=0.0,
+    )
+
+    for separation in (10.0, 15.0):
+        _characterization_rates_for_planet(
+            char_curve=char_curve, planet_separation_mas=separation, **kwargs
+        )
+    scalar_only = {
+        k: v for k, v in char_curve.items()
+        if k != "sky_rate_hz_per_spectro_port_per_anchor"
+    }
+    _characterization_rates_for_planet(
+        char_curve=scalar_only, planet_separation_mas=10.0, **kwargs
+    )
+
+    assert snr_sky == [pytest.approx(10.0), pytest.approx(50.0), pytest.approx(50.0)]
+    assert max_r_sky == snr_sky
+
+
+def test_char_max_r_uses_characterization_band_and_r_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review 2026-11-07 second Codex pass, items 2 and 3: max R searches the
+    characterization band and R interval the stage published (curve first,
+    then spectro), and the global grid band only as a last resort."""
+
+    import nullsim.physics.spectroscopy as spectroscopy
+    from nullsim.outputs.paper import _char_max_resolving_power
+
+    record = _collection(_config(), _state(), tmp_path).records[0]
+    common = dict(
+        planet_rate_hz=0.1,
+        leakage_rate_hz=1.0,
+        dark_rate_hz_per_port=0.0,
+        sky_rate_hz_per_port=0.0,
+        n_spectro_ports=1,
+        integration_time_s=14400.0,
+        eps_systematic=0.0,
+        servo_bw_hz=0.0,
+    )
+    band = {"band_lambda_m": 1.25e-6, "band_bandwidth_m": 0.2e-6}
+
+    # Item 3, real primitive: 0.1 Hz planet on 1 Hz leakage over 4 h reaches
+    # R = 45.4 with the default floor of 1 (direct max_spectral_resolution
+    # call); with the stage's floor of 300 no R in [300, cap] qualifies, so 0.
+    assert _char_max_resolving_power(
+        record, char={**band, "resolving_power_floor": 1.0}, **common
+    ) == pytest.approx(45.4465850821492, rel=1.0e-9)
+    assert _char_max_resolving_power(
+        record, char={**band, "resolving_power_floor": 300.0}, **common
+    ) == 0.0
+
+    seen: list[dict] = []
+
+    def fake_max_r(**kwargs: object) -> float:
+        seen.append(kwargs)
+        return 100.0
+
+    monkeypatch.setattr(spectroscopy, "max_spectral_resolution", fake_max_r)
+    curve_band = {"band_lambda_m": 1.1e-6, "band_bandwidth_m": 0.075e-6}
+    _char_max_resolving_power(record, char=band, char_curve=curve_band, **common)
+    _char_max_resolving_power(record, char=band, **common)
+    _char_max_resolving_power(record, char=None, **common)
+
+    curve_call, spectro_call, grid_call = seen
+    assert curve_call["band_lambda_m"] == pytest.approx(1.1e-6)
+    assert curve_call["band_bandwidth_m"] == pytest.approx(0.075e-6)
+    assert spectro_call["band_lambda_m"] == pytest.approx(1.25e-6)
+    assert spectro_call["band_bandwidth_m"] == pytest.approx(0.2e-6)
+    # _config's grid: 1.0 um center, 0.1 um bandwidth.
+    assert grid_call["band_lambda_m"] == pytest.approx(1.0e-6)
+    assert grid_call["band_bandwidth_m"] == pytest.approx(0.1e-6)
+
+
 def test_char_max_r_charges_awg_throughput(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

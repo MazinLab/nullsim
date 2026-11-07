@@ -1870,9 +1870,10 @@ def _survey_rows(collection: RunCollection) -> list[dict[str, Any]]:
             # arm total per logical port, dark the per-port rate in the
             # stage's D budget.
             "char_n_spectro_ports": n_spectro_ports,
-            "char_sky_rate_per_spectro_port": _first_float(
+            "char_sky_rate_per_spectro_port": _curve_value_at_separation(
                 char_curve,
                 "sky_rate_hz_per_spectro_port",
+                float(planet.separation_mas),
                 default=_first_float(char, "sky_rate_hz_per_spectro_port", default=0.0),
             ),
             "char_dark_rate_per_spectro_port": (
@@ -2527,6 +2528,7 @@ def _char_max_resolving_power(
     eps_systematic: float,
     servo_bw_hz: float,
     char: Mapping[str, Any] | None,
+    char_curve: Mapping[str, Any] | None = None,
 ) -> float:
     """Largest resolving power with per-bin SNR >= ``snr_min_per_bin``.
 
@@ -2534,20 +2536,29 @@ def _char_max_resolving_power(
     payload: the rates are pre-spectrograph, so the AWG optical throughput
     applies in AWG mode; sky is summed over the spectro ports; the detector
     pixels per port and the pixels per resolution element (1 for MKID) are
-    the stage's.
+    the stage's. The band (``band_lambda_m``, ``band_bandwidth_m``) and the
+    R interval (``snr_min_per_bin``, ``resolving_power_floor`` and
+    ``_cap``) come from the curve payload when it has them, else from the
+    spectro payload; the band falls back to the global grid last.
     """
 
     from nullsim.physics.spectroscopy import max_spectral_resolution
 
     if not (np.isfinite(planet_rate_hz) and planet_rate_hz > 0.0):
         return float("nan")
-    band_lambda_m = 0.0
-    band_bandwidth_m = 0.0
-    if record is not None:
-        grid = getattr(record.config, "grid", None)
-        if grid is not None:
-            band_lambda_m = float(grid.wavelength_center_um) * 1.0e-6
-            band_bandwidth_m = float(grid.wavelength_bandwidth_um) * 1.0e-6
+
+    def published(key: str, default: float) -> float:
+        return _first_float(char_curve, key, default=_first_float(char, key, default=default))
+
+    grid = None if record is None else getattr(record.config, "grid", None)
+    band_lambda_m = published(
+        "band_lambda_m",
+        0.0 if grid is None else float(grid.wavelength_center_um) * 1.0e-6,
+    )
+    band_bandwidth_m = published(
+        "band_bandwidth_m",
+        0.0 if grid is None else float(grid.wavelength_bandwidth_um) * 1.0e-6,
+    )
     if band_lambda_m <= 0.0 or band_bandwidth_m <= 0.0:
         return float("nan")
     n_ports = max(int(n_spectro_ports), 1)
@@ -2572,8 +2583,9 @@ def _char_max_resolving_power(
         n_spectro_pixels=max(n_spectro_pixels, 1),
         null_instability=max(float(eps_systematic), 0.0),
         servo_bandwidth_hz=max(float(servo_bw_hz), 0.0),
-        snr_min=_first_float(char, "snr_min_per_bin", default=3.0),
-        resolving_power_cap=_first_float(char, "resolving_power_cap", default=1.0e4),
+        snr_min=published("snr_min_per_bin", 3.0),
+        resolving_power_cap=published("resolving_power_cap", 1.0e4),
+        resolving_power_floor=published("resolving_power_floor", 1.0),
         pixels_per_resolution_element=pixels_per_resolution_element,
         sky_rate_hz_per_spectro_port=max(float(sky_rate_hz_per_port), 0.0) * n_ports,
     )
@@ -2754,9 +2766,12 @@ def _characterization_curve_estimate_for_planet(
         if char is not None
         else 0.0
     )
-    sky_rate_hz_per_port = _first_float(
+    # Each anchor's retuned row routes its own sky and has its own leak CV:
+    # use the values at the planet's separation, as for throughput and leak.
+    sky_rate_hz_per_port = _curve_value_at_separation(
         char_curve,
         "sky_rate_hz_per_spectro_port",
+        planet_separation_mas,
         default=_first_float(char, "sky_rate_hz_per_spectro_port", default=0.0),
     )
     null_instability = _first_float(
@@ -2764,21 +2779,12 @@ def _characterization_curve_estimate_for_planet(
         "null_instability",
         default=_first_float(char, "null_instability", default=0.0),
     )
-    eps_systematic = _first_float(
+    eps_systematic = _curve_value_at_separation(
         char_curve,
         "eps_systematic",
+        planet_separation_mas,
         default=_first_float(char, "eps_systematic", default=null_instability),
     )
-    # The curve publishes each anchor's retuned-port leak CV; use the one at
-    # the planet's separation when it is defined there.
-    eps_per_anchor = _payload_vector(char_curve, "eps_systematic_per_anchor")
-    seps = _payload_vector(char_curve, "separations_mas")
-    if eps_per_anchor is not None and seps is not None and seps.shape == eps_per_anchor.shape:
-        eps_at = _interp_gapped(
-            seps, eps_per_anchor, np.isfinite(eps_per_anchor), planet_separation_mas
-        )
-        if np.isfinite(eps_at):
-            eps_systematic = eps_at
     servo_bw_hz = _first_float(
         char_curve,
         "servo_bw_hz",
@@ -2811,6 +2817,7 @@ def _characterization_curve_estimate_for_planet(
         eps_systematic=eps_systematic,
         servo_bw_hz=servo_bw_hz,
         char=char,
+        char_curve=char_curve,
     )
     return (
         float(planet_rate_hz),
@@ -2818,6 +2825,30 @@ def _characterization_curve_estimate_for_planet(
         float(snr),
         float(max_resolving_power),
     )
+
+
+def _curve_value_at_separation(
+    curve: Mapping[str, Any] | None,
+    key: str,
+    separation_mas: float,
+    *,
+    default: float,
+) -> float:
+    """A curve quantity at the planet's separation.
+
+    Interpolates ``<key>_per_anchor`` with ``_interp_gapped``; falls back to
+    the scalar ``key`` (an anchor median), then to ``default``.
+    """
+
+    scalar = _first_float(curve, key, default=default)
+    if curve is None:
+        return scalar
+    per_anchor = _payload_vector(curve, f"{key}_per_anchor")
+    seps = _payload_vector(curve, "separations_mas")
+    if per_anchor is None or seps is None or seps.shape != per_anchor.shape:
+        return scalar
+    value = _interp_gapped(seps, per_anchor, np.isfinite(per_anchor), separation_mas)
+    return value if np.isfinite(value) else scalar
 
 
 def _char_curve_rescaled_to_cell(

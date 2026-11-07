@@ -75,3 +75,9 @@ Detection-space figure (`nullsim/outputs/plots/detection_space.py`):
 - **Every characterization curve is drawn (Issue 25).** Several
   `characterization.detection_curve` components on one record each get a
   line, a color, and a legend label naming the component.
+- **Characterization rows use their own anchor's sky, band, and R bounds.**
+  The per-anchor spectro sky is interpolated at the planet's separation,
+  as epsilon is, since each retuned row routes its own sky. The paper's
+  max R uses the characterization band (`band_lambda_m`,
+  `band_bandwidth_m`) and the stage's `resolving_power_floor`, so it
+  searches the same interval as the stage.
