@@ -1253,7 +1253,7 @@ def _write_pdi_products(
     json_payload = {
         "config": {
             "integration_time_s": _integration_time_s(collection),
-            "dual_pol_throughput_vs_scalar": _DUAL_POL_THROUGHPUT_VS_SCALAR,
+            "dual_pol_throughput_vs_scalar": _scalar_to_dual_pol_rate_scale(collection),
             "hwp_rotation_rate_hz": _PDI_HWP_ROTATION_RATE_HZ,
             "pol_model_crossover_rearth": _POL_MODEL_CROSSOVER_REARTH,
         },
@@ -1300,6 +1300,7 @@ def _write_pdi_sensitivity_curves(
     targets = _named_or_top_rows(rows, ("tau Boo b", "tau Cet h"), n=2)
     times_s = np.array([60.0, 600.0, 3600.0, 3.6e4, 3.6e5, 3.6e6])
     n_dark = _n_dark_ports_per_arm(collection)
+    rate_scale = _scalar_to_dual_pol_rate_scale(collection)
     with publication_style():
         fig, axes = plt.subplots(
             1, max(len(targets), 1), figsize=(11.0, 4.5), squeeze=False
@@ -1328,6 +1329,7 @@ def _write_pdi_sensitivity_curves(
                         t,
                         modulation_period_s=0.0,
                         n_dark_ports=n_dark,
+                        rate_scale=rate_scale,
                         ideal=True,
                     )
                 )
@@ -1337,10 +1339,17 @@ def _write_pdi_sensitivity_curves(
                         t,
                         modulation_period_s=1.0 / _PDI_HWP_ROTATION_RATE_HZ,
                         n_dark_ports=n_dark,
+                        rate_scale=rate_scale,
                     )
                 )
                 stepped.append(
-                    _pdi_snr(row, t, modulation_period_s=60.0, n_dark_ports=n_dark)
+                    _pdi_snr(
+                        row,
+                        t,
+                        modulation_period_s=60.0,
+                        n_dark_ports=n_dark,
+                        rate_scale=rate_scale,
+                    )
                 )
             t_hr = times_s / 3600.0
             ax.plot(t_hr, scalar, "o-", color="0.35", label="scalar detection")
@@ -1381,6 +1390,7 @@ def _write_hwp_rate_sweep(
     rates_hz = np.logspace(0.0, 4.0, 41)
     tint = _integration_time_s(collection)
     n_dark = _n_dark_ports_per_arm(collection)
+    rate_scale = _scalar_to_dual_pol_rate_scale(collection)
     with publication_style():
         fig, ax = plt.subplots(figsize=(7.5, 4.6))
         if not targets:
@@ -1399,6 +1409,7 @@ def _write_hwp_rate_sweep(
                     tint,
                     modulation_period_s=1.0 / float(rate),
                     n_dark_ports=n_dark,
+                    rate_scale=rate_scale,
                 )
                 for rate in rates_hz
             ]
@@ -1411,6 +1422,7 @@ def _write_hwp_rate_sweep(
                     tint,
                     modulation_period_s=60.0,
                     n_dark_ports=n_dark,
+                    rate_scale=rate_scale,
                 ),
                 linestyle="--",
                 alpha=0.6,
@@ -1673,6 +1685,9 @@ def _survey_rows(collection: RunCollection) -> list[dict[str, Any]]:
         _find_component(cell, "characterization.detection_curve") is not None
         for cell in collection.records
     )
+    sweep_jmags = [
+        jmag for cell in collection.records if (jmag := _record_jmag(cell)) is not None
+    ]
     for planet in planets:
         raw = by_name.get(planet.name)
         record = _record_for_jmag(collection, _float_value(raw, "sy_jmag"))
@@ -1725,13 +1740,13 @@ def _survey_rows(collection: RunCollection) -> list[dict[str, Any]]:
         char_curve = _find_component(record, "characterization.detection_curve")
         char_record = record
         char_rate_scale = jmag_flux_scale
+        char_floor_scaled_from_jmag = float("nan")
         if char_curve is None and curve_expected:
             # The nearest J-mag cell skipped its characterization curve
-            # (skip_jmags); fall back to the nearest curve-bearing cell and
-            # rescale the stellar rate to the planet's host magnitude. The
-            # curve's throughput and leak fractions are chip properties, so
-            # the first-order 10^(-0.4 dJ) flux scaling already used for the
-            # rate columns applies unchanged.
+            # (skip_jmags); borrow the nearest curve-bearing cell's chip
+            # (throughput, static leak) and rescale the stellar rate to the
+            # host magnitude. The realized floor, eps, and systematic
+            # bandwidth depend on J, so they come from the host's own cell.
             curve_records = [
                 r
                 for r in collection.records
@@ -1750,11 +1765,17 @@ def _survey_rows(collection: RunCollection) -> list[dict[str, Any]]:
                         - target_jmag
                     ),
                 )
-                char_curve = _find_component(
-                    char_record, "characterization.detection_curve"
+                char_curve = _char_curve_rescaled_to_cell(
+                    _find_component(char_record, "characterization.detection_curve"),
+                    donor_sensitivity=_find_component(
+                        char_record, "sensitivity.detection_curve"
+                    ),
+                    cell_sensitivity=sensitivity,
                 )
                 char = _find_component(char_record, "characterization.spectro")
                 char_record_jmag = _record_jmag(char_record)
+                if char_record_jmag is not None:
+                    char_floor_scaled_from_jmag = char_record_jmag
                 char_rate_scale = (
                     10.0 ** (-0.4 * (target_jmag - char_record_jmag))
                     if char_record_jmag is not None
@@ -1805,6 +1826,19 @@ def _survey_rows(collection: RunCollection) -> list[dict[str, Any]]:
             ),
             "ft_servo_bandwidth_hz": _frame_rate_hz(record),
             "sky_rate_per_dark_port": _sky_rate_per_dark_port(record),
+            "dark_rate_per_dark_port": _first_float(
+                _find_component(record, "performance.standard"),
+                "dark_rate_hz_per_port",
+                default=0.0,
+            ),
+            # Hosts beyond the simulated J range take the edge cell's floor,
+            # eps, and bandwidth without extrapolation.
+            "host_jmag_outside_sweep": int(
+                target_jmag is not None
+                and bool(sweep_jmags)
+                and not min(sweep_jmags) <= target_jmag <= max(sweep_jmags)
+            ),
+            "char_floor_scaled_from_jmag": float(char_floor_scaled_from_jmag),
             "char_spectro_throughput": _first_float(
                 char, "spectro_throughput", default=0.0
             ),
@@ -1875,6 +1909,9 @@ def _exoplanet_table_columns() -> list[str]:
         "null_instability",
         "ft_servo_bandwidth_hz",
         "sky_rate_per_dark_port",
+        "dark_rate_per_dark_port",
+        "host_jmag_outside_sweep",
+        "char_floor_scaled_from_jmag",
         "char_spectro_throughput",
         "char_spectro_null_depth",
         "char_spectro_design_null_depth",
@@ -1904,6 +1941,8 @@ def _pdi_table_columns() -> list[str]:
         "pol_fraction_orbit_avg",
         "leakage_rate_dark",
         "planet_signal_rate_dark",
+        "sky_rate_per_dark_port",
+        "dark_rate_per_dark_port",
         "char_planet_signal_rate_pdi",
         "char_leakage_rate_pdi",
         "snr_det_4h",
@@ -2008,6 +2047,25 @@ def _format_char_max_r(value: float) -> str:
 def _latex_characterization_table(
     top_by_category: Mapping[str, list[dict[str, Any]]],
 ) -> str:
+    rows = [
+        row
+        for category in sorted(top_by_category)
+        for row in top_by_category[category]
+    ]
+    notes = ""
+    if any(_float_value(row, "char_floor_scaled_from_jmag") is not None for row in rows):
+        notes += (
+            r" Hosts whose nearest simulated $J$ cell has no characterization "
+            r"curve use the chip throughput and static leak of the nearest "
+            r"cell that has one, with its realized leakage floor scaled by "
+            r"the ratio of the two cells' realized null excess, and with the "
+            r"systematic $\epsilon$ and bandwidth of the host's own cell."
+        )
+    if any(row.get("host_jmag_outside_sweep") for row in rows):
+        notes += (
+            r" Hosts outside the simulated $J$ range use the nearest cell "
+            r"without extrapolation."
+        )
     lines = [
         r"\begin{table*}",
         r"\centering",
@@ -2017,18 +2075,13 @@ def _latex_characterization_table(
         r"the integrated one spectro port characterization SNR in a 4\,h "
         r"integration; $R_{\rm SNR \geq 3}$ is the largest spectral "
         r"resolving power at which each Nyquist sampled bin retains "
-        r"SNR $\geq 3$, capped at the $R = 10^4$ AWG design limit.}",
+        r"SNR $\geq 3$, capped at the $R = 10^4$ AWG design limit." + notes + "}",
         r"\label{tab:characterization_survey}",
         r"\begin{tabular}{llrrrrr}",
         r"\hline",
         r"Planet & Class & $J$ & Sep. (mas) & Contrast & "
         r"SNR$_{\rm char}$ & $R_{\rm SNR \geq 3}$ \\",
         r"\hline",
-    ]
-    rows = [
-        row
-        for category in sorted(top_by_category)
-        for row in top_by_category[category]
     ]
     for row in rows:
         lines.append(
@@ -2079,28 +2132,30 @@ def _pdi_row(row: dict[str, Any], collection: RunCollection) -> dict[str, Any] |
         return None
     pol = _orbit_averaged_polarization_fraction(radius)
     tint = _integration_time_s(collection)
-    planet = (
-        float(row.get("planet_signal_rate_dark") or 0.0)
-        * _DUAL_POL_THROUGHPUT_VS_SCALAR
-    )
-    leakage = (
-        float(row.get("leakage_rate_dark") or 0.0) * _DUAL_POL_THROUGHPUT_VS_SCALAR
-    )
+    scale = _scalar_to_dual_pol_rate_scale(collection)
+    planet_raw = float(row.get("planet_signal_rate_dark") or 0.0)
+    leakage_raw = float(row.get("leakage_rate_dark") or 0.0)
     # ``is None`` checks: a legitimate characterization rate of 0.0 must
     # not silently fall back to the detection-mode rate (review 2026-06-10
-    # nit).
+    # nit). The fallback takes the unscaled rate so the factor applies once.
     char_planet_raw = row.get("char_planet_signal_rate")
-    char_planet = (
-        float(planet if char_planet_raw is None else char_planet_raw)
-        * _DUAL_POL_THROUGHPUT_VS_SCALAR
-    )
     char_leakage_raw = row.get("char_leakage_rate")
-    char_leakage = (
-        float(leakage if char_leakage_raw is None else char_leakage_raw)
-        * _DUAL_POL_THROUGHPUT_VS_SCALAR
+    planet = planet_raw * scale
+    leakage = leakage_raw * scale
+    char_planet = scale * float(
+        planet_raw if char_planet_raw is None else char_planet_raw
     )
+    char_leakage = scale * float(
+        leakage_raw if char_leakage_raw is None else char_leakage_raw
+    )
+    sky = float(row.get("sky_rate_per_dark_port") or 0.0)
+    dark = float(row.get("dark_rate_per_dark_port") or 0.0)
     n_dark = _n_dark_ports_per_arm(collection)
-    snr_pdi = _signal_to_noise_pdi_rates(planet, leakage, tint, pol, n_dark)
+    snr_pdi = _signal_to_noise_pdi_rates(
+        planet, leakage, tint, pol, n_dark, sky_rate_hz=sky, dark_rate_hz=dark
+    )
+    # The characterization rates are spectro port rates; the survey row
+    # carries no spectro port background, so none is charged here.
     snr_char = _signal_to_noise_pdi_rates(char_planet, char_leakage, tint, pol, n_dark)
     det = float(row.get("snr_det_4h") or 0.0)
     return {
@@ -2115,8 +2170,10 @@ def _pdi_row(row: dict[str, Any], collection: RunCollection) -> dict[str, Any] |
         "sma_au": row.get("sma_au"),
         "ang_sep_mas": row.get("ang_sep_mas"),
         "pol_fraction_orbit_avg": float(pol),
-        "leakage_rate_dark": float(row.get("leakage_rate_dark") or 0.0),
-        "planet_signal_rate_dark": float(row.get("planet_signal_rate_dark") or 0.0),
+        "leakage_rate_dark": leakage_raw,
+        "planet_signal_rate_dark": planet_raw,
+        "sky_rate_per_dark_port": sky,
+        "dark_rate_per_dark_port": dark,
         "char_planet_signal_rate_pdi": float(char_planet),
         "char_leakage_rate_pdi": float(char_leakage),
         "snr_det_4h": float(det),
@@ -2144,12 +2201,30 @@ def _pdi_displayed_snr(row: Mapping[str, Any]) -> float:
     return value if np.isfinite(value) else float("-inf")
 
 
+def _scalar_to_dual_pol_rate_scale(collection: RunCollection) -> float:
+    """Factor converting the survey's detector rates to dual polarization.
+
+    ``_DUAL_POL_THROUGHPUT_VS_SCALAR`` stands in for the HWP, PBS, and PM
+    fiber losses of a scalar pipeline. A pipeline with polarization stages
+    already carries those losses in its detector rates, so the factor is 1.
+    """
+
+    has_polarization_stages = any(
+        stage.type.startswith("polarization.")
+        for stage in collection.config.pipeline.stages
+    )
+    return 1.0 if has_polarization_stages else _DUAL_POL_THROUGHPUT_VS_SCALAR
+
+
 def _signal_to_noise_pdi_rates(
     planet_rate_hz: float,
     leakage_rate_hz: float,
     integration_time_s: float,
     pol_fraction: float,
     n_dark_ports: int,
+    *,
+    sky_rate_hz: float = 0.0,
+    dark_rate_hz: float = 0.0,
 ) -> float:
     from nullsim.physics.pdi import signal_to_noise_pdi
 
@@ -2167,6 +2242,8 @@ def _signal_to_noise_pdi_rates(
             modulation_period_s=1.0 / _PDI_HWP_ROTATION_RATE_HZ,
             cmrr_db=30.0,
             recover_both_qu=True,
+            dark_rate_hz_per_port_per_arm=dark_rate_hz,
+            sky_rate_hz_per_dark_port_per_arm=sky_rate_hz,
         )
     )
 
@@ -2177,16 +2254,19 @@ def _pdi_snr(
     *,
     modulation_period_s: float,
     n_dark_ports: int,
+    rate_scale: float,
     ideal: bool = False,
 ) -> float:
     from nullsim.physics.pdi import signal_to_noise_pdi
 
     return float(
         signal_to_noise_pdi(
-            planet_rate_total_hz=float(row["planet_signal_rate_dark"])
-            * _DUAL_POL_THROUGHPUT_VS_SCALAR,
-            stellar_leakage_rate_total_hz=float(row["leakage_rate_dark"])
-            * _DUAL_POL_THROUGHPUT_VS_SCALAR,
+            planet_rate_total_hz=float(row["planet_signal_rate_dark"]) * rate_scale,
+            stellar_leakage_rate_total_hz=float(row["leakage_rate_dark"]) * rate_scale,
+            dark_rate_hz_per_port_per_arm=float(row.get("dark_rate_per_dark_port") or 0.0),
+            sky_rate_hz_per_dark_port_per_arm=float(
+                row.get("sky_rate_per_dark_port") or 0.0
+            ),
             integration_time_s=integration_time_s,
             pol_fraction=float(row["pol_fraction_orbit_avg"]),
             n_dark_ports_per_arm=n_dark_ports,
@@ -2298,18 +2378,36 @@ def _contrast_limit_at(record: RunRecord | None, separation_mas: float) -> float
     mask = np.isfinite(sep) & np.isfinite(contrast) & (sep > 0) & (contrast > 0)
     if not mask.any():
         return None
-    order = np.argsort(sep[mask])
-    # left/right=nan so out-of-grid separations surface as missing rather than
-    # silently clamping to the nearest endpoint (optimistic at the inner edge).
-    return float(
-        np.interp(
-            float(separation_mas),
-            sep[mask][order],
-            contrast[mask][order],
-            left=np.nan,
-            right=np.nan,
-        )
-    )
+    return _interp_gapped(sep, contrast, mask, separation_mas)
+
+
+def _interp_gapped(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    valid: np.ndarray,
+    x: float,
+) -> float:
+    """Linear interpolation that treats invalid samples as gaps.
+
+    Returns NaN outside the sampled range and between two samples when either
+    is invalid, so a failed anchor or an infinite contrast is never bridged
+    and a lone valid sample counts only at its own abscissa.
+    """
+
+    keep = np.isfinite(xs)
+    order = np.argsort(xs[keep])
+    xs, ys, valid = xs[keep][order], ys[keep][order], valid[keep][order]
+    x = float(x)
+    if xs.size == 0 or not xs[0] <= x <= xs[-1]:
+        return float("nan")
+    hit = xs == x
+    if hit.any():
+        index = np.flatnonzero(hit & valid)
+        return float(ys[index[0]]) if index.size else float("nan")
+    upper = int(np.searchsorted(xs, x))
+    if not (valid[upper - 1] and valid[upper]):
+        return float("nan")
+    return float(np.interp(x, xs[upper - 1 : upper + 1], ys[upper - 1 : upper + 1]))
 
 
 def _interp_payload(
@@ -2326,11 +2424,7 @@ def _interp_payload(
     ys = np.asarray(payload[y_key], dtype=np.float64)
     if xs.ndim != 1 or ys.ndim != 1 or xs.size != ys.size or xs.size == 0:
         return float(default)
-    mask = np.isfinite(xs) & np.isfinite(ys)
-    if not mask.any():
-        return float(default)
-    order = np.argsort(xs[mask])
-    return float(np.interp(float(x), xs[mask][order], ys[mask][order]))
+    return _interp_gapped(xs, ys, np.isfinite(ys), x)
 
 
 def _bright_rate_hz(record: RunRecord | None) -> float:
@@ -2648,6 +2742,63 @@ def _characterization_curve_estimate_for_planet(
     )
 
 
+def _char_curve_rescaled_to_cell(
+    donor_curve: Mapping[str, Any],
+    *,
+    donor_sensitivity: Mapping[str, Any] | None,
+    cell_sensitivity: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Carry a characterization curve from a donor J cell to the host's cell.
+
+    The retuned chip's throughput and static leak transfer between cells. The
+    realized (piston and scintillation) floor, eps, and the systematic
+    bandwidth do not: all three follow the fringe tracker's photon budget.
+
+    - floor: scaled by the ratio of the two cells' realized-null excess over
+      the ideal chip null, ``realized_null_depth - ideal_chip_null_depth``.
+    - eps: the stage forms ``hypot(null_instability / nsc_reduction, speckle)``
+      (``_combined_systematic_eps``), so swapping the donor's sensitivity null
+      instability for the cell's keeps the donor's speckle term.
+    - bandwidth: the cell's ``effective_systematic_bandwidth_hz``, as the
+      stage reads it.
+    """
+
+    curve = dict(donor_curve)
+    if donor_sensitivity is None or cell_sensitivity is None:
+        return curve
+
+    def excess(sensitivity: Mapping[str, Any]) -> float:
+        return _first_float(sensitivity, "realized_null_depth") - _first_float(
+            sensitivity, "ideal_chip_null_depth"
+        )
+
+    donor_excess = excess(donor_sensitivity)
+    ratio = excess(cell_sensitivity) / donor_excess if donor_excess > 0.0 else 1.0
+    if np.isfinite(ratio):
+        floor = _payload_vector(curve, "realized_spectro_floor_per_anchor")
+        static = _payload_vector(curve, "spectro_static_leak_fraction_per_anchor")
+        if floor is not None and static is not None:
+            curve["realized_spectro_floor_per_anchor"] = floor * ratio
+            curve["spectro_leak_fraction_per_anchor"] = static + floor * ratio
+        if curve.get("realized_spectro_floor") is not None:
+            curve["realized_spectro_floor"] = float(curve["realized_spectro_floor"]) * ratio
+
+    nsc = _first_float(curve, "nsc_systematic_reduction", default=1.0)
+    eps_donor = _first_float(curve, "eps_systematic", default=float("nan"))
+    ni_donor = _first_float(donor_sensitivity, "null_instability", default=0.0)
+    ni_cell = _first_float(cell_sensitivity, "null_instability", default=float("nan"))
+    if np.isfinite(eps_donor) and np.isfinite(ni_cell) and nsc > 0.0:
+        curve["eps_systematic"] = float(
+            np.sqrt(max(eps_donor**2 + (ni_cell**2 - ni_donor**2) / nsc**2, 0.0))
+        )
+    bandwidth = _first_float(
+        cell_sensitivity, "effective_systematic_bandwidth_hz", default=float("nan")
+    )
+    if np.isfinite(bandwidth) and bandwidth > 0.0:
+        curve["servo_bw_hz"] = bandwidth
+    return curve
+
+
 def _characterization_curve_throughput_and_leak(
     payload: Mapping[str, Any],
     separation_mas: float,
@@ -2671,21 +2822,8 @@ def _characterization_curve_throughput_and_leak(
     if not np.any(mask):
         return float("nan"), float("nan"), False
 
-    order = np.argsort(seps[mask])
-    valid_seps = seps[mask][order]
-    valid_throughput = throughput[mask][order]
-    valid_leak = leak[mask][order]
-    if valid_seps.size == 1:
-        return float(valid_throughput[0]), float(valid_leak[0]), True
-    target = float(separation_mas)
-    # left/right=nan so planets outside the anchor separation range surface as
-    # missing rather than silently clamping to the nearest anchor.
-    throughput_at = float(
-        np.interp(target, valid_seps, valid_throughput, left=np.nan, right=np.nan)
-    )
-    leak_at = float(
-        np.interp(target, valid_seps, valid_leak, left=np.nan, right=np.nan)
-    )
+    throughput_at = _interp_gapped(seps, throughput, mask, separation_mas)
+    leak_at = _interp_gapped(seps, leak, mask, separation_mas)
     if not (np.isfinite(throughput_at) and np.isfinite(leak_at)):
         return float("nan"), float("nan"), False
     return throughput_at, leak_at, True

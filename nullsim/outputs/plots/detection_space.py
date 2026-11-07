@@ -5,10 +5,12 @@ config × J-mag × integration-time) cell on top of the known-exoplanet
 population. Both detection-mode and characterization-mode 5σ curves
 are drawn — detection-mode as solid lines, characterization-mode as
 dashed lines of the matched colour, and ``performance.hdc`` CCF curves
-as dash-dot lines in their own colour. The exoplanet scatter is computed
-from a bundled NASA Exoplanet Archive snapshot under KILO paperv3's
-Lambertian reflected-light assumptions and filtered by observability
-from the telescope site (default: Mauna Kea, ``alt ≥ 45°``).
+as dash-dot lines in their own colour. The exoplanet scatter comes from
+the declared ``[catalog.exoplanets]`` snapshot through the versioned
+catalog parser, or else from a bundled NASA Exoplanet Archive snapshot
+under KILO paperv3's Lambertian reflected-light assumptions, and is
+filtered by observability from the resolved telescope site (default:
+Mauna Kea, ``alt ≥ 45°``).
 """
 
 from __future__ import annotations
@@ -31,6 +33,8 @@ import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
 
+from nullsim.catalogs.exoplanets import ExoplanetCatalogConfig, load_catalog
+from nullsim.config.catalog import parse_catalog_block
 from nullsim.outputs import RunCollection, RunRecord
 from nullsim.outputs.plots._kilo_planet_overlay import (
     GEOMETRIC_ALBEDO_DEFAULT,
@@ -41,6 +45,7 @@ from nullsim.outputs.plots._kilo_planet_overlay import (
     TYPE_COLORS,
     TYPE_DISPLAY_LABELS,
     load_planets,
+    planets_from_catalog,
     trappist1_centroid,
 )
 from nullsim.outputs.styles import publication_style
@@ -107,13 +112,9 @@ def detection_space(
     plot_dir = output_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    catalog_snapshot_path, catalog_is_user_configured = _catalog_snapshot_path(runs)
     observability = _observability_config(runs)
-    planets = _load_planet_overlay(
-        catalog_snapshot_path,
-        required=catalog_is_user_configured,
-        observability=observability,
-    )
+    logging.info("detection_space: planet overlay %s.", observability.caption)
+    planets = _load_planet_overlay(_catalog_config(runs), observability=observability)
     stellar_diameter_mas = _stellar_diameter_mas(runs)
 
     with publication_style():
@@ -446,12 +447,13 @@ def _ideal_coronagraph_curve_inputs(runs: RunCollection) -> dict[str, Any] | Non
         float(stellar_diameter_mas) / 2.0 if stellar_diameter_mas else 0.0
     )
 
-    zodi_payload = _newest_component(state, "background.space_zodi")
-    background_rate_hz = 0.0
-    if zodi_payload is not None:
-        per_port = float(zodi_payload.get("zodi_rate_hz_per_dark_port", 0.0))
-        n_ports = int(zodi_payload.get("n_physical_dark_ports", 0))
-        background_rate_hz = per_port * max(n_ports, 0)
+    background_rate_hz = _ideal_coronagraph_background_rate_hz(
+        _newest_component(state, "background.space_zodi"),
+        wavelength_m=float(record.config.grid.wavelength_center_um) * 1.0e-6,
+        diameter_m=float(diameter_m),
+        primary_area_m2=primary_area_m2,
+        optics_fraction=float(np.mean(mirror_fraction)) * detector_qe,
+    )
 
     integration_time_s = _contrast_reference_time_s(record)
     if integration_time_s is None:
@@ -479,6 +481,52 @@ def _ideal_coronagraph_curve_inputs(runs: RunCollection) -> dict[str, Any] | Non
         "integration_time_s": float(integration_time_s),
         "snr_target": snr_target,
     }
+
+
+_ARCSEC_PER_RAD = 180.0 / math.pi * 3600.0
+
+
+def _ideal_coronagraph_background_rate_hz(
+    zodi_payload: dict[str, Any] | None,
+    *,
+    wavelength_m: float,
+    diameter_m: float,
+    primary_area_m2: float,
+    optics_fraction: float,
+) -> float:
+    """Zodi through a perfect coronagraph on the full primary.
+
+    Local zodi plus exozodi surface brightness at the scene separation
+    (photons/s/m^2/arcsec^2 at the telescope entrance) over one
+    ``(lambda/D)^2`` resolution element of the primary, times the mirror
+    train and detector QE. That is the background the Guyon et al. (2006)
+    ideal instrument sees in its planet aperture; the nuller's routed
+    per-port zodi is not.
+    """
+
+    if zodi_payload is None:
+        return 0.0
+    local = zodi_payload.get("local_zodi_rate_hz_per_m2_per_arcsec2")
+    exozodi = zodi_payload.get(
+        "exozodi_rate_hz_per_m2_per_arcsec2_at_scene_separation"
+    )
+    if local is None or exozodi is None:
+        warnings.warn(
+            "detection_space: background.space_zodi publishes no zodi surface "
+            "brightness; the ideal-coronagraph background falls back to the "
+            "nuller's routed dark-port zodi.",
+            stacklevel=2,
+        )
+        per_port = float(zodi_payload.get("zodi_rate_hz_per_dark_port", 0.0))
+        n_ports = int(zodi_payload.get("n_physical_dark_ports", 0))
+        return per_port * max(n_ports, 0)
+    resolution_element_arcsec2 = (wavelength_m / diameter_m * _ARCSEC_PER_RAD) ** 2
+    return (
+        (float(local) + float(exozodi))
+        * primary_area_m2
+        * resolution_element_arcsec2
+        * optics_fraction
+    )
 
 
 def _attr_or_key(container: Any, name: str) -> Any:
@@ -534,13 +582,9 @@ def _plot_characterization_curves(axes: plt.Axes, runs: RunCollection) -> None:
     """Overlay char-mode 5σ contrast curves as dashed lines matched in colour."""
 
     seen: set[str] = set()
-    for record in _paper_curve_records(runs):
-        payload = _characterization_curve(record)
-        if payload is None:
-            continue
+    for record, color, key, payload in _characterization_curve_entries(runs):
         separations_mas = np.asarray(payload["separations_mas"], dtype=np.float64)
         contrasts = np.asarray(payload["contrast_5sigma"], dtype=np.float64)
-        key = _curve_legend_label(record, mode="char")
         if key in seen:
             continue
         seen.add(key)
@@ -586,7 +630,7 @@ def _plot_characterization_curves(axes: plt.Axes, runs: RunCollection) -> None:
                 axes.plot(
                     separations_segment,
                     contrast_segment,
-                    color=_CHARACTERIZATION_COLOR,
+                    color=color,
                     **style,
                     zorder=5,
                 )
@@ -595,7 +639,7 @@ def _plot_characterization_curves(axes: plt.Axes, runs: RunCollection) -> None:
                         separations_segment,
                         contrast_segment,
                         np.full_like(contrast_segment, fill_value=1.0),
-                        color=_CHARACTERIZATION_COLOR,
+                        color=color,
                         alpha=0.10,
                         linewidth=0,
                         zorder=2,
@@ -604,7 +648,7 @@ def _plot_characterization_curves(axes: plt.Axes, runs: RunCollection) -> None:
                 axes.scatter(
                     separations_segment,
                     contrast_segment,
-                    color=_CHARACTERIZATION_COLOR,
+                    color=color,
                     s=18.0,
                     zorder=5,
                 )
@@ -645,14 +689,38 @@ def _valid_curve_segments(
     return tuple(segments)
 
 
-def _characterization_curve(record: RunRecord) -> dict | None:
-    for name, payload in record.result.state.results.components.items():
-        if name.startswith("characterization.detection_curve") and isinstance(
-            payload,
-            dict,
-        ):
-            return payload
-    return None
+_CHARACTERIZATION_PREFIX = "characterization.detection_curve"
+_EXTRA_CHARACTERIZATION_COLORS = ("#8E44AD", "#D35400", "#16A085", "#7F8C8D")
+
+
+def _characterization_curve_entries(
+    runs: RunCollection,
+) -> tuple[tuple[RunRecord, str, str, dict], ...]:
+    """Every characterization curve of the headline records, each labeled.
+
+    Yields ``(record, color, legend_label, payload)``. A record with one
+    curve keeps the house green and the plain label; with several, each
+    component gets its own color and its component name in the label, so no
+    curve is dropped or chosen by insertion order.
+    """
+
+    entries = []
+    for record in _paper_curve_records(runs):
+        curves = [
+            (name, payload)
+            for name, payload in record.result.state.results.components.items()
+            if name.startswith(_CHARACTERIZATION_PREFIX) and isinstance(payload, dict)
+        ]
+        label = _curve_legend_label(record, mode="char")
+        for index, (name, payload) in enumerate(curves):
+            if len(curves) == 1:
+                entries.append((record, _CHARACTERIZATION_COLOR, label, payload))
+                continue
+            colors = (_CHARACTERIZATION_COLOR, *_EXTRA_CHARACTERIZATION_COLORS)
+            entries.append(
+                (record, colors[index % len(colors)], f"{label} [{name}]", payload)
+            )
+    return tuple(entries)
 
 
 # ----------------------------------------------------------------------
@@ -974,71 +1042,67 @@ def _plot_known_exoplanets(axes: plt.Axes, planets: Sequence[PlotPlanet]) -> Non
         )
 
 
-def _catalog_snapshot_path(runs: RunCollection) -> tuple[Path, bool]:
-    """Return the user-configured exoplanet catalog snapshot path.
+def _catalog_config(runs: RunCollection) -> ExoplanetCatalogConfig | None:
+    """The validated ``[catalog.exoplanets]`` block, or None without one.
 
-    Reads ``[catalog.exoplanets].snapshot_path`` from the first record's
-    raw_config when present and resolves it against the source config
-    directory. Earlier the plot always loaded the bundled CSV regardless
-    of ``[catalog.exoplanets]`` — meaning the run_hash included the
-    user-supplied catalog hash (via cli._run_hash_with_externals) but
-    the plotted overlay was always the bundled snapshot. Lying provenance.
+    Reads the block from the first record's raw_config and resolves a
+    relative ``snapshot_path`` against the source config directory, as the
+    loader does when it folds the catalog into ``run_hash``.
     """
 
     try:
         record = runs.records[0]
     except (IndexError, AttributeError):
-        return _BUNDLED_PLANET_CATALOG, False
+        return None
     raw = getattr(record.config, "raw_config", None) or {}
     catalog_block = (
         raw.get("catalog", {}).get("exoplanets") if isinstance(raw, dict) else None
     )
     if not isinstance(catalog_block, dict):
-        return _BUNDLED_PLANET_CATALOG, False
-    snapshot = catalog_block.get("snapshot_path")
-    if not snapshot:
-        return _BUNDLED_PLANET_CATALOG, False
-    snapshot_path = Path(str(snapshot))
-    if not snapshot_path.is_absolute():
-        source_path = getattr(record.config, "source_path", None)
-        config_dir = source_path.parent if source_path is not None else None
-        if config_dir is not None:
-            snapshot_path = (config_dir / snapshot_path).resolve()
-    if not snapshot_path.is_file():
-        raise FileNotFoundError(
-            "detection_space: configured catalog snapshot does not exist: "
-            f"{snapshot_path}"
-        )
-    return snapshot_path, True
+        return None
+    source_path = getattr(record.config, "source_path", None)
+    return parse_catalog_block(
+        catalog_block,
+        config_dir=source_path.parent if source_path is not None else None,
+    )
 
 
 def _load_planet_overlay(
-    snapshot_path: Path = _BUNDLED_PLANET_CATALOG,
+    catalog: ExoplanetCatalogConfig | None = None,
     *,
-    required: bool = False,
     observability: _ObservabilityConfig | None = None,
 ) -> tuple[PlotPlanet, ...]:
-    if not snapshot_path.exists():
-        if required:
-            raise FileNotFoundError(
-                f"detection_space: catalog snapshot does not exist: {snapshot_path}"
-            )
-        return ()
+    """Overlay planets from the declared catalog, else the bundled KILO set.
+
+    A declared ``[catalog.exoplanets]`` snapshot goes through the versioned
+    ``load_catalog`` parser (rule version, separation and contrast columns,
+    aliases) and must load. Without one, the bundled paperv3 snapshot keeps
+    KILO's radius bins and contrast model.
+    """
+
     obs = observability or _ObservabilityConfig(
         latitude_deg=LAT_KECK_DEG,
         min_altitude_deg=45.0,
         caption=r"observable above $45^\circ$ altitude from Mauna Kea",
     )
+    if catalog is not None:
+        return planets_from_catalog(
+            load_catalog(catalog),
+            rule_version=catalog.classification_rule_version,
+            latitude_deg=obs.latitude_deg,
+            min_altitude_deg=obs.min_altitude_deg,
+            geometric_albedo=GEOMETRIC_ALBEDO_DEFAULT,
+        )
+    if not _BUNDLED_PLANET_CATALOG.exists():
+        return ()
     try:
         return load_planets(
-            snapshot_path,
+            _BUNDLED_PLANET_CATALOG,
             latitude_deg=obs.latitude_deg,
             min_altitude_deg=obs.min_altitude_deg,
             geometric_albedo=GEOMETRIC_ALBEDO_DEFAULT,
         )
     except Exception as exc:  # pragma: no cover - defensive against bad CSVs
-        if required:
-            raise
         warnings.warn(
             f"detection_space: planet overlay disabled ({exc})",
             stacklevel=2,
@@ -1049,7 +1113,10 @@ def _load_planet_overlay(
 def _observability_config(runs: RunCollection) -> _ObservabilityConfig:
     """Resolve the known-planet observability cut from ``[site]``.
 
-    Ground-based configs default to the KILO paperv3 Mauna Kea
+    Latitude and site name come from the resolved (preset-merged) site, so
+    a ``cerro_armazones_site`` config cuts at Armazones. Explicit
+    ``[site.observability]`` ``latitude_deg``/``site_label`` override them,
+    and a site with no latitude falls back to the KILO paperv3 Mauna Kea
     ``alt >= 45 deg`` cut. Space configs can opt out with:
 
         [site.observability]
@@ -1057,7 +1124,7 @@ def _observability_config(runs: RunCollection) -> _ObservabilityConfig:
     """
 
     site = _site_mapping(runs)
-    observability = site.get("observability") if isinstance(site, dict) else None
+    observability = site.get("observability")
     if not isinstance(observability, dict):
         observability = {}
     if bool(observability.get("all_sky", False)):
@@ -1067,15 +1134,17 @@ def _observability_config(runs: RunCollection) -> _ObservabilityConfig:
             caption="all-sky space observability",
         )
 
+    site_latitude = site.get("latitude_deg")
     latitude_deg = _float_or_default(
-        observability.get("latitude_deg"),
+        observability.get("latitude_deg", site_latitude),
         LAT_KECK_DEG,
     )
     min_altitude_deg = _float_or_default(
         observability.get("min_altitude_deg"),
         45.0,
     )
-    site_label = str(observability.get("site_label") or "Mauna Kea")
+    default_label = site.get("name") if site_latitude is not None else None
+    site_label = str(observability.get("site_label") or default_label or "Mauna Kea")
     caption = (
         rf"observable above ${min_altitude_deg:g}^\circ$ altitude "
         f"from {site_label}"
@@ -1088,20 +1157,19 @@ def _observability_config(runs: RunCollection) -> _ObservabilityConfig:
 
 
 def _site_mapping(runs: RunCollection) -> dict[str, Any]:
+    """The first record's resolved ``[site]``: preset fields plus overrides.
+
+    The raw TOML table holds only the preset name in the shipped configs, so
+    it cannot supply the latitude.
+    """
+
     try:
         record = runs.records[0]
     except (IndexError, AttributeError):
         return {}
-    raw = getattr(record.config, "raw_config", None)
-    if isinstance(raw, dict):
-        site = raw.get("site")
-        if isinstance(site, dict):
-            return site
     site_obj = getattr(record.config, "site", None)
     if hasattr(site_obj, "model_dump"):
-        dumped = site_obj.model_dump(mode="python")
-        if isinstance(dumped, dict):
-            return dumped
+        return site_obj.model_dump(mode="python")
     return {}
 
 
@@ -1162,23 +1230,12 @@ def _attach_legends(
         labels.append(_curve_legend_label(record, mode="det"))
 
     seen_char: set[str] = set()
-    for record in _paper_curve_records(runs):
-        payload = _characterization_curve(record)
-        if payload is None:
-            continue
-        key = _curve_legend_label(record, mode="char")
+    for record, color, key, _payload in _characterization_curve_entries(runs):
         if key in seen_char:
             continue
         seen_char.add(key)
-        handles.append(
-            Line2D(
-                [],
-                [],
-                color=_CHARACTERIZATION_COLOR,
-                **_line_style_for_record(record),
-            )
-        )
-        labels.append(_curve_legend_label(record, mode="char"))
+        handles.append(Line2D([], [], color=color, **_line_style_for_record(record)))
+        labels.append(key)
 
     # Read the HDC entries back off the drawn artists: payload presence alone
     # must not put a curve in the legend that never made it onto the axes.

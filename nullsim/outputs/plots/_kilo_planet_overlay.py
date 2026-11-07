@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 from scipy import integrate
 
+from nullsim.catalogs.exoplanets import Exoplanet, classify_planet
 from nullsim.physics.reflected_light import (
     lambertian_phase,
     reflected_light_contrast,
@@ -244,6 +245,82 @@ def load_planets(
                 ),
                 radius_rearth=float(radius),
                 radius_is_estimated=bool(radius_is_est),
+            )
+        )
+    return tuple(out)
+
+
+_CATALOG_METHOD_TO_OVERLAY = {"RV": "Radial Velocity"}
+
+
+def planets_from_catalog(
+    catalog: Iterable[Exoplanet],
+    *,
+    rule_version: str,
+    latitude_deg: float = LAT_KECK_DEG,
+    min_altitude_deg: float | None = 45.0,
+    geometric_albedo: float = GEOMETRIC_ALBEDO_DEFAULT,
+    max_distance_pc: float | None = 50.0,
+) -> tuple[PlotPlanet, ...]:
+    """Plot-ready planets from a versioned ``load_catalog`` snapshot.
+
+    Separation, contrast, and class come from the catalog when it supplies
+    them (``separation_mas``, ``contrast_estimate``, and the declared
+    classification rule). Missing radii fall back to Chen & Kipping (2017)
+    from the mass, and the contrast to the same orbit-averaged Lambertian
+    reflected light as ``load_planets`` (needs a semi-major axis). Planets
+    without a declination are dropped when the altitude cut is active, and
+    the 50 pc cut applies where a distance is given.
+    """
+
+    phi_orbit = lambertian_orbit_averaged_phase()
+    out: list[PlotPlanet] = []
+    for planet in catalog:
+        if (
+            max_distance_pc is not None
+            and planet.distance_pc is not None
+            and planet.distance_pc > max_distance_pc
+        ):
+            continue
+        if min_altitude_deg is not None and (
+            planet.dec_deg is None
+            or max_altitude_deg(planet.dec_deg, latitude_deg) < min_altitude_deg
+        ):
+            continue
+        if planet.separation_mas is None:
+            continue
+
+        radius = planet.radius_earth
+        radius_is_estimated = False
+        if radius is None and planet.mass_earth:
+            radius = chen_kipping_2017_radius(planet.mass_earth)
+            radius_is_estimated = True
+
+        contrast = planet.contrast_estimate
+        if contrast is None:
+            if radius is None or planet.semi_major_axis_au is None:
+                continue
+            contrast = phi_orbit * reflected_light_contrast(
+                radius_earth=radius,
+                semi_major_axis_au=planet.semi_major_axis_au,
+                geometric_albedo=geometric_albedo,
+                phase_angle_rad=0.0,
+            )
+
+        planet_type = planet.planet_type
+        if planet_type is None and radius is not None:
+            planet_type = classify_planet(radius, planet.mass_earth, rule_version)
+        out.append(
+            PlotPlanet(
+                name=planet.name,
+                separation_mas=float(planet.separation_mas),
+                contrast=float(contrast),
+                planet_type=planet_type or "Unclassified",
+                discovery_method=_CATALOG_METHOD_TO_OVERLAY.get(
+                    planet.discovery_method, planet.discovery_method
+                ),
+                radius_rearth=float("nan") if radius is None else float(radius),
+                radius_is_estimated=radius_is_estimated,
             )
         )
     return tuple(out)

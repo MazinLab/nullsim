@@ -296,10 +296,10 @@ def test_paper_characterization_rates_mask_infeasible_curve_anchor(
 
 
 def test_pdi_snr_uses_inferred_dark_port_count(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: dict[str, int] = {}
+    captured: dict[str, object] = {}
 
     def fake_signal_to_noise_pdi(**kwargs: object) -> float:
-        captured["n_dark_ports_per_arm"] = int(kwargs["n_dark_ports_per_arm"])
+        captured.update(kwargs)
         return 9.0
 
     import nullsim.physics.pdi as pdi
@@ -310,13 +310,246 @@ def test_pdi_snr_uses_inferred_dark_port_count(monkeypatch: pytest.MonkeyPatch) 
             "planet_signal_rate_dark": 1.0,
             "leakage_rate_dark": 2.0,
             "pol_fraction_orbit_avg": 0.3,
+            "sky_rate_per_dark_port": 2.0,
+            "dark_rate_per_dark_port": 0.5,
         },
         10.0,
         modulation_period_s=60.0,
         n_dark_ports=11,
+        rate_scale=1.0,
     )
     assert snr == pytest.approx(9.0)
     assert captured["n_dark_ports_per_arm"] == 11
+    # Review 2026-11-07 row 58: the survey row's sky and dark reach the PDI.
+    assert captured["sky_rate_hz_per_dark_port_per_arm"] == pytest.approx(2.0)
+    assert captured["dark_rate_hz_per_port_per_arm"] == pytest.approx(0.5)
+
+
+def test_pdi_dual_pol_factor_only_for_scalar_pipelines_and_only_once(
+    tmp_path: Path,
+) -> None:
+    """Review 2026-11-07 Issue 15: the 0.87 scalar to dual polarization factor
+    applies only without polarization stages, and the char fallback (no char
+    rates) must not receive it a second time."""
+
+    from nullsim.outputs.paper import _pdi_row
+
+    row = {
+        "name": "p",
+        "radius_rearth": 10.0,
+        "planet_signal_rate_dark": 4.0,
+        "leakage_rate_dark": 100.0,
+    }
+    scalar = _collection(
+        _config(), _state(), tmp_path
+    )
+    dual = _collection(
+        _config(extra_stage_types=("polarization.pbs_split",)),
+        _state(),
+        tmp_path,
+    )
+
+    scalar_row = _pdi_row(row, scalar)
+    dual_row = _pdi_row(row, dual)
+
+    assert scalar_row["char_planet_signal_rate_pdi"] == pytest.approx(4.0 * 0.87)
+    assert scalar_row["char_leakage_rate_pdi"] == pytest.approx(100.0 * 0.87)
+    assert dual_row["char_planet_signal_rate_pdi"] == pytest.approx(4.0)
+    assert dual_row["char_leakage_rate_pdi"] == pytest.approx(100.0)
+
+
+def test_interp_gapped_never_bridges_or_clamps() -> None:
+    """Review 2026-11-07 row 59: failed anchors are gaps, a lone anchor is
+    valid only at its own separation, and outside the grid is NaN."""
+
+    from nullsim.outputs.paper import _interp_gapped
+
+    xs = np.array([30.0, 10.0, 20.0, 40.0])
+    ys = np.array([3.0, 1.0, 2.0, 4.0])
+    valid = np.array([False, True, True, True])
+
+    assert _interp_gapped(xs, ys, valid, 15.0) == pytest.approx(1.5)
+    assert _interp_gapped(xs, ys, valid, 20.0) == pytest.approx(2.0)
+    assert np.isnan(_interp_gapped(xs, ys, valid, 25.0))  # touches failed 30
+    assert np.isnan(_interp_gapped(xs, ys, valid, 30.0))
+    assert np.isnan(_interp_gapped(xs, ys, valid, 5.0))
+    assert np.isnan(_interp_gapped(xs, ys, valid, 45.0))
+
+    lone = np.array([False, True, False, False])
+    assert _interp_gapped(xs, ys, lone, 10.0) == pytest.approx(1.0)
+    assert np.isnan(_interp_gapped(xs, ys, lone, 12.0))
+
+
+def test_contrast_limit_treats_infinite_contrast_as_gap(tmp_path: Path) -> None:
+    from nullsim.outputs.paper import _contrast_limit_at
+    from nullsim.stages.detector.ideal_counter import CONTRAST_CURVE_DTYPE
+
+    curve = np.empty(3, dtype=CONTRAST_CURVE_DTYPE)
+    curve["separation_mas"] = (10.0, 20.0, 40.0)
+    curve["contrast"] = (1.0e-6, np.inf, 1.0e-7)
+    state = replace(_state(), results=replace(_state().results, contrast_curve=curve))
+    record = _collection(_config(), state, tmp_path).records[0]
+
+    assert np.isnan(_contrast_limit_at(record, 15.0))
+    assert np.isnan(_contrast_limit_at(record, 50.0))
+    assert _contrast_limit_at(record, 40.0) == pytest.approx(1.0e-7)
+
+
+def test_char_curve_single_surviving_anchor_is_valid_only_at_its_separation(
+    tmp_path: Path,
+) -> None:
+    record = _collection(_config(), _state(), tmp_path).records[0]
+    char_curve = {
+        "detected_stellar_rate_hz": 1.0e6,
+        "separations_mas": np.array([10.0, 20.0, 40.0]),
+        "spectro_throughput_per_anchor": np.array([0.1, 0.2, 0.4]),
+        "spectro_leak_fraction_per_anchor": np.array([1.0e-5, 2.0e-5, 4.0e-5]),
+        "optimization_success_per_anchor": np.array([False, True, False]),
+    }
+    kwargs = dict(
+        record=record,
+        char=None,
+        char_curve=char_curve,
+        planet_contrast=1.0e-7,
+        fallback_planet_rate_hz=1.0,
+        fallback_leakage_rate_hz=2.0,
+    )
+
+    at_anchor = _characterization_rates_for_planet(planet_separation_mas=20.0, **kwargs)
+    off_anchor = _characterization_rates_for_planet(planet_separation_mas=30.0, **kwargs)
+
+    assert at_anchor[0] == pytest.approx(1.0e6 * 1.0e-7 * 0.2)
+    assert at_anchor[1] == pytest.approx(1.0e6 * 2.0e-5)
+    assert np.isnan(off_anchor[0]) and np.isnan(off_anchor[1])
+
+
+def test_char_curve_rescaled_to_cell_moves_floor_eps_and_bandwidth() -> None:
+    """Review 2026-11-07 Issue 14: a borrowed curve keeps the donor chip's
+    throughput and static leak but takes the floor, eps, and bandwidth from
+    the host's J cell.
+
+    Hand values: donor excess 1e-5 - 1e-6 = 9e-6, cell excess 3.7e-5 - 1e-6
+    = 3.6e-5, so the floor scales 4x. Donor eps 0.05 with nsc = 2 and
+    null instability 0.06 leaves a speckle term sqrt(0.05^2 - 0.03^2) = 0.04;
+    the cell's null instability 0.18 gives hypot(0.09, 0.04) = sqrt(0.0097).
+    """
+
+    from nullsim.outputs.paper import _char_curve_rescaled_to_cell
+
+    donor_curve = {
+        "spectro_throughput_per_anchor": np.array([0.3, 0.5]),
+        "spectro_static_leak_fraction_per_anchor": np.array([1.0e-7, 2.0e-7]),
+        "realized_spectro_floor_per_anchor": np.array([2.0e-6, 4.0e-6]),
+        "spectro_leak_fraction_per_anchor": np.array([2.1e-6, 4.2e-6]),
+        "realized_spectro_floor": 3.0e-6,
+        "eps_systematic": 0.05,
+        "nsc_systematic_reduction": 2.0,
+    }
+    donor_sensitivity = {
+        "realized_null_depth": 1.0e-5,
+        "ideal_chip_null_depth": 1.0e-6,
+        "null_instability": 0.06,
+        "effective_systematic_bandwidth_hz": 3784.0,
+    }
+    cell_sensitivity = {
+        "realized_null_depth": 3.7e-5,
+        "ideal_chip_null_depth": 1.0e-6,
+        "null_instability": 0.18,
+        "effective_systematic_bandwidth_hz": 925.0,
+    }
+
+    curve = _char_curve_rescaled_to_cell(
+        donor_curve,
+        donor_sensitivity=donor_sensitivity,
+        cell_sensitivity=cell_sensitivity,
+    )
+
+    np.testing.assert_allclose(curve["spectro_throughput_per_anchor"], [0.3, 0.5])
+    np.testing.assert_allclose(
+        curve["spectro_leak_fraction_per_anchor"], [8.1e-6, 16.2e-6]
+    )
+    assert curve["realized_spectro_floor"] == pytest.approx(1.2e-5)
+    assert curve["eps_systematic"] == pytest.approx(np.sqrt(0.0097))
+    assert curve["servo_bw_hz"] == pytest.approx(925.0)
+    # The donor payload is left untouched.
+    np.testing.assert_allclose(
+        donor_curve["spectro_leak_fraction_per_anchor"], [2.1e-6, 4.2e-6]
+    )
+
+
+def test_survey_rows_rescale_borrowed_char_floor_and_flag_rows(
+    tmp_path: Path,
+) -> None:
+    """End to end through ``_survey_rows``: hosts nearest a curveless J=6 cell
+    borrow the J=4 chip with the J=6 floor, and are flagged."""
+
+    from nullsim.outputs.paper import _survey_rows
+
+    anchors = np.array([0.1, 1.0e7])
+
+    def cell(jmag: float, *, excess: float, with_curve: bool) -> RunRecord:
+        results = Results().add_component(
+            "performance.standard", {"stellar_rate_hz_total": 1.0e6}
+        )
+        results = results.add_component(
+            "sensitivity.detection_curve",
+            {
+                "realized_null_depth": 1.0e-6 + excess,
+                "ideal_chip_null_depth": 1.0e-6,
+                "null_instability": 0.0,
+                "effective_systematic_bandwidth_hz": 1000.0,
+            },
+        )
+        if with_curve:
+            results = results.add_component(
+                "characterization.detection_curve",
+                {
+                    "detected_stellar_rate_hz": 1.0e6,
+                    "separations_mas": anchors,
+                    "spectro_throughput_per_anchor": np.full(2, 0.5),
+                    "spectro_static_leak_fraction_per_anchor": np.full(2, 1.0e-7),
+                    "realized_spectro_floor_per_anchor": np.full(2, 2.0e-6),
+                    "spectro_leak_fraction_per_anchor": np.full(2, 2.1e-6),
+                    "eps_systematic": 0.0,
+                },
+            )
+        return RunRecord(
+            config=_config(),
+            result=RunResult(
+                state=replace(_state(), results=results),
+                diagnostics={},
+                timings=(),
+                cache_hit_count=0,
+                config_hash="cfg",
+            ),
+            run_dir=tmp_path,
+            coord_tuple=(("scene.star.jmag", jmag),),
+        )
+
+    collection = RunCollection(
+        config=_config(),
+        records=(
+            cell(4.0, excess=1.0e-5, with_curve=True),
+            cell(6.0, excess=3.0e-5, with_curve=False),
+        ),
+        output_dir=tmp_path,
+    )
+
+    rows = _survey_rows(collection)
+    borrowed = [r for r in rows if 5.0 < float(r["host_jmag"] or 0.0) < 7.0]
+    native = [r for r in rows if 3.0 < float(r["host_jmag"] or 99.0) < 5.0]
+    assert borrowed and native
+    for row in borrowed:
+        stellar = 1.0e6 * 10.0 ** (-0.4 * (row["host_jmag"] - 4.0))
+        # static 1e-7 + floor 2e-6 x (3e-5 / 1e-5)
+        assert row["char_leakage_rate"] == pytest.approx(stellar * 6.1e-6)
+        assert row["char_floor_scaled_from_jmag"] == 4.0
+        assert row["host_jmag_outside_sweep"] == int(row["host_jmag"] > 6.0)
+    for row in native:
+        assert np.isnan(row["char_floor_scaled_from_jmag"])
+
+    caption = _latex_characterization_table({"Rocky": borrowed[:1]})
+    assert "realized null excess" in caption
 
 
 def test_pdi_displayed_snr_sorts_finite_first_and_sinks_nan() -> None:
@@ -397,7 +630,9 @@ def test_assumed_star_disk_mas_uses_config_star() -> None:
     assert _assumed_star_disk_mas(missing) == 0.0
 
 
-def _config():
+def _config(extra_stage_types: tuple[str, ...] = ()):
+    stages = [{"id": "scene", "type": "scene.point_source"}]
+    stages += [{"id": f"extra{i}", "type": kind} for i, kind in enumerate(extra_stage_types)]
     raw_config = {
         "run": {"name": "paper_test", "seed": 1},
         "grid": {
@@ -418,7 +653,7 @@ def _config():
             },
         },
         "observation": {"integration_time_s": 10.0},
-        "pipeline": {"stages": [{"id": "scene", "type": "scene.point_source"}]},
+        "pipeline": {"stages": stages},
         "output": {
             "paper": True,
             "plots": ["null_transmission_map"],

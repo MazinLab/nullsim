@@ -18,6 +18,7 @@ from nullsim.outputs.plots._kilo_planet_overlay import PlotPlanet
 from nullsim.outputs.plots.detection_space import (
     detection_space,
     _attach_legends,
+    _catalog_config,
     _contrast_curve_legend_title,
     _decorate_axes,
     _load_planet_overlay,
@@ -744,12 +745,9 @@ def test_detection_space_all_sky_observability_keeps_southern_planets(
         records=(ground_record,),
         output_dir=tmp_path,
     )
+    catalog = _catalog_config(ground_collection)
     ground_obs = _observability_config(ground_collection)
-    ground_planets = _load_planet_overlay(
-        _FIXTURE_CATALOG,
-        required=True,
-        observability=ground_obs,
-    )
+    ground_planets = _load_planet_overlay(catalog, observability=ground_obs)
 
     space_config = _resolved_all_sky_with_catalog(_FIXTURE_CATALOG)
     space_record = RunRecord(
@@ -764,15 +762,138 @@ def test_detection_space_all_sky_observability_keeps_southern_planets(
         output_dir=tmp_path,
     )
     space_obs = _observability_config(space_collection)
-    space_planets = _load_planet_overlay(
-        _FIXTURE_CATALOG,
-        required=True,
-        observability=space_obs,
-    )
+    space_planets = _load_planet_overlay(catalog, observability=space_obs)
 
     assert len(ground_planets) == 3
     assert len(space_planets) == 5
     assert space_obs.min_altitude_deg is None
+
+
+def test_detection_space_observability_uses_resolved_site_latitude() -> None:
+    """Review 2026-11-07 Issue 16: the NAYRA config resolves its site preset
+    to Cerro Armazones; the cut must use that latitude and name, not Mauna
+    Kea, and an explicit [site.observability] entry still wins."""
+
+    from nullsim.config import load_config
+
+    config = load_config(
+        Path(__file__).resolve().parents[3]
+        / "examples"
+        / "test"
+        / "nayra_eelt_baseline.toml"
+    )
+    record = _synthetic_record(jmag=5.0, contrast_floor=1.0e-7)
+    record = RunRecord(
+        config=config,
+        result=record.result,
+        run_dir=record.run_dir,
+        coord_tuple=record.coord_tuple,
+    )
+    collection = RunCollection(config=config, records=(record,), output_dir=Path("."))
+
+    observability = _observability_config(collection)
+
+    assert observability.latitude_deg == pytest.approx(-24.589)
+    assert "Cerro Armazones" in observability.caption
+
+    site = config.site.model_copy(
+        update={"observability": {"latitude_deg": 19.826, "site_label": "Keck"}}
+    )
+    override = config.model_copy(update={"site": site})
+    record = RunRecord(
+        config=override,
+        result=record.result,
+        run_dir=record.run_dir,
+        coord_tuple=record.coord_tuple,
+    )
+    observability = _observability_config(
+        RunCollection(config=override, records=(record,), output_dir=Path("."))
+    )
+    assert observability.latitude_deg == pytest.approx(19.826)
+    assert "Keck" in observability.caption
+
+
+def test_detection_space_catalog_overlay_uses_versioned_parser(tmp_path: Path) -> None:
+    """Review 2026-11-07 row 57: a declared catalog goes through load_catalog.
+
+    A 3 R_earth planet is "Neptune-like" under KILO's radius bins but
+    "Super-Earth" under the declared v1 rule; a supplied contrast column is
+    used as given, and only a planet without one gets the Lambertian model.
+    """
+
+    from nullsim.catalogs.exoplanets import ExoplanetCatalogConfig
+    from nullsim.outputs.plots._kilo_planet_overlay import (
+        lambertian_orbit_averaged_phase,
+    )
+    from nullsim.physics.reflected_light import reflected_light_contrast
+
+    snapshot = tmp_path / "snap.csv"
+    snapshot.write_text(
+        "pl_name,dec,pl_rade,pl_orbsmax,sy_dist,contrast_estimate,discoverymethod\n"
+        "Given,10.0,1.0,0.1,10.0,3e-9,Imaging\n"
+        "Modeled,10.0,3.0,0.1,10.0,,Radial Velocity\n",
+        encoding="utf-8",
+    )
+    catalog = ExoplanetCatalogConfig(
+        retrieval_date="2026-04-01", snapshot_path=snapshot
+    )
+
+    planets = {p.name: p for p in _load_planet_overlay(catalog)}
+
+    assert planets["Given"].contrast == pytest.approx(3.0e-9)
+    assert planets["Given"].discovery_method == "Imaging"
+    assert planets["Modeled"].planet_type == "Super-Earth"
+    assert planets["Modeled"].discovery_method == "Radial Velocity"
+    assert planets["Modeled"].separation_mas == pytest.approx(10.0)
+    assert planets["Modeled"].contrast == pytest.approx(
+        lambertian_orbit_averaged_phase()
+        * reflected_light_contrast(
+            radius_earth=3.0,
+            semi_major_axis_au=0.1,
+            geometric_albedo=0.3,
+            phase_angle_rad=0.0,
+        )
+    )
+
+
+def test_detection_space_plots_every_characterization_curve() -> None:
+    """Review 2026-11-07 Issue 25: two characterization.detection_curve
+    components on one record both draw, in distinct colors, each labeled."""
+
+    record = _synthetic_record(jmag=4.0, contrast_floor=1.0e-7)
+    payload = {
+        "separations_mas": np.asarray([1.0, 3.0, 10.0]),
+        "contrast_5sigma": np.asarray([1.0e-5, 1.0e-6, 1.0e-7]),
+    }
+    record = _record_with_char_payload(record, payload)
+    state = replace(
+        record.result.state,
+        results=record.result.state.results.add_component(
+            "characterization.detection_curve.char_h",
+            {**payload, "contrast_5sigma": payload["contrast_5sigma"] * 3.0},
+        ),
+    )
+    record = RunRecord(
+        config=record.config,
+        result=replace(record.result, state=state),
+        run_dir=record.run_dir,
+        coord_tuple=record.coord_tuple,
+    )
+    collection = RunCollection(
+        config=record.config, records=(record,), output_dir=Path(".")
+    )
+    fig, axes = plt.subplots()
+    try:
+        _plot_characterization_curves(axes, collection)
+        assert len(axes.lines) == 2
+        assert axes.lines[0].get_color() != axes.lines[1].get_color()
+        _attach_legends(axes, (), collection)
+        labels = [text.get_text() for text in axes.get_legend().get_texts()]
+        char_labels = [label for label in labels if "char-mode" in label]
+        assert len(char_labels) == 2
+        assert any("characterization.detection_curve.char_h" in lab for lab in char_labels)
+    finally:
+        plt.close(fig)
 
 
 # ---------------------------------------------------------------------------

@@ -152,15 +152,47 @@ def test_overlay_skips_multi_aperture_configs() -> None:
 
 def test_inputs_assemble_perfect_optics_rate() -> None:
     record = _record()
-    inputs = _ideal_coronagraph_curve_inputs(_collection(record))
+    with pytest.warns(UserWarning, match="zodi surface brightness"):
+        inputs = _ideal_coronagraph_curve_inputs(_collection(record))
     assert inputs is not None
     assert inputs["diameter_m"] == pytest.approx(8.0)
     assert inputs["stellar_radius_mas"] == pytest.approx(0.93)
+    # Without the surface brightness keys: the routed dark-port fallback.
     assert inputs["background_rate_hz"] == pytest.approx(52.0)
     assert inputs["integration_time_s"] == pytest.approx(86400.0)
     # I=1.5 solar analog through a clear 8 m primary and QE 0.9 lands at
     # a few 1e10 cps; pin the order of magnitude, not the zero point.
     assert 1.0e9 < inputs["stellar_rate_hz"] < 1.0e12
+
+
+def test_background_is_zodi_through_one_resolution_element_of_the_primary() -> None:
+    """Review 2026-11-07 row 56: (local + exozodi) surface brightness times
+    primary area, (lambda/D)^2, and QE, not the nuller's routed zodi.
+
+    Hand value: lambda/D = 0.8e-6 / 8 rad = 0.0206265 arcsec, squared
+    4.2545e-4 arcsec^2; area pi*16 = 50.265 m^2; (30 + 10) * 50.265 *
+    4.2545e-4 * 0.9 = 0.76985 Hz.
+    """
+
+    record = _record()
+    state = record.result.state
+    zodi = {
+        **state.results.components["background.space_zodi"],
+        "local_zodi_rate_hz_per_m2_per_arcsec2": 30.0,
+        "exozodi_rate_hz_per_m2_per_arcsec2_at_scene_separation": 10.0,
+    }
+    components = {**state.results.components, "background.space_zodi": zodi}
+    state = replace(state, results=replace(state.results, components=components))
+    record = RunRecord(
+        config=record.config,
+        result=replace(record.result, state=state),
+        run_dir=record.run_dir,
+        coord_tuple=record.coord_tuple,
+    )
+
+    inputs = _ideal_coronagraph_curve_inputs(_collection(record))
+
+    assert inputs["background_rate_hz"] == pytest.approx(0.76985, rel=1.0e-4)
 
 
 def test_degenerate_sweep_draws_one_curve_and_one_legend_entry() -> None:
