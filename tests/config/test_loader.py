@@ -4,8 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from nullsim.config import NullsimConfigError, load_config
-from nullsim.config.loader import _deep_merge
+from nullsim.config import NullsimConfigError, expand_sweeps, load_config
+from nullsim.config.loader import _deep_merge, sweep_resolved_toml_text
+
+_SAMPLE_CATALOG = Path(__file__).parents[1] / "catalogs" / "fixtures" / "sample_catalog.csv"
 
 
 def _write_config(tmp_path: Path, text: str) -> Path:
@@ -839,3 +841,94 @@ def test_load_config_timedomain_merges_through_extends(tmp_path: Path) -> None:
     assert resolved_config.timedomain == {
         "engine": {"dt_ms": 0.1, "duration_s": 2.0},
     }
+
+
+def test_sweep_resolved_toml_reloads_to_identical_cells(tmp_path: Path) -> None:
+    """Row 67: a saved sweep config must re-expand to the same cells.
+
+    The materialized text copies [scene.star].jmag into the scene stage's
+    star_jmag, which then reads as an explicit override of the swept source.
+    """
+
+    parent = _write_config(tmp_path, _base_config())
+    child = tmp_path / "child.toml"
+    child.write_text(
+        f"""
+extends = "{parent.name}"
+
+[[sweep]]
+param = "scene.star.jmag"
+values = [4.0, 5.0, 6.0]
+""",
+        encoding="utf-8",
+    )
+    resolved_config = load_config(child)
+    saved = tmp_path / "out" / "config.sweep.resolved.toml"
+    saved.parent.mkdir()
+    saved.write_text(sweep_resolved_toml_text(resolved_config), encoding="utf-8")
+
+    original = [cell.config.config_hash for cell in expand_sweeps(resolved_config)]
+    reloaded = [cell.config.config_hash for cell in expand_sweeps(load_config(saved))]
+
+    assert len(original) == 3
+    assert reloaded == original
+
+
+def test_inherited_catalog_path_resolves_against_defining_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Row 68: relative snapshot paths rebase onto the file that wrote them."""
+
+    parent_dir = tmp_path / "parent"
+    parent_dir.mkdir()
+    snapshot = parent_dir / "snap.csv"
+    snapshot.write_bytes(_SAMPLE_CATALOG.read_bytes())
+    parent = parent_dir / "config.toml"
+    parent.write_text(
+        _base_config()
+        + """
+[catalog.exoplanets]
+retrieval_date = "2026-04-01"
+snapshot_path = "snap.csv"
+""",
+        encoding="utf-8",
+    )
+    child_dir = tmp_path / "child"
+    child_dir.mkdir()
+    child = child_dir / "child.toml"
+    child.write_text('extends = "../parent/config.toml"\n', encoding="utf-8")
+
+    resolved_config = load_config(child)
+    snapshot_path = resolved_config.raw_config["catalog"]["exoplanets"]["snapshot_path"]
+    assert snapshot_path == str(snapshot.resolve())
+    assert f'snapshot_path = "{snapshot.resolve()}"' in resolved_config.resolved_toml_text
+
+    saved = tmp_path / "elsewhere" / "config.resolved.toml"
+    saved.parent.mkdir()
+    resolved_config.write_toml(saved)
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    reloaded = load_config(saved).raw_config["catalog"]["exoplanets"]
+    assert reloaded["snapshot_path"] == str(snapshot.resolve())
+
+
+def test_config_hash_does_not_depend_on_checkout_directory(tmp_path: Path) -> None:
+    """The absolute catalog path must not leak into config_hash."""
+
+    hashes = []
+    for checkout in ("checkout_a", "checkout_b"):
+        config_dir = tmp_path / checkout
+        config_dir.mkdir()
+        (config_dir / "snap.csv").write_bytes(_SAMPLE_CATALOG.read_bytes())
+        config = config_dir / "config.toml"
+        config.write_text(
+            _base_config()
+            + """
+[catalog.exoplanets]
+retrieval_date = "2026-04-01"
+snapshot_path = "snap.csv"
+""",
+            encoding="utf-8",
+        )
+        hashes.append(load_config(config).config_hash)
+    assert hashes[0] == hashes[1]

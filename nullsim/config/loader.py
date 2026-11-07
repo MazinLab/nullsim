@@ -78,6 +78,7 @@ def _load_raw_config(path: Path, seen: frozenset[Path] = frozenset()) -> dict[st
         raise NullsimConfigError(f"Config extends cycle detected: {chain}")
     with config_path.open("rb") as handle:
         raw_config = tomllib.load(handle)
+    _absolutize_catalog_path(raw_config, config_path.parent)
 
     extends = raw_config.pop("extends", None)
     if extends is None:
@@ -89,6 +90,53 @@ def _load_raw_config(path: Path, seen: frozenset[Path] = frozenset()) -> dict[st
         base_path = config_path.parent / base_path
     base_config = _load_raw_config(base_path, seen | frozenset({config_path}))
     return _deep_merge(base_config, raw_config)
+
+
+def _absolutize_catalog_path(raw_config: dict[str, Any], config_dir: Path) -> None:
+    """Rebase a relative ``[catalog.exoplanets].snapshot_path`` onto ``config_dir``.
+
+    Runs per file during ``extends`` loading, so an inherited path resolves
+    against the file that wrote it, and the resolved TOML records an absolute
+    path that reloads from any directory (review 2026-11-07 row 68).
+    """
+
+    catalog_block = raw_config.get("catalog", {}).get("exoplanets")
+    if not isinstance(catalog_block, dict):
+        return
+    snapshot_path = catalog_block.get("snapshot_path")
+    if isinstance(snapshot_path, str) and not Path(snapshot_path).is_absolute():
+        catalog_block["snapshot_path"] = str((config_dir / snapshot_path).resolve())
+
+
+def _without_catalog_directory(config_mapping: dict[str, Any]) -> dict[str, Any]:
+    """Return the mapping with the catalog snapshot path cut to its file name.
+
+    The snapshot path is absolute after loading, so hashing it would make
+    ``config_hash`` depend on where the repository is checked out. The
+    snapshot's bytes already enter ``run_hash`` through
+    ``_catalog_block_hash``, so the directory carries no identity.
+    """
+
+    catalog_block = config_mapping.get("catalog", {}).get("exoplanets")
+    if not isinstance(catalog_block, dict) or "snapshot_path" not in catalog_block:
+        return config_mapping
+    hashed = copy.deepcopy(config_mapping)
+    snapshot_path = Path(str(catalog_block["snapshot_path"]))
+    hashed["catalog"]["exoplanets"]["snapshot_path"] = snapshot_path.name
+    return hashed
+
+
+def sweep_resolved_toml_text(resolved: ResolvedConfig) -> str:
+    """Return canonical TOML for the merged, pre-materialization config.
+
+    Extends and presets are resolved and ``[[sweep]]`` blocks are intact, but
+    no top-level value has been copied into stage params, so reloading the
+    text and re-expanding its sweeps yields the same cells. The materialized
+    ``resolved_toml_text`` cannot do this: its injected stage values read as
+    explicit overrides of the swept sources (review 2026-11-07 row 67).
+    """
+
+    return canonical_toml_dumps(merge_presets(resolved.raw_config))
 
 
 def merge_presets(raw_config: Mapping[str, Any]) -> dict[str, Any]:
@@ -138,7 +186,9 @@ def resolve_config(
 
     config_mapping = top_level_config.model_dump(mode="python", exclude_none=True)
     resolved_toml_text = canonical_toml_dumps(config_mapping)
-    config_hash = compute_config_hash(resolved_toml_text)
+    config_hash = compute_config_hash(
+        canonical_toml_dumps(_without_catalog_directory(config_mapping))
+    )
 
     # Fold the [catalog.exoplanets] snapshot hash into ``run_hash`` so
     # the library-path identity matches the CLI/manifest. Pre-fix the

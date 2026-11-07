@@ -79,6 +79,16 @@ def test_content_digest_changes_when_any_budget_gets_a_contribution() -> None:
         assert updated_state.content_digest() != original_digest
 
 
+def test_content_digest_depends_on_component_insertion_order() -> None:
+    """Issue 25: consumers pick among components by order, so the cache must see it."""
+
+    sky_first = Results().add_component("sky", 1.0).add_component("nayra", 2.0)
+    nayra_first = Results().add_component("nayra", 2.0).add_component("sky", 1.0)
+
+    assert dict(sky_first.components) == dict(nayra_first.components)
+    assert sky_first.content_digest() != nayra_first.content_digest()
+
+
 def test_content_digest_for_scene_ignores_throughput_contributions() -> None:
     state = SimulationState.empty()
     updated_state = replace(

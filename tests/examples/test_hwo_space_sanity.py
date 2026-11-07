@@ -93,12 +93,13 @@ def test_hwo_space_config_loads() -> None:
     assert cfg.run.seed == 1
     catalog = cfg.raw_config["catalog"]["exoplanets"]
     snapshot_path = str(catalog["snapshot_path"])
-    assert snapshot_path == (
-        "../nullsim/data/exoplanet_catalogs/"
-        "nasa_exoplanet_archive_paperv3.csv"
-    )
+    # The loader rebases relative catalog paths onto the defining file.
+    resolved_snapshot = (
+        CONFIG_PATH.parent
+        / "../nullsim/data/exoplanet_catalogs/nasa_exoplanet_archive_paperv3.csv"
+    ).resolve()
+    assert snapshot_path == str(resolved_snapshot)
     assert "tests/catalogs/fixtures" not in snapshot_path
-    resolved_snapshot = (CONFIG_PATH.parent / snapshot_path).resolve()
     assert resolved_snapshot.is_file()
     with resolved_snapshot.open(encoding="utf-8") as handle:
         assert sum(1 for _line in handle) > 100

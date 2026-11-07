@@ -167,9 +167,13 @@ class SubBudget:
         return replace(self, components=updated_components)
 
     def content_digest(self) -> bytes:
-        """Return a sha256 digest over typed fields and sorted components.
+        """Return a sha256 digest over typed fields and ordered components.
 
-        The digest is computed from a stable, pickle-independent canonical byte
+        Components are hashed in insertion order, not sorted by name:
+        consumers that pick among one family's components (first detector,
+        last background) depend on that order, so two pipelines that differ
+        only in stage order must not share a cache key (review 2026-11-07
+        Issue 25). The digest is computed from a stable, pickle-independent canonical byte
         stream: numpy arrays are normalized to C-contiguous bytes plus dtype
         and shape, mappings are key-sorted, and dataclass payloads are walked
         by field name. This is what makes the disk cache survive a pickle
@@ -186,9 +190,9 @@ class SubBudget:
                 continue
             digest.update(_canonical_bytes(budget_field.name))
             digest.update(_canonical_bytes(getattr(self, budget_field.name)))
-        for component_name in sorted(self.components):
+        for component_name, component_value in self.components.items():
             digest.update(_canonical_bytes(component_name))
-            digest.update(_canonical_bytes(self.components[component_name]))
+            digest.update(_canonical_bytes(component_value))
         return digest.digest()
 
 

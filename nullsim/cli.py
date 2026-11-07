@@ -35,6 +35,7 @@ from nullsim.config import (
     expand_sweeps,
     load_config,
 )
+from nullsim.config.loader import sweep_resolved_toml_text
 from nullsim.outputs import RunCollection, RunRecord, _autoload_outputs
 from nullsim.outputs.paper import write_paper_outputs
 from nullsim.outputs.sweep_results import write_sweep_results
@@ -244,10 +245,12 @@ def _handle_run(args: argparse.Namespace) -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Persist the canonical resolved TOML next to outputs — the
-    # materialized form, so a reader can reproduce the run from this
-    # file alone without re-running the materializer.
-    resolved.write_toml(output_dir / "config.sweep.resolved.toml")
+    # Persist two canonical TOMLs next to outputs: the merged sweep config
+    # (extends and presets resolved, not materialized), which reloads and
+    # re-expands to the same cells, and the materialized cell-0 config.
+    (output_dir / "config.sweep.resolved.toml").write_text(
+        sweep_resolved_toml_text(resolved), encoding="utf-8"
+    )
     primary_resolved.write_toml(output_dir / "config.resolved.toml")
     if args.config.is_file():
         # Code Review 2026-05-16 Issue 23: don't silently swallow OSError
