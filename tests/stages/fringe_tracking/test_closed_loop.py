@@ -1604,6 +1604,12 @@ def test_inter_telescope_piston_uses_geometry_baseline_and_primary(
     ) * 1.0e6
     assert unknown_um == pytest.approx(sigma_um, rel=1e-3)
 
+    # The stage publishes the same disturbance for the debug report.
+    stage = _stage(_context(tmp_path), inter_telescope_piston=True)
+    published = stage.apply(keck).results.components["fringe_tracking.closed_loop"]
+    published_um = published["inter_telescope_uncorrected_piston_rms_m"] * 1.0e6
+    assert published_um == pytest.approx(sigma_um, rel=1e-12)
+
 
 def test_closed_loop_counts_logical_bright_ports_for_dual_pol_arms(
     tmp_path: Path,

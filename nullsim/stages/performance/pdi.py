@@ -163,9 +163,9 @@ class PdiPerformance(BaseStage):
 
 
 def _find_detector_component(state: SimulationState) -> tuple[str, Any]:
-    """Return the first ``detector.*`` component with port_rates+port_labels."""
+    """Return the newest ``detector.*`` component with port_rates+port_labels."""
 
-    for name, value in state.results.components.items():
+    for name, value in reversed(state.results.components.items()):
         if not name.startswith(_DETECTOR_PREFIX):
             continue
         if not isinstance(value, dict):

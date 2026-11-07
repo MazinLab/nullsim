@@ -31,10 +31,7 @@ from matplotlib.ticker import FuncFormatter, LogLocator
 
 from nullsim.outputs import RunCollection, RunRecord
 from nullsim.outputs.styles import _ensure_headless_backend  # noqa: F401  # side-effect
-from nullsim.physics.fringe_tracking import (
-    piston_psd_knee_hz,
-    von_karman_differential_piston_rms_m,
-)
+from nullsim.physics.fringe_tracking import piston_psd_knee_hz
 from nullsim.pipeline import register_plot
 
 # ---------------------------------------------------------------------------
@@ -1720,19 +1717,15 @@ def _panel_ft_disturbances(
     inter_on = bool(spec_params.get("inter_telescope_piston", False))
     if inter_on:
         outer_scale = spec_params.get("outer_scale_m")
-        r0 = ao_payload.get("r0_500nm_m")
         diameter_m = state.geometry.diameter_m
         vk_str = f"ON · L0 {_f(outer_scale, '{:.1f}')} m"
-        if (
-            isinstance(r0, (int, float)) and r0 > 0
-            and isinstance(outer_scale, (int, float)) and outer_scale > 0
-        ):
-            sigma_vk_m = von_karman_differential_piston_rms_m(
-                r0_500nm_m=float(r0), outer_scale_m=float(outer_scale),
-            )
+        # The stage's own pair-averaged, aperture-filtered value.
+        sigma_vk_m = breakdown.get("inter_telescope_uncorrected_piston_rms_m")
+        if isinstance(sigma_vk_m, (int, float)):
             vk_str += f" · uncorr sigma {sigma_vk_m * 1e9:.0f} nm"
             if (
                 isinstance(eff_wind, (int, float)) and eff_wind > 0
+                and isinstance(outer_scale, (int, float)) and outer_scale > 0
                 and diameter_m is not None and float(diameter_m) > 0
             ):
                 knee_hz = piston_psd_knee_hz(

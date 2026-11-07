@@ -16,7 +16,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import lsq_linear, nnls
 
-from nullsim.physics.ruilier_cassaing import angular_coupling_factor
+from nullsim.physics.ruilier_cassaing import angular_coupling_amplitude
 
 MAS_PER_RAD = 206_264_806.247
 MAUNAKEA_LAT_RAD = np.radians(19.8283)
@@ -217,12 +217,14 @@ def compute_beam_patterns(
         if diameters.shape != (amps.size,):
             raise ValueError("sub_diameters_m must have shape (M,).")
         theta = np.sqrt(l_2d * l_2d + m_2d * m_2d)
-        coupling = angular_coupling_factor(
-            theta[None, :, :],
-            diameters[:, None, None],
-            float(wavelength_m),
+        weighted = weighted * np.asarray(
+            angular_coupling_amplitude(
+                theta[None, :, :],
+                diameters[:, None, None],
+                float(wavelength_m),
+            ),
+            dtype=np.float64,
         )
-        weighted = weighted * np.sqrt(np.asarray(coupling, dtype=np.float64))
 
     fields = u[ports, :] @ weighted.reshape(amps.size, -1)
     return (np.abs(fields) ** 2).reshape(ports.size, len(m_coords), len(l_coords))

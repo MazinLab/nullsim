@@ -2,7 +2,7 @@
 
 Both terms are diffuse. Each single-mode input collects ``B lambda^2 eta_d``
 per spectral bin from a surface brightness B (antenna theorem; see
-``nayra_sky.DIFFUSE_SINGLE_MODE_ACCEPTANCE``), with no point-source coupling.
+``ruilier_cassaing.DIFFUSE_SINGLE_MODE_ACCEPTANCE``), with no point-source coupling.
 Local zodi is uniform across the field, so output j receives
 ``sum_k |(U S)_jk|^2`` of one input's share through the deployed chip.
 Exozodi falls off with stellocentric radius, so its effective brightness is
@@ -38,9 +38,9 @@ from nullsim.stages._mode_splitter import (
 )
 from nullsim.stages._science_bands import infer_band_from_wavelength_um
 from nullsim.stages._utils import unique_component_name
+from nullsim.physics.ruilier_cassaing import DIFFUSE_SINGLE_MODE_ACCEPTANCE
 from nullsim.stages.background.nayra_sky import (
     ARCSEC2_PER_STERADIAN,
-    DIFFUSE_SINGLE_MODE_ACCEPTANCE,
     _bandwidth_per_bin_um,
     _diffuse_port_routing,
     _latest_chip_transfer,

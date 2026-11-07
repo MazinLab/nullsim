@@ -19,9 +19,9 @@ from pydantic import Field as PydanticField
 from nullsim.pipeline import BaseStage, SimulationState, register_stage
 from nullsim.stages._science_bands import infer_band_from_wavelength_um
 from nullsim.stages._utils import unique_component_name
+from nullsim.physics.ruilier_cassaing import DIFFUSE_SINGLE_MODE_ACCEPTANCE
 from nullsim.stages.background.nayra_sky import (
     ARCSEC2_PER_STERADIAN,
-    DIFFUSE_SINGLE_MODE_ACCEPTANCE,
     _bandwidth_per_bin_um,
     _rate_throughput_or_unity,
     _require_wavelength_grid_um,

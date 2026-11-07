@@ -595,3 +595,39 @@ def test_piston_covariance_matches_monte_carlo_over_piston_draws() -> None:
 
     np.testing.assert_allclose(closed_form, monte_carlo, rtol=0.01)
     assert np.max(np.abs(closed_form / no_piston - 1.0)) > 0.05
+
+
+def test_planet_input_field_keeps_coupling_sign_past_first_zero() -> None:
+    """Modes of unequal diameter combine with signed overlap amplitudes.
+
+    At s = theta D / lambda = 2 the 3 m mode is past the overlap's first
+    zero (s = 1.4948), so its field is negative while the 1 m mode's is
+    positive; a sqrt of the power ratio would make both positive.
+    """
+
+    from scipy.integrate import quad
+    from scipy.special import j0
+
+    rho = 1.120906422778534
+    wavelength_m = 1.25e-6
+    separation_rad = 2.0 * wavelength_m / 3.0
+    diameters_m = np.array([3.0, 1.0])
+
+    def overlap(s: float) -> float:
+        num = quad(lambda u: u * math.exp(-rho**2 * u**2) * j0(math.pi * s * u), 0, 1)
+        den = quad(lambda u: u * math.exp(-rho**2 * u**2), 0, 1)
+        return num[0] / den[0]
+
+    field = planet_input_field(
+        positions_m=np.zeros((2, 2)),
+        coupling_per_sub=np.ones(2),
+        sub_areas_m2=np.ones(2),
+        sub_diameters_m=diameters_m,
+        wavelength_m=wavelength_m,
+        separation_rad=separation_rad,
+        position_angle_rad=0.0,
+    )
+    expected = [overlap(separation_rad * d / wavelength_m) for d in diameters_m]
+    assert expected[0] < 0.0 < expected[1]
+    np.testing.assert_allclose(field.real, expected, rtol=1e-9, atol=1e-15)
+    np.testing.assert_allclose(field.imag, 0.0, atol=1e-15)

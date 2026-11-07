@@ -1937,7 +1937,7 @@ def _amplitude_postprocessing_payload(
 def _find_sensitivity_payload(
     state: SimulationState,
 ) -> tuple[str, dict[str, Any] | None]:
-    for name, payload in state.results.components.items():
+    for name, payload in reversed(state.results.components.items()):
         if name.startswith("sensitivity.detection_curve") and isinstance(payload, dict):
             return str(name), payload
     return "sensitivity.detection_curve", None

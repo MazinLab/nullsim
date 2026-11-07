@@ -1,7 +1,7 @@
 # NAYRA E-ELT N=18 quadrature-mesh reference config.
 #
 # Single 39.146 m E-ELT aperture at Cerro Armazones with N=18 photonic
-# sub-apertures packed inside the pupil (avoiding the 0.11 fractional
+# sub-apertures packed inside the pupil (avoiding the 11.1 m
 # central obstruction and six spider vanes):
 #
 #   18 physical aperture modes -> dual-pol PBS arms -> mode_splitter x2
@@ -141,7 +141,7 @@ type = "atmosphere.kolmogorov"
 # scene.star.spectral_type.
 #
 # 18 photonic sub-apertures packed inside the circular E-ELT envelope
-# avoiding the 0.11 central obstruction and six ELT spider vanes; the
+# avoiding the 11.1 m central obstruction and six ELT spider vanes; the
 # pupil-geometry packer derives d_sub from the E-ELT pupil model.
 [[pipeline.stages]]
 id = "ao"

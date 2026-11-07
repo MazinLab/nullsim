@@ -319,10 +319,11 @@ residual_starlight_combine_mode = "max"
 # V-band surface brightness converted to I-band with an approximate solar color;
 # this HWO example pins a low/ecliptic-pole value because deep direct-imaging
 # targets should avoid the high-zodi sky. Exozodi uses a HOSTS-like lognormal
-# dust-level draw and an inclined smooth-disk surface-brightness multiplier,
-# then routes through the same off-axis dark-port throughput that
-# sensitivity.detection_curve computed for the planet separation. The solid
-# angle defaults to 1 (lambda/D)^2.
+# dust-level draw and an inclined smooth-disk surface-brightness multiplier
+# on an r^-2 profile. Each single-mode input collects eta_d lambda^2 of the
+# diffuse surface brightness (eta_d = 0.919). Local zodi is routed through the
+# deployed chip as incoherent light, and exozodi is weighted by the
+# position-angle-averaged dark transmission over its profile.
 id = "zodi"
 type = "background.space_zodi"
 band = "I"
@@ -336,7 +337,6 @@ exozodi_morphology = "smooth_inclined_disk"
 exozodi_inclination_distribution = "isotropic"
 exozodi_max_inclination_deg = 80.0
 exozodi_max_surface_brightness_multiplier = 5.0
-routing = "scene_planet_throughput"
 
 [[pipeline.stages]]
 # Standard performance stage. opd_budget is now optional: when no FT or

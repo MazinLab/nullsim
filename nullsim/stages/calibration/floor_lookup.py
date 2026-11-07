@@ -196,7 +196,7 @@ class CalibrationFloorLookup(BaseStage):
 
 
 def _find_detector_component(state: SimulationState) -> tuple[str, Any]:
-    """Return the first ``detector.*`` component on ``state.results``.
+    """Return the newest ``detector.*`` component on ``state.results``.
 
     Matches the convention from ``nullsim.stages.detector.mkid`` and
     ``nullsim.stages.detector.snspd`` which both write a single
@@ -204,7 +204,7 @@ def _find_detector_component(state: SimulationState) -> tuple[str, Any]:
     ``integration_time_s`` keys.
     """
 
-    for name, value in state.results.components.items():
+    for name, value in reversed(state.results.components.items()):
         if not name.startswith("detector."):
             continue
         if not isinstance(value, dict):

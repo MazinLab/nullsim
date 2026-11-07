@@ -40,9 +40,9 @@ star. For ``phi = k x`` with ``x ~ N(0, C)``,
 
 Port of KILO ``kilo/performance.py`` ``compute_planet_throughput_vs_separation``
 (lines 1010-1128) and ``kilo/injection.py`` ``planet_input_field``
-(lines 459-525). The angular-coupling rolloff uses
-``nullsim.physics.ruilier_cassaing.angular_coupling_factor`` so the
-on-axis SMF convention stays consistent across the package.
+(lines 459-525). The angular-coupling rolloff is the exact signed overlap
+``nullsim.physics.ruilier_cassaing.angular_coupling_amplitude``, which
+departs from KILO's Gaussian envelope beyond about 0.5 lambda/D.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ from numpy.typing import NDArray
 
 from nullsim.physics.imaging import compute_beam_patterns
 from nullsim.physics.realized_null import normalized_wavelength_weights
-from nullsim.physics.ruilier_cassaing import angular_coupling_factor
+from nullsim.physics.ruilier_cassaing import angular_coupling_amplitude
 
 __all__ = [
     "stellar_input_field",
@@ -131,12 +131,14 @@ def planet_input_field(
 
     amplitude = np.sqrt(coupling * areas)
     if sub_diameters_m is not None:
-        ang_power = angular_coupling_factor(
-            separation_rad,
-            np.asarray(sub_diameters_m, dtype=np.float64),
-            float(wavelength_m),
+        amplitude = amplitude * np.asarray(
+            angular_coupling_amplitude(
+                separation_rad,
+                np.asarray(sub_diameters_m, dtype=np.float64),
+                float(wavelength_m),
+            ),
+            dtype=np.float64,
         )
-        amplitude = amplitude * np.sqrt(np.asarray(ang_power, dtype=np.float64))
     return (amplitude * np.exp(1j * phase)).astype(np.complex128)
 
 
@@ -300,11 +302,10 @@ def compute_planet_throughput_vs_separation(
             )
         for i, sep in enumerate(seps):
             if sub_diameters is not None:
-                ang_power = np.asarray(
-                    angular_coupling_factor(sep, sub_diameters, wavelength),
+                amplitudes = base_amplitudes * np.asarray(
+                    angular_coupling_amplitude(sep, sub_diameters, wavelength),
                     dtype=np.float64,
                 )
-                amplitudes = base_amplitudes * np.sqrt(ang_power)
             else:
                 amplitudes = base_amplitudes
 

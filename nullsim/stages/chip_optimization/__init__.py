@@ -48,7 +48,7 @@ from pydantic import Field as PydanticField
 from nullsim.physics.clements import ClementsDecomposition, reconstruct_clements
 from nullsim.physics.fringe_observability import differential_piston_basis
 from nullsim.physics.planet_throughput import planet_input_field
-from nullsim.physics.ruilier_cassaing import angular_coupling_factor
+from nullsim.physics.ruilier_cassaing import angular_coupling_amplitude
 from nullsim.pipeline import SimulationState
 from nullsim.stages._mode_splitter import (
     component_mode_areas_m2 as _component_mode_areas_m2,
@@ -1424,9 +1424,9 @@ def _uses_disk_samples(params: ChipOptimizationParams) -> bool:
 
 
 def _delay_line_diagnostic_payload(state: SimulationState) -> dict[str, Any] | None:
-    """Return the first geometric-delay diagnostic payload, if present."""
+    """Return the newest geometric-delay diagnostic payload, if present."""
 
-    for name, payload in state.throughput.components.items():
+    for name, payload in reversed(state.throughput.components.items()):
         if not name.startswith("delay_line_loss"):
             continue
         if not isinstance(payload, dict):
@@ -2037,15 +2037,15 @@ def _stellar_disk_field_stack(
             sample = np.empty_like(on_axis, dtype=np.complex128)
             for wavelength_index, wavelength_um in enumerate(wavelength_grid_um):
                 wavelength_m = float(wavelength_um) * 1.0e-6
-                angular_power = np.asarray(
-                    angular_coupling_factor(radius_rad, diameters, wavelength_m),
+                angular_amplitude = np.asarray(
+                    angular_coupling_amplitude(radius_rad, diameters, wavelength_m),
                     dtype=np.float64,
                 )
                 opd_m = positions[:, 0] * alpha_rad + positions[:, 1] * beta_rad
                 phase = _TWO_PI * opd_m / wavelength_m
                 sample[:, wavelength_index, :] = (
                     on_axis[:, wavelength_index, :]
-                    * np.sqrt(angular_power)[:, np.newaxis]
+                    * angular_amplitude[:, np.newaxis]
                     * np.exp(1j * phase)[:, np.newaxis]
                 )
             for part in (sample.real, sample.imag):

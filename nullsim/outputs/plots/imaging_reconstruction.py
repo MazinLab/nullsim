@@ -1196,7 +1196,7 @@ def _summary_payload(
 
 
 def _find_detector_component(state: SimulationState) -> dict[str, Any]:
-    for name, value in state.results.components.items():
+    for name, value in reversed(state.results.components.items()):
         if not name.startswith("detector.") or not isinstance(value, dict):
             continue
         if {"port_rates", "port_labels", "integration_time_s"}.issubset(value):

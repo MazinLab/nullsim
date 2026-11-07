@@ -25,7 +25,7 @@ from nullsim.physics.realized_null import (
     _validate_mode_group_indices,
     _validate_piston_covariance,
 )
-from nullsim.physics.ruilier_cassaing import angular_coupling_factor
+from nullsim.physics.ruilier_cassaing import angular_coupling_amplitude
 
 __all__ = [
     "CharacterizationResult",
@@ -170,11 +170,10 @@ def disk_sample_stellar_stack(
     if stellar_radius_rad > 0.0 and n_rings > 0 and n_azimuths > 0:
         for ring_index in range(n_rings):
             radius = stellar_radius_rad * (ring_index + 1) / n_rings
-            angular_power = np.asarray(
-                angular_coupling_factor(radius, diameters, wavelength_m),
+            amplitudes = base * np.asarray(
+                angular_coupling_amplitude(radius, diameters, wavelength_m),
                 dtype=np.float64,
             )
-            amplitudes = base * np.sqrt(angular_power)
             for azimuth_index in range(n_azimuths):
                 angle = _TWO_PI * azimuth_index / n_azimuths
                 alpha = radius * np.sin(angle)
@@ -225,11 +224,10 @@ def spectro_disk_leak(
 
     for radius_index, radius_mas in enumerate(radius_grid_mas):
         radius_rad = radius_mas / 206265e3
-        angular_power = np.asarray(
-            angular_coupling_factor(radius_rad, diameters, wavelength_m),
+        amplitudes = base * np.asarray(
+            angular_coupling_amplitude(radius_rad, diameters, wavelength_m),
             dtype=np.float64,
         )
-        amplitudes = base * np.sqrt(angular_power)
         accum = 0.0
         for pa in pa_grid:
             alpha = radius_rad * np.sin(pa)

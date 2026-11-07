@@ -3,7 +3,7 @@
 # Single 39.146 m E-ELT aperture at Cerro Armazones with N=18
 # sub-apertures within the pupil -> 18 input modes -> 153-MZI Clements
 # mesh (324 real parameters). Sub-apertures are packed inside the
-# circular E-ELT envelope avoiding the 0.11 fractional central
+# circular E-ELT envelope avoiding the 11.1 m central
 # obstruction and six 0.5 m spider vanes.
 #
 # Source: nayra/
@@ -131,7 +131,7 @@ type = "atmosphere.kolmogorov"
 # (strict-square 55² = 3025) is the closest square to 3000 per nullsim.
 #
 # 18 photonic sub-apertures packed inside the circular E-ELT envelope
-# avoiding the 0.11 central obstruction and six ELT spider vanes; pupil
+# avoiding the 11.1 m central obstruction and six ELT spider vanes; pupil
 # geometry helper derives d_sub = 6.22 m for M=18 from NAYRA's packed
 # E-ELT pupil model.
 [[pipeline.stages]]

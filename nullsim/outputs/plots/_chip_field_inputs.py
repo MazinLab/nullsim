@@ -109,9 +109,9 @@ def maybe_find_component(
     state: SimulationState,
     prefix: str,
 ) -> dict[str, Any] | None:
-    """Return the first dict results component whose name starts with ``prefix``."""
+    """Return the newest dict results component whose name starts with ``prefix``."""
 
-    for name, value in state.results.components.items():
+    for name, value in reversed(state.results.components.items()):
         if name.startswith(prefix) and isinstance(value, dict):
             return value
     return None

@@ -20,9 +20,6 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, Field as PydanticField
 
 from nullsim.physics.photometry import photon_rate_per_m2_per_bin
-from nullsim.physics.ruilier_cassaing import (
-    OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO,
-)
 from nullsim.pipeline import BaseStage, SimulationState, register_stage
 from nullsim.stages._mode_splitter import splitter_physical_indices
 from nullsim.stages._science_bands import infer_band_from_wavelength_um
@@ -41,21 +38,6 @@ _SKY_MAG_ARCSEC2 = {
 
 # 1 sr = (180*3600/pi)^2 arcsec^2.
 ARCSEC2_PER_STERADIAN = (180.0 * 3600.0 / np.pi) ** 2
-
-DIFFUSE_SINGLE_MODE_ACCEPTANCE = 1.0 - np.exp(
-    -2.0 * OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO**2
-)
-"""Diffuse-light acceptance of a single-mode input behind a circular aperture.
-
-By the antenna theorem (Siegman 1966, Proc. IEEE 54, 1350) a single guided
-mode accepts the etendue A.Omega = lambda^2 of a uniform incoherent source of
-total-intensity surface brightness B, over both polarizations. A circular
-aperture of radius R in front of the input passes only the fraction
-``1 - exp(-2 rho^2)`` of the back-propagated Gaussian mode of field radius w,
-with ``rho = R / w``. At the Ruilier-Cassaing optimum rho = 1.1209 this is
-0.919, so the input collects ``B lambda^2 * 0.919`` per spectral bin. The
-point-source coupling eta = 0.8145 does not apply to diffuse light.
-"""
 
 _DARK_PORT_SPAXEL_ARCSEC2 = {
     "Y": 0.0035,

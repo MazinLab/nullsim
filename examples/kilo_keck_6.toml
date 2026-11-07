@@ -77,10 +77,9 @@ id = "chip"
 deployment_mode = "per_pol_arm"
 
 # Each PBS-arm waveguide accepts a single polarization, so the per-port
-# single-mode sky etendue is n_pol * lambda^2 with n_pol = 1. Downstream
-# consumers multiply the per-port rate by the per-arm detector channel
-# count (2x the chip ports), recovering the same total sky as the scalar
-# n_pol = 2 convention; leaving the default 2 here double-counts sky.
+# single-mode sky etendue is n_pol * lambda^2 with n_pol = 1 (the default).
+# Downstream consumers multiply the per-port rate by the per-arm detector
+# channel count (2x the chip ports), recovering the total sky of both arms.
 [[pipeline.stages]]
 id = "background"
 n_polarizations = 1

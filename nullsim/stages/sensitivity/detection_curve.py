@@ -278,9 +278,9 @@ def _unitary_arm_weights(
 
 
 def _delay_line_diagnostic_payload(state: SimulationState) -> dict[str, Any] | None:
-    """Return the first geometric-delay diagnostic payload, if present."""
+    """Return the newest geometric-delay diagnostic payload, if present."""
 
-    for name, payload in state.throughput.components.items():
+    for name, payload in reversed(state.throughput.components.items()):
         if not name.startswith("delay_line_loss"):
             continue
         if not isinstance(payload, dict):
@@ -2305,7 +2305,7 @@ def _resolve_amp_servo_n_modes(
         if n_input_modes is not None and int(n_input_modes) > 0:
             return int(n_input_modes)
     chip_payload = None
-    for name, payload in state.results.components.items():
+    for name, payload in reversed(state.results.components.items()):
         if name.startswith("chip.kernel_mzi_mesh") and isinstance(payload, dict):
             chip_payload = payload
             break
@@ -3140,9 +3140,9 @@ def _detector_stellar_and_static_leakage_rates_hz(
 
 
 def _find_detector_component(state: SimulationState) -> Mapping[str, Any] | None:
-    """Return the first ``detector.*`` results component with port rates."""
+    """Return the newest ``detector.*`` results component with port rates."""
 
-    for name, value in state.results.components.items():
+    for name, value in reversed(state.results.components.items()):
         if not name.startswith("detector."):
             continue
         if not isinstance(value, Mapping):

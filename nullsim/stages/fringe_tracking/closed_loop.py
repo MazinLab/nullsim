@@ -346,6 +346,11 @@ class ClosedLoopFringeTracker(BaseStage):
             terms.common_differential
         )
         breakdown["sigma2_inter_telescope_rad2"] = float(terms.inter_telescope)
+        if params.inter_telescope_piston:
+            # The pair-averaged disturbance the servo acts on, for audit.
+            breakdown["inter_telescope_uncorrected_piston_rms_m"] = math.sqrt(
+                _inter_telescope_piston_variance_m2(state, params, self.type_name)
+            )
         breakdown["sigma2_vibration_rad2"] = float(terms.vibration)
         breakdown["servo_bandwidth_hz"] = float(f_3db_hz)
         breakdown["f_sample_hz"] = float(sample_rate_hz)

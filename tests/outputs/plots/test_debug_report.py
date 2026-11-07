@@ -406,6 +406,7 @@ def _photon_kalman_ft_payload() -> dict:
         "photon_kalman_total_common_nm": 11.3,
         "loop_latency_s": 5e-5,
         "crlb_m_sqrt_s": 8.1e-11,
+        "inter_telescope_uncorrected_piston_rms_m": 1.688e-6,
         "tracked_line_count": 6,
         "line_tracking_residual_floor_nm": 2.0,
         "accelerometer_fusion": True,
@@ -540,7 +541,7 @@ def test_ft_disturbance_panel_renders_photon_kalman_payload(tmp_path: Path) -> N
     assert "photon_kalman" in blob
     assert "Greenwood" in blob and "16.60 m/s" in blob and "10.00 m/s" in blob
     assert "12/30, 29/40" in blob          # vibration line spectrum
-    assert "uncorr sigma" in blob          # computed von Karman input
+    assert "uncorr sigma 1688 nm" in blob  # the stage's published value
     assert "19.3 nm effective" in blob     # post-fusion broadband floor
     assert "atmosphere" in blob            # superseded OPD component listed
 

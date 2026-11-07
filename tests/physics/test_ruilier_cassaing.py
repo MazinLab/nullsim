@@ -7,7 +7,9 @@ from scipy.optimize import brentq
 from scipy.special import j0
 
 from nullsim.physics.ruilier_cassaing import (
+    DIFFUSE_SINGLE_MODE_ACCEPTANCE,
     OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO,
+    UNOBSTRUCTED_GEOMETRIC_COUPLING_LIMIT,
     angular_coupling_amplitude,
     angular_coupling_factor,
     coupling_efficiency,
@@ -151,13 +153,13 @@ def test_angular_coupling_amplitude_first_zero_and_sign_change() -> None:
 
 
 @pytest.mark.parametrize("obscuration", [0.0, 0.3])
-@pytest.mark.parametrize("s", [0.0, 0.5, 5.0, 40.0])
+@pytest.mark.parametrize("s", [0.0, 0.5, 5.0, 40.0, 120.0, 500.0, 2000.0])
 def test_angular_coupling_amplitude_matches_adaptive_quadrature(
     obscuration: float, s: float
 ) -> None:
     rho = OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO
     profile = lambda u: u * np.exp(-((rho * u) ** 2))  # noqa: E731
-    num = quad(lambda u: profile(u) * j0(np.pi * s * u), obscuration, 1.0, limit=400)[0]
+    num = quad(lambda u: profile(u) * j0(np.pi * s * u), obscuration, 1.0, limit=4000)[0]
     den = quad(profile, obscuration, 1.0)[0]
 
     got = angular_coupling_amplitude(s, 1.0, 1.0, obscuration)
@@ -177,3 +179,27 @@ def test_angular_coupling_factor_broadcasts_and_scales_with_theta_d_over_lambda(
     )
     assert isinstance(angular_coupling_factor(0.0, 1.0, 1.0e-6), float)
     assert angular_coupling_factor(0.0, 1.0, 1.0e-6) == pytest.approx(1.0)
+
+
+def test_diffuse_acceptance_equals_integrated_point_source_coupling() -> None:
+    """Reciprocity: ``A eta(0) int a(theta)^2 dOmega = eta_d lambda^2``.
+
+    With ``s = theta D / lambda`` and ``A = pi D^2 / 4`` this reads
+    ``(pi^2 / 2) eta(0) int_0^inf a(s)^2 s ds = 1 - exp(-2 rho^2)``. Past
+    ``S = 60`` the oscillation-averaged asymptote
+    ``a^2 ~ exp(-2 rho^2) / (N0^2 pi^4 s^3)`` gives the tail in closed form.
+    """
+
+    rho = OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO
+    x, w = np.polynomial.legendre.leggauss(16)
+    edges = np.linspace(0.0, 60.0, 241)
+    mid, half = 0.5 * (edges[1:] + edges[:-1]), 0.5 * np.diff(edges)
+    s = (mid[:, None] + half[:, None] * x).ravel()
+    body = np.sum((half[:, None] * w).ravel() * angular_coupling_factor(s, 1.0, 1.0) * s)
+    n0 = (1.0 - np.exp(-(rho**2))) / (2.0 * rho**2)
+    tail = np.exp(-2.0 * rho**2) / (n0**2 * np.pi**4 * edges[-1])
+
+    integrated = np.pi**2 / 2.0 * UNOBSTRUCTED_GEOMETRIC_COUPLING_LIMIT * (body + tail)
+
+    assert DIFFUSE_SINGLE_MODE_ACCEPTANCE == pytest.approx(1.0 - np.exp(-2.0 * rho**2))
+    assert integrated == pytest.approx(DIFFUSE_SINGLE_MODE_ACCEPTANCE, rel=2e-5)

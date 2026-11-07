@@ -9,6 +9,7 @@ Strehl scaling convention used by Coudé du Foresto et al. (2000).
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 
 import numpy as np
@@ -33,12 +34,30 @@ land closer to 0.5-1%; the 3.5% value is the conservative paper-baseline.
 """
 
 
-_OFF_AXIS_QUADRATURE_NODES = 96
-"""Gauss-Legendre nodes for the off-axis overlap; matches adaptive quadrature
-to ~1e-16 for ``theta D / lambda`` up to at least 80."""
+DIFFUSE_SINGLE_MODE_ACCEPTANCE = 1.0 - math.exp(
+    -2.0 * OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO**2
+)
+"""Diffuse-light acceptance of a single-mode input behind a circular aperture.
 
-_OFF_AXIS_CHUNK = 8192
-"""Separations evaluated per block, bounding the (chunk, nodes) work array."""
+By the antenna theorem (Siegman 1966, Proc. IEEE 54, 1350) a single guided
+mode accepts the etendue A.Omega = lambda^2 of a uniform incoherent source of
+total-intensity surface brightness B, over both polarizations. A circular
+aperture of radius R in front of the input passes only the fraction
+``1 - exp(-2 rho^2)`` of the back-propagated Gaussian mode of field radius w,
+with ``rho = R / w``. At the Ruilier-Cassaing optimum rho = 1.1209 this is
+0.919, so the input collects ``B lambda^2 * 0.919`` per spectral bin. The
+point-source coupling eta = 0.8145 does not apply to diffuse light.
+Reciprocity ties the two: ``A eta(0) int a(theta)^2 dOmega = eta_d lambda^2``
+with ``a`` from :func:`angular_coupling_amplitude`.
+"""
+
+_OFF_AXIS_MIN_NODES = 96
+"""Gauss-Legendre nodes for ``theta D / lambda`` up to 48. Resolving
+``J0(pi s u)`` on ``[0, 1]`` takes about ``s`` nodes plus a margin, so larger
+``s`` raises the count (see ``_off_axis_node_count``)."""
+
+_OFF_AXIS_WORK = 8192 * _OFF_AXIS_MIN_NODES
+"""Bound on the (separations, nodes) work array per block."""
 
 
 def coupling_efficiency(
@@ -173,11 +192,13 @@ def angular_coupling_amplitude(
         * np.asarray(sub_diameter_m, dtype=np.float64)
         / np.asarray(wavelength_m, dtype=np.float64)
     )
-    nodes, weights = _off_axis_quadrature(float(central_obscuration_ratio))
     flat = s.ravel()
+    n_nodes = _off_axis_node_count(float(flat.max(initial=0.0)))
+    nodes, weights = _off_axis_quadrature(float(central_obscuration_ratio), n_nodes)
+    chunk = max(1, _OFF_AXIS_WORK // n_nodes)
     out = np.empty_like(flat)
-    for start in range(0, flat.size, _OFF_AXIS_CHUNK):
-        block = flat[start : start + _OFF_AXIS_CHUNK]
+    for start in range(0, flat.size, chunk):
+        block = flat[start : start + chunk]
         out[start : start + block.size] = j0(np.pi * np.outer(block, nodes)) @ weights
     return _as_scalar_if_zero_dim(out.reshape(s.shape))
 
@@ -210,16 +231,23 @@ def angular_coupling_factor(
     return _as_scalar_if_zero_dim(amplitude * amplitude)
 
 
-@lru_cache(maxsize=8)
+def _off_axis_node_count(s_max: float) -> int:
+    """Node count resolving ``J0(pi s u)`` for ``s <= s_max``, a multiple of 32."""
+
+    return max(_OFF_AXIS_MIN_NODES, 32 * math.ceil((s_max + 48.0) / 32.0))
+
+
+@lru_cache(maxsize=32)
 def _off_axis_quadrature(
     central_obscuration_ratio: float,
+    n_nodes: int,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Gauss-Legendre nodes on ``[eps, 1]`` with weights that fold in the mode
     profile ``u exp(-rho^2 u^2)`` and are normalized to sum to one."""
 
     eps = central_obscuration_ratio
     _validate_half_open_unit_interval(np.asarray(eps), "central_obscuration_ratio")
-    x, w = np.polynomial.legendre.leggauss(_OFF_AXIS_QUADRATURE_NODES)
+    x, w = np.polynomial.legendre.leggauss(n_nodes)
     u = eps + 0.5 * (1.0 - eps) * (x + 1.0)
     rho = OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO
     weights = w * u * np.exp(-((rho * u) ** 2))
