@@ -12,11 +12,18 @@ from nullsim.physics.fringe_observability import (  # noqa: E402
     intensity_response_matrix,
 )
 from nullsim.stages.chip_optimization.torch import (  # noqa: E402
+    _amplitude_observability_loss_torch,
+    _amplitude_observability_singular_values_torch,
+    _joint_phase_amplitude_observability_crlb_loss_torch,
+    _joint_phase_amplitude_observability_loss_torch,
+    _joint_phase_amplitude_observability_singular_values_torch,
+    _per_delay_state_singular_values_torch,
     _tracker_observability_losses_torch,
     _tracker_observability_singular_values_torch,
     _tracker_per_state_singular_values_torch,
     _tracker_rank_priority_selection_key,
     _tracker_worst_state_losses_torch,
+    _worst_delay_state_loss_torch,
 )
 
 _N_MODES = 4
@@ -154,3 +161,80 @@ def test_worst_delay_state_exposes_pointing_unobservable_alone() -> None:
         eps=_EPS,
     )
     assert key[0] == 1.0  # rank deficit of the blind state, not of the stack
+
+
+def _amplitude_joint_kwargs(inputs: dict) -> tuple[dict, dict]:
+    """Amplitude and joint helper kwargs on the same stacked channels."""
+
+    shared = {key: inputs[key] for key in (
+        "u_r", "u_i", "field_r_by_wl", "field_i_by_wl", "eps", "torch_mod"
+    )}
+    basis = inputs["piston_basis"]
+    amplitude = dict(shared, port_indices=inputs["bright_indices"],
+                     amplitude_basis=basis)
+    joint = dict(amplitude, wavelengths_m=inputs["wavelengths_m"],
+                 piston_basis=basis, amplitude_scale=0.02)
+    return amplitude, joint
+
+
+def test_amplitude_and_joint_observability_judge_each_delay_state() -> None:
+    rng = np.random.default_rng(17)
+    u = _unitary(rng)
+    u_by_wl = np.stack([u, u.conj()])
+    good = _field(rng)
+    # A weak pointing with mode 0 dark (heavy delay-line loss, say).
+    blind = 0.3 * good
+    blind[:, 0, :] = 0.0
+
+    # Identical states: per-state values equal the single pointing, and the
+    # stacked matrix carries the sqrt(n_states) inflation.
+    n_states = 6
+    amp1, joint1 = _amplitude_joint_kwargs(_channel_inputs(u_by_wl, [good]))
+    amp6, joint6 = _amplitude_joint_kwargs(
+        _channel_inputs(u_by_wl, [good] * n_states)
+    )
+    for fn, single, stacked in (
+        (_amplitude_observability_singular_values_torch, amp1, amp6),
+        (_joint_phase_amplitude_observability_singular_values_torch, joint1, joint6),
+    ):
+        expected = np.sort(fn(**single).numpy())
+        per_state = _per_delay_state_singular_values_torch(
+            fn, n_states, **stacked
+        ).numpy()
+        np.testing.assert_allclose(np.sort(per_state, axis=1),
+                                   np.tile(expected, (n_states, 1)), rtol=1e-10)
+        np.testing.assert_allclose(np.sort(fn(**stacked).numpy()),
+                                   np.sqrt(n_states) * expected, rtol=1e-10)
+
+    # A pointing blind to one mode: the worst-state penalty is the blind
+    # state's, which the stacked matrix hid behind the good pointing.
+    amp2, joint2 = _amplitude_joint_kwargs(_channel_inputs(u_by_wl, [good, blind]))
+    amp_b, joint_b = _amplitude_joint_kwargs(_channel_inputs(u_by_wl, [blind]))
+
+    def floor_between_states(fn, kwargs: dict) -> float:
+        good_min, blind_min = _per_delay_state_singular_values_torch(
+            fn, 2, **kwargs
+        ).numpy().min(axis=1)
+        assert blind_min < good_min
+        return float(np.sqrt(good_min * blind_min))
+
+    amp_floor = floor_between_states(
+        _amplitude_observability_singular_values_torch, amp2
+    )
+    joint_floor = floor_between_states(
+        _joint_phase_amplitude_observability_singular_values_torch, joint2
+    )
+    cases = (
+        (_amplitude_observability_loss_torch, amp2, amp_b,
+         dict(min_singular_per_fractional_intensity=amp_floor)),
+        (_joint_phase_amplitude_observability_loss_torch, joint2, joint_b,
+         dict(min_singular_per_scaled_mode=joint_floor)),
+        (_joint_phase_amplitude_observability_crlb_loss_torch, joint2, joint_b,
+         dict(target_per_scaled_mode=100.0)),
+    )
+    for fn, both, blind_only, extra in cases:
+        worst = _worst_delay_state_loss_torch(fn, 2, **both, **extra)
+        assert float(worst) == pytest.approx(
+            float(fn(**blind_only, **extra)), rel=1e-10
+        )
+        assert float(worst) > float(fn(**both, **extra))

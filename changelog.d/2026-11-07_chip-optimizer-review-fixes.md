@@ -20,7 +20,12 @@
     kilo_keck_6 (the 1.3e-2 floor acted as 5.3e-3). The published
     `tracker_observability_*_final` values describe the worst state;
     `tracker_observability_singular_values_per_nm_per_state_final` holds
-    all of them.
+    all of them. The amplitude and joint phase+amplitude observability
+    terms follow the same rule (kilo_keck_6's active joint CRLB term carried
+    the same sqrt(6)): their penalties act on the worst state, their
+    `*_final` values describe it, `*_singular_values_per_state_final` holds
+    every state, and `joint_observability_n_rows` and its rank check count
+    rows per state, so delay states no longer count toward joint rank.
   - `calibration_time` plot (Issue 23): plots the normalized null
     (`convergence_history_normalized_null`, the convention of
     `optimization_normalized_null_final`) instead of the dimensional

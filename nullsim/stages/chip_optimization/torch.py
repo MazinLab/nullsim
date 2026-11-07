@@ -880,7 +880,9 @@ class ChipOptimizationTorch(BaseStage):
                         "reference-power-weighted response singular values to "
                         "physical differential fractional-intensity modes. This "
                         "regularizer rewards estimability instead of making the "
-                        "science dark ports insensitive to amplitude perturbations."
+                        "science dark ports insensitive to amplitude perturbations. "
+                        "Each delay state is a separate pointing; the hinge acts "
+                        "on the worst state."
                     ),
                 }
             )
@@ -917,16 +919,17 @@ class ChipOptimizationTorch(BaseStage):
                 joint_field_source,
                 joint_n_field_states,
             ) = _selected_field_tensors(joint_wave_idx_np)
-            joint_n_rows = int(joint_idx_np.size) * int(joint_eval_wave_idx_t.numel())
+            # Rows per delay state: each state is its own response matrix.
+            joint_n_rows = int(joint_idx_np.size) * int(joint_wave_idx_np.size)
             joint_n_columns = 2 * int(amplitude_basis.chip_basis.shape[1])
             if joint_n_rows < joint_n_columns:
                 raise ValueError(
                     "chip_optimization.torch joint observability is rank-deficient "
-                    "by construction: selected ports × spectral/field states gives "
-                    f"{joint_n_rows} rows for {joint_n_columns} phase+amplitude "
-                    "modes. Increase joint_observability_n_spectral_channels, "
-                    "enable delay-state fields, select more ports, or disable the "
-                    "joint observability regularizer."
+                    "by construction: selected ports × spectral channels gives "
+                    f"{joint_n_rows} rows per delay state for {joint_n_columns} "
+                    "phase+amplitude modes. Increase "
+                    "joint_observability_n_spectral_channels, select more ports, "
+                    "or disable the joint observability regularizer."
                 )
             joint_wavelengths_m_t = wavelengths_m_all_t.index_select(
                 0,
@@ -978,7 +981,9 @@ class ChipOptimizationTorch(BaseStage):
                     "hinge penalizes weak singular modes; the optional CRLB "
                     "term softly minimizes sqrt(mean(1/s_i^2)); the optional "
                     "science-null guard penalizes candidates above the target "
-                    "null basin."
+                    "null basin. Each delay state is a separate pointing; the "
+                    "hinge and CRLB act on the worst state, and n_rows counts "
+                    "rows per state."
                 ),
             }
         else:
@@ -1128,7 +1133,9 @@ class ChipOptimizationTorch(BaseStage):
                     0,
                     amplitude_observability_eval_wave_idx_t,
                 )
-                amplitude_observability_loss = _amplitude_observability_loss_torch(
+                amplitude_observability_loss = _worst_delay_state_loss_torch(
+                    _amplitude_observability_loss_torch,
+                    n_delay_states,
                     u_r=u_r_amp_obs,
                     u_i=u_i_amp_obs,
                     field_r_by_wl=amplitude_observability_field_r_sel,
@@ -1156,7 +1163,9 @@ class ChipOptimizationTorch(BaseStage):
                 u_i_joint = u_i.index_select(0, joint_eval_wave_idx_t)
                 if params.joint_observability_weight > 0.0:
                     joint_observability_loss = (
-                        _joint_phase_amplitude_observability_loss_torch(
+                        _worst_delay_state_loss_torch(
+                            _joint_phase_amplitude_observability_loss_torch,
+                            n_delay_states,
                             u_r=u_r_joint,
                             u_i=u_i_joint,
                             field_r_by_wl=joint_field_r_sel,
@@ -1177,7 +1186,9 @@ class ChipOptimizationTorch(BaseStage):
                     )
                 if params.joint_observability_crlb_weight > 0.0:
                     joint_observability_crlb_loss = (
-                        _joint_phase_amplitude_observability_crlb_loss_torch(
+                        _worst_delay_state_loss_torch(
+                            _joint_phase_amplitude_observability_crlb_loss_torch,
+                            n_delay_states,
                             u_r=u_r_joint,
                             u_i=u_i_joint,
                             field_r_by_wl=joint_field_r_sel,
@@ -1652,7 +1663,9 @@ class ChipOptimizationTorch(BaseStage):
                 )
                 if amplitude_observability_active:
                     amplitude_observability_loss = (
-                        _amplitude_observability_loss_torch(
+                        _worst_delay_state_loss_torch(
+                            _amplitude_observability_loss_torch,
+                            n_delay_states,
                             u_r=u_r.unsqueeze(0).expand(
                                 bs_amplitude_n_channels,
                                 -1,
@@ -1687,7 +1700,9 @@ class ChipOptimizationTorch(BaseStage):
                 if joint_observability_active:
                     if params.joint_observability_weight > 0.0:
                         joint_observability_loss = (
-                            _joint_phase_amplitude_observability_loss_torch(
+                            _worst_delay_state_loss_torch(
+                                _joint_phase_amplitude_observability_loss_torch,
+                                n_delay_states,
                                 u_r=u_r.unsqueeze(0).expand(
                                     bs_amplitude_n_channels,
                                     -1,
@@ -1716,7 +1731,9 @@ class ChipOptimizationTorch(BaseStage):
                         )
                     if params.joint_observability_crlb_weight > 0.0:
                         joint_observability_crlb_loss = (
-                            _joint_phase_amplitude_observability_crlb_loss_torch(
+                            _worst_delay_state_loss_torch(
+                                _joint_phase_amplitude_observability_crlb_loss_torch,
+                                n_delay_states,
                                 u_r=u_r.unsqueeze(0).expand(
                                     bs_amplitude_n_channels,
                                     -1,
@@ -2232,47 +2249,37 @@ class ChipOptimizationTorch(BaseStage):
                 per_state_np = (
                     singular_t.detach().cpu().numpy().astype(np.float64, copy=False)
                 )
-            # Headline values describe the worst delay state (Issue 21): the
-            # state with the weakest mode, the largest CRLB, the lowest rank.
-            floor = float(params.tracker_observability_min_singular_per_nm)
-            tracker_eps = float(params.tracker_observability_eps)
-            n_dof = int(tracker_basis.chip_basis.shape[1])
-            if per_state_np.shape[1]:
-                singular_np = per_state_np[int(np.argmin(per_state_np.min(axis=1)))]
-                min_singular = float(np.min(singular_np))
-                condition = (
-                    float(np.max(singular_np) / min_singular)
-                    if min_singular > 0.0
-                    else float("inf")
-                )
-            else:
-                singular_np = per_state_np[0]
-                min_singular = 0.0
-                condition = float("inf")
+            # Headline values describe the worst delay state (Issue 21); the
+            # CRLB is the largest over states.
+            tracker = _worst_state_singular_summary(
+                per_state_np,
+                float(params.tracker_observability_min_singular_per_nm),
+                int(tracker_basis.chip_basis.shape[1]),
+            )
             crlb_rms_nm = max(
-                _tracker_crlb_rms_nm_from_singular_values(values, eps=tracker_eps)
+                _tracker_crlb_rms_nm_from_singular_values(
+                    values, eps=float(params.tracker_observability_eps)
+                )
                 for values in per_state_np
             )
             crlb_loss = (
                 crlb_rms_nm / float(params.tracker_observability_crlb_target_nm)
             ) ** 2
             tracker_final_metadata = {
-                "tracker_observability_singular_values_per_nm_final": tuple(
-                    float(value) for value in singular_np
+                "tracker_observability_singular_values_per_nm_final": (
+                    tracker["singular_values"]
                 ),
-                "tracker_observability_singular_values_per_nm_per_state_final": tuple(
-                    tuple(float(value) for value in values) for values in per_state_np
+                "tracker_observability_singular_values_per_nm_per_state_final": (
+                    tracker["singular_values_per_state"]
                 ),
-                "tracker_observability_min_singular_per_nm_final": min_singular,
-                "tracker_observability_condition_final": condition,
+                "tracker_observability_min_singular_per_nm_final": (
+                    tracker["min_singular"]
+                ),
+                "tracker_observability_condition_final": tracker["condition"],
                 "tracker_observability_crlb_rms_nm_final": float(crlb_rms_nm),
                 "tracker_observability_crlb_loss_final": float(crlb_loss),
-                "tracker_observability_rank_at_floor_final": int(
-                    np.min(np.count_nonzero(per_state_np >= floor, axis=1))
-                ),
-                "tracker_observability_floor_met_final": bool(
-                    per_state_np.shape[1] >= n_dof and np.all(per_state_np >= floor)
-                ),
+                "tracker_observability_rank_at_floor_final": tracker["rank_at_floor"],
+                "tracker_observability_floor_met_final": tracker["floor_met"],
             }
 
         amplitude_final_metadata: dict[str, Any] = {}
@@ -2325,7 +2332,9 @@ class ChipOptimizationTorch(BaseStage):
             }
         if amplitude_observability_active:
             with torch_mod.no_grad():
-                singular_t = _amplitude_observability_singular_values_torch(
+                singular_t = _per_delay_state_singular_values_torch(
+                    _amplitude_observability_singular_values_torch,
+                    n_delay_states,
                     u_r=u_r_opt_diag.index_select(
                         0,
                         amplitude_observability_eval_wave_idx_t,
@@ -2344,41 +2353,32 @@ class ChipOptimizationTorch(BaseStage):
                 amp_singular_np = (
                     singular_t.detach().cpu().numpy().astype(np.float64, copy=False)
                 )
-            amp_floor = float(
-                params.amplitude_observability_min_singular_per_fractional_intensity
+            amp = _worst_state_singular_summary(
+                amp_singular_np,
+                float(params.amplitude_observability_min_singular_per_fractional_intensity),
+                int(amplitude_basis.chip_basis.shape[1]),
             )
-            if amp_singular_np.size:
-                amp_min_singular = float(np.min(amp_singular_np))
-                amp_max_singular = float(np.max(amp_singular_np))
-                amp_condition = (
-                    float(amp_max_singular / amp_min_singular)
-                    if amp_min_singular > 0.0
-                    else float("inf")
-                )
-            else:
-                amp_min_singular = 0.0
-                amp_condition = float("inf")
             amplitude_final_metadata.update(
                 {
-                    "amplitude_observability_singular_values_final": tuple(
-                        float(value) for value in amp_singular_np
+                    "amplitude_observability_singular_values_final": (
+                        amp["singular_values"]
                     ),
-                    "amplitude_observability_min_singular_final": amp_min_singular,
-                    "amplitude_observability_condition_final": amp_condition,
-                    "amplitude_observability_rank_at_floor_final": int(
-                        np.count_nonzero(amp_singular_np >= amp_floor)
+                    "amplitude_observability_singular_values_per_state_final": (
+                        amp["singular_values_per_state"]
                     ),
-                    "amplitude_observability_floor_met_final": bool(
-                        amp_singular_np.size >= amplitude_basis.chip_basis.shape[1]
-                        and np.all(amp_singular_np >= amp_floor)
-                    ),
+                    "amplitude_observability_min_singular_final": amp["min_singular"],
+                    "amplitude_observability_condition_final": amp["condition"],
+                    "amplitude_observability_rank_at_floor_final": amp["rank_at_floor"],
+                    "amplitude_observability_floor_met_final": amp["floor_met"],
                 }
             )
 
         joint_final_metadata: dict[str, Any] = {}
         if joint_observability_active:
             with torch_mod.no_grad():
-                singular_t = _joint_phase_amplitude_observability_singular_values_torch(
+                singular_t = _per_delay_state_singular_values_torch(
+                    _joint_phase_amplitude_observability_singular_values_torch,
+                    n_delay_states,
                     u_r=u_r_opt_diag.index_select(0, joint_eval_wave_idx_t),
                     u_i=u_i_opt_diag.index_select(0, joint_eval_wave_idx_t),
                     field_r_by_wl=joint_field_r_sel,
@@ -2394,41 +2394,28 @@ class ChipOptimizationTorch(BaseStage):
                 joint_singular_np = (
                     singular_t.detach().cpu().numpy().astype(np.float64, copy=False)
                 )
-            joint_floor = float(
-                params.joint_observability_min_singular_per_scaled_mode
-            )
-            if joint_singular_np.size:
-                joint_min_singular = float(np.min(joint_singular_np))
-                joint_max_singular = float(np.max(joint_singular_np))
-                joint_condition = (
-                    float(joint_max_singular / joint_min_singular)
-                    if joint_min_singular > 0.0
-                    else float("inf")
-                )
-            else:
-                joint_min_singular = 0.0
-                joint_condition = float("inf")
             joint_n_modes = 2 * int(amplitude_basis.chip_basis.shape[1])
+            joint = _worst_state_singular_summary(
+                joint_singular_np,
+                float(params.joint_observability_min_singular_per_scaled_mode),
+                joint_n_modes,
+            )
             joint_final_metadata = {
-                "joint_observability_singular_values_final": tuple(
-                    float(value) for value in joint_singular_np
+                "joint_observability_singular_values_final": joint["singular_values"],
+                "joint_observability_singular_values_per_state_final": (
+                    joint["singular_values_per_state"]
                 ),
-                "joint_observability_min_singular_final": joint_min_singular,
-                "joint_observability_condition_final": joint_condition,
+                "joint_observability_min_singular_final": joint["min_singular"],
+                "joint_observability_condition_final": joint["condition"],
                 "joint_observability_n_modes_final": joint_n_modes,
-                "joint_observability_rank_at_floor_final": int(
-                    np.count_nonzero(joint_singular_np >= joint_floor)
-                ),
+                "joint_observability_rank_at_floor_final": joint["rank_at_floor"],
                 # Only meaningful when the hinge term enforced the floor;
                 # in CRLB-only runs (weight=0, crlb_weight>0) the floor was
                 # never part of the objective (review 2026-06-10).
                 "joint_observability_floor_enforced": bool(
                     params.joint_observability_weight > 0.0
                 ),
-                "joint_observability_floor_met_final": bool(
-                    joint_singular_np.size >= joint_n_modes
-                    and np.all(joint_singular_np >= joint_floor)
-                ),
+                "joint_observability_floor_met_final": joint["floor_met"],
             }
 
         # Finding 3 fix: the torch backend's _clements_unitary_ri uses
@@ -2974,72 +2961,94 @@ def _tracker_observability_losses_torch(
     return hinge, crlb
 
 
-def _tracker_worst_state_losses_torch(
-    *,
-    n_states: int,
-    u_r: Any,
-    u_i: Any,
-    field_r_by_wl: Any,
-    field_i_by_wl: Any,
-    wavelengths_m: Any,
-    torch_mod: Any,
-    **kwargs: Any,
-) -> tuple[Any, Any]:
-    """Tracker hinge and CRLB penalties of the worst delay state.
+_CHANNEL_AXIS_KWARGS = ("u_r", "u_i", "field_r_by_wl", "field_i_by_wl", "wavelengths_m")
 
-    The tracker channel axis is wavelength-major with ``n_states`` delay
-    states innermost. The tracker sees one pointing at a time, so the states
-    are alternatives, not simultaneous measurements: each state gets its own
-    response matrix and the penalties take the maximum over states. Stacking
-    them into one matrix scaled every singular value by ``sqrt(n_states)``
-    for identical states and could hide a state that is unobservable alone
-    (review 2026-11-07 Issue 21).
+
+def _per_delay_state_torch(fn: Any, n_states: int, **kwargs: Any) -> list[Any]:
+    """Evaluate an observability helper once per delay state.
+
+    Observability channel axes are wavelength-major with ``n_states`` delay
+    states innermost, so ``x[state::n_states]`` selects one state. The
+    fringe tracker sees one pointing at a time: the states are alternatives,
+    not simultaneous measurements. Stacking them into one response matrix
+    scaled every singular value by ``sqrt(n_states)`` for identical states
+    and could hide a state that is unobservable alone (review 2026-11-07
+    Issue 21), so each state gets its own matrix and callers act on the
+    worst one.
     """
 
-    hinges, crlbs = zip(*(
-        _tracker_observability_losses_torch(
-            u_r=u_r[state::n_states],
-            u_i=u_i[state::n_states],
-            field_r_by_wl=field_r_by_wl[state::n_states],
-            field_i_by_wl=field_i_by_wl[state::n_states],
-            wavelengths_m=wavelengths_m[state::n_states],
-            torch_mod=torch_mod,
-            **kwargs,
-        )
+    return [
+        fn(**{
+            key: (value[state::n_states] if key in _CHANNEL_AXIS_KWARGS else value)
+            for key, value in kwargs.items()
+        })
         for state in range(int(n_states))
+    ]
+
+
+def _worst_delay_state_loss_torch(fn: Any, n_states: int, **kwargs: Any) -> Any:
+    """Largest per-state value of a scalar observability penalty."""
+
+    return kwargs["torch_mod"].stack(_per_delay_state_torch(fn, n_states, **kwargs)).max()
+
+
+def _per_delay_state_singular_values_torch(
+    fn: Any, n_states: int, **kwargs: Any
+) -> Any:
+    """Per-state singular values, shape ``(n_states, n_modes)``."""
+
+    return kwargs["torch_mod"].stack(_per_delay_state_torch(fn, n_states, **kwargs))
+
+
+def _tracker_worst_state_losses_torch(*, n_states: int, **kwargs: Any) -> tuple[Any, Any]:
+    """Tracker hinge and CRLB penalties of the worst delay state."""
+
+    hinges, crlbs = zip(*_per_delay_state_torch(
+        _tracker_observability_losses_torch, n_states, **kwargs
     ))
+    torch_mod = kwargs["torch_mod"]
     return torch_mod.stack(hinges).max(), torch_mod.stack(crlbs).max()
 
 
-def _tracker_per_state_singular_values_torch(
-    *,
-    n_states: int,
-    u_r: Any,
-    u_i: Any,
-    field_r_by_wl: Any,
-    field_i_by_wl: Any,
-    wavelengths_m: Any,
-    torch_mod: Any,
-    **kwargs: Any,
-) -> Any:
-    """Tracker singular values per delay state, shape ``(n_states, n_dof)``.
+def _tracker_per_state_singular_values_torch(*, n_states: int, **kwargs: Any) -> Any:
+    """Tracker singular values per delay state, shape ``(n_states, n_dof)``."""
 
-    Same wavelength-major, state-innermost channel layout as
-    ``_tracker_worst_state_losses_torch``.
+    return _per_delay_state_singular_values_torch(
+        _tracker_observability_singular_values_torch, n_states, **kwargs
+    )
+
+
+def _worst_state_singular_summary(
+    per_state: NDArray[np.float64],
+    floor: float,
+    n_modes: int,
+) -> dict[str, Any]:
+    """Headline observability values of the worst delay state.
+
+    The worst state is the one with the weakest mode; rank at floor is the
+    minimum over states and the floor is met only if every state meets it.
     """
 
-    return torch_mod.stack([
-        _tracker_observability_singular_values_torch(
-            u_r=u_r[state::n_states],
-            u_i=u_i[state::n_states],
-            field_r_by_wl=field_r_by_wl[state::n_states],
-            field_i_by_wl=field_i_by_wl[state::n_states],
-            wavelengths_m=wavelengths_m[state::n_states],
-            torch_mod=torch_mod,
-            **kwargs,
+    if per_state.shape[1]:
+        values = per_state[int(np.argmin(per_state.min(axis=1)))]
+        min_singular = float(np.min(values))
+        condition = (
+            float(np.max(values) / min_singular) if min_singular > 0.0 else float("inf")
         )
-        for state in range(int(n_states))
-    ])
+    else:
+        values = per_state[0]
+        min_singular = 0.0
+        condition = float("inf")
+    return {
+        "singular_values": tuple(float(value) for value in values),
+        "singular_values_per_state": tuple(
+            tuple(float(value) for value in row) for row in per_state
+        ),
+        "min_singular": min_singular,
+        "condition": condition,
+        "rank_at_floor": int(np.min(np.count_nonzero(per_state >= floor, axis=1))),
+        "floor_met": bool(per_state.shape[1] >= n_modes and np.all(per_state >= floor)),
+    }
 
 
 def _tracker_observability_loss_torch(

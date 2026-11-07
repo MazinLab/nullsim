@@ -1599,6 +1599,10 @@ def test_torch_stage_with_delay_states_runs(
             "delay_state_n_azimuths": 2,
             "tracker_observability_weight": 1.0e-3,
             "tracker_observability_n_spectral_channels": 2,
+            "amplitude_observability_weight": 1.0e-3,
+            "amplitude_observability_n_spectral_channels": 2,
+            "joint_observability_crlb_weight": 1.0e-3,
+            "joint_observability_n_spectral_channels": 2,
         },
         _context(tmp_path, instance_id="chip_opt_torch_delay_states"),
     )
@@ -1617,6 +1621,14 @@ def test_torch_stage_with_delay_states_runs(
     assert payload["delay_state_field_shape"] == (2, 2, 3, 1)
     assert payload["tracker_observability_field_source"] == "delay_state_fields"
     assert payload["tracker_observability_n_field_states"] == 2
+    # Observability is judged per delay state (review 2026-11-07 Issue 21).
+    for key in (
+        "tracker_observability_singular_values_per_nm_per_state_final",
+        "amplitude_observability_singular_values_per_state_final",
+        "joint_observability_singular_values_per_state_final",
+    ):
+        assert len(payload[key]) == 2
+    assert payload["joint_observability_n_rows"] == 4  # 2 ports x 2 channels
 
 
 @pytest.mark.parametrize("backend", ["torch"])
