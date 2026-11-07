@@ -1604,6 +1604,20 @@ def test_inter_telescope_piston_uses_geometry_baseline_and_primary(
     ) * 1.0e6
     assert unknown_um == pytest.approx(sigma_um, rel=1e-3)
 
+    # Line-of-sight r0 = r0 X^(-3/5) and variance ~ r0^(-5/3): sigma ~ X^(1/2).
+    ao = dict(keck.wavefront.components["ao_residual"], airmass=2.0)
+    tilted = replace(
+        keck,
+        wavefront=replace(
+            keck.wavefront,
+            components={**keck.wavefront.components, "ao_residual": ao},
+        ),
+    )
+    tilted_um = math.sqrt(
+        _inter_telescope_piston_variance_m2(tilted, params, "test")
+    ) * 1.0e6
+    assert tilted_um == pytest.approx(sigma_um * math.sqrt(2.0), rel=1e-9)
+
     # The stage publishes the same disturbance for the debug report.
     stage = _stage(_context(tmp_path), inter_telescope_piston=True)
     published = stage.apply(keck).results.components["fringe_tracking.closed_loop"]

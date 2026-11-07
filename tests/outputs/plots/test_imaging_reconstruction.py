@@ -15,6 +15,7 @@ from nullsim.outputs import RunCollection, RunRecord
 from nullsim.outputs.plots.imaging_reconstruction import (
     _build_imaging_inputs,
     _planet_views,
+    _stellar_rates_by_wavelength,
     imaging_reconstruction,
 )
 from nullsim.physics.reflected_light import reflected_light_contrast
@@ -392,3 +393,25 @@ def _imaging_state(performance_overrides: dict | None = None) -> SimulationState
         photon_rates=photon_rates,
         results=results,
     )
+
+
+def test_stellar_weights_use_true_wavelength_rates_not_mkid_redistributed() -> None:
+    """Optical responses are evaluated at true wavelengths, so the spectral
+    weights come from the detector's pre-redistribution, uncapped rates."""
+
+    state = SimulationState.empty({"wavelength_grid_um": (0.95, 1.0, 1.05)})
+    true_rates = np.array([[3.0, 1.0, 0.0], [1.0, 1.0, 0.0]])
+    state = replace(
+        state,
+        photon_rates=PhotonRates(rates_hz=np.ones((2, 3))),  # MKID-smeared
+        results=Results().add_component(
+            "detector.mkid",
+            {"pre_energy_response_port_rate_hz_per_wavelength": true_rates},
+        ),
+    )
+
+    weights = _stellar_rates_by_wavelength(
+        state=state, wavelength_indices=(0, 1, 2), total_rate_hz=6.0e3
+    )
+
+    np.testing.assert_allclose(weights, [4.0e3, 2.0e3, 0.0])

@@ -1226,7 +1226,7 @@ def _stellar_rates_by_wavelength(
     wavelength_indices: tuple[int, ...],
     total_rate_hz: float,
 ) -> NDArray[np.float64]:
-    rates = state.photon_rates.rates_hz
+    rates, source = _true_port_rates_by_wavelength(state)
     if rates is None:
         return _uniform_rates_by_wavelength(
             total_rate_hz=total_rate_hz,
@@ -1242,8 +1242,25 @@ def _stellar_rates_by_wavelength(
     return _rescaled_rates_by_wavelength(
         selected,
         total_rate_hz=total_rate_hz,
-        name="state.photon_rates.rates_hz",
+        name=source,
     )
+
+
+def _true_port_rates_by_wavelength(state: SimulationState) -> tuple[Any, str]:
+    """Per-port, per-bin rates at true wavelengths, before MKID energy
+    redistribution and the saturation cap; these weight optical responses
+    that are evaluated at true wavelengths."""
+
+    for name, payload in reversed(state.results.components.items()):
+        if not name.startswith("detector.") or not isinstance(payload, dict):
+            continue
+        for key in (
+            "pre_energy_response_port_rate_hz_per_wavelength",
+            "uncapped_port_rate_hz_per_wavelength",
+        ):
+            if payload.get(key) is not None:
+                return payload[key], f"{name}.{key}"
+    return state.photon_rates.rates_hz, "state.photon_rates.rates_hz"
 
 
 def _background_rates_by_wavelength(

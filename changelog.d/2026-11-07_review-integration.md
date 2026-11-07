@@ -29,3 +29,11 @@ point-aperture limit (2.354 um where the stage uses 1.688 um for Keck-Keck).
 Config comments: kilo_keck_6's sky polarization note matches the new
 n_polarizations default, hwo_space drops the deprecated zodi `routing` key and
 describes the new routing, and the NAYRA configs give the 11.1 m obstruction.
+
+The external review of the fixes found two more defects outside the package
+follow-ups. `fringe_tracking.closed_loop` now evaluates the inter-telescope
+von Karman piston at the line-of-sight r0, r0_zenith X^(-3/5), from the AO or
+atmosphere payload's airmass. At kilo_keck_6's airmass 1.155 the uncorrected
+Keck-Keck piston rises from 1.688 to 1.814 um. Imaging weights its broadband
+responses by the detector's per-bin rates at true wavelengths, before MKID
+energy redistribution and the saturation cap.

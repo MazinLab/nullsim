@@ -1181,13 +1181,19 @@ def _common_disturbance_terms_rad2(
 
 
 def _resolve_r0_500nm_m(state: SimulationState, stage_name: str) -> float:
-    ao_payload = state.wavefront.components.get("ao_residual")
-    if isinstance(ao_payload, dict):
-        value = ao_payload.get("r0_500nm_m")
-        if value is not None:
-            r0_500nm_m = float(value)
-            if math.isfinite(r0_500nm_m) and r0_500nm_m > 0.0:
-                return r0_500nm_m
+    """Return r0 at 500 nm along the line of sight, ``r0_zenith X^(-3/5)``.
+
+    The AO and atmosphere payloads store the zenith r0 beside the airmass
+    they applied; the bare ``wavefront.r0_at_500nm_m`` fallback is zenith.
+    """
+
+    for name in ("ao_residual", "atmosphere"):
+        payload = state.wavefront.components.get(name)
+        if not isinstance(payload, dict) or payload.get("r0_500nm_m") is None:
+            continue
+        r0_500nm_m = float(payload["r0_500nm_m"])
+        if math.isfinite(r0_500nm_m) and r0_500nm_m > 0.0:
+            return r0_500nm_m * float(payload.get("airmass") or 1.0) ** -0.6
     if state.wavefront.r0_at_500nm_m is not None:
         r0_500nm_m = float(state.wavefront.r0_at_500nm_m)
         if math.isfinite(r0_500nm_m) and r0_500nm_m > 0.0:
