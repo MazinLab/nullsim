@@ -1,10 +1,21 @@
-"""Space-based local-zodi and exozodi background model."""
+"""Space-based local-zodi and exozodi background model.
+
+Both terms are diffuse. Each single-mode input collects ``B lambda^2 eta_d``
+per spectral bin from a surface brightness B (antenna theorem; see
+``nayra_sky.DIFFUSE_SINGLE_MODE_ACCEPTANCE``), with no point-source coupling.
+Local zodi is uniform across the field, so output j receives
+``sum_k |(U S)_jk|^2`` of one input's share through the deployed chip.
+Exozodi falls off with stellocentric radius, so its effective brightness is
+the profile averaged with the position-angle-averaged dark transmission
+T_dark(r) as weight.
+"""
 
 from __future__ import annotations
 
+import logging
 import math
-from dataclasses import dataclass, replace
-from typing import Literal, cast
+from dataclasses import replace
+from typing import Any, Literal, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -19,16 +30,24 @@ from nullsim.physics.photometry import (
     photon_rate_per_m2_per_bin,
     stellar_band_magnitude_from_jmag,
 )
+from nullsim.physics.planet_throughput import compute_planet_throughput_vs_separation
 from nullsim.pipeline import BaseStage, SimulationState, register_stage
+from nullsim.stages._mode_splitter import (
+    component_mode_areas_m2,
+    component_mode_diameters_m,
+)
 from nullsim.stages._science_bands import infer_band_from_wavelength_um
 from nullsim.stages._utils import unique_component_name
 from nullsim.stages.background.nayra_sky import (
+    ARCSEC2_PER_STERADIAN,
+    DIFFUSE_SINGLE_MODE_ACCEPTANCE,
     _bandwidth_per_bin_um,
-    _field_applied_throughput_or_unity,
+    _diffuse_port_routing,
+    _latest_chip_transfer,
+    _rate_throughput_or_unity,
+    _require_wavelength_grid_um,
     _resolve_area_per_sub_m2,
     _resolve_n_subapertures,
-    _throughput_or_unity,
-    _require_wavelength_grid_um,
 )
 
 
@@ -39,6 +58,7 @@ __all__ = [
     "SpaceZodiBackground",
 ]
 
+_LOG = logging.getLogger(__name__)
 
 DEFAULT_LOCAL_ZODI_V_MAG_ARCSEC2 = 22.7
 DEFAULT_EXOZODI_V_MAG_ARCSEC2 = 22.0
@@ -54,15 +74,15 @@ _SOLAR_V_MINUS_BAND = {
     "K": 1.56,
 }
 _ARCSEC_PER_RAD = 206_264.80624709636
-
-
-@dataclass(frozen=True)
-class _RoutingThroughput:
-    throughput: float
-    source: str
-    n_dark_ports: int
-    separations_mas: NDArray[np.float64] | None = None
-    throughputs_per_sep: NDArray[np.float64] | None = None
+# Blackbody grain equilibrium temperature at 1 AU from the Sun, and the
+# silicate sublimation temperature that sets the dust disk's inner edge.
+_BLACKBODY_TEMPERATURE_1AU_K = 278.3
+_DUST_SUBLIMATION_TEMPERATURE_K = 1500.0
+# T(r) quadrature for the exozodi weight: log grid out to this many
+# lambda_max / D_mode_min.
+_EXOZODI_PROFILE_MAX_LAMBDA_OVER_D = 20.0
+_EXOZODI_PROFILE_N_RADII = 240
+_EXOZODI_PROFILE_N_PA = 36
 
 
 @register_stage
@@ -112,17 +132,23 @@ class SpaceZodiBackground(BaseStage):
             default=DEFAULT_LOCAL_ZODI_V_MAG_ARCSEC2,
             gt=0.0,
         )
+        # 1-zodi exozodi surface brightness at 1 AU from a solar twin.
         exozodi_v_mag_arcsec2: float = PydanticField(
             default=DEFAULT_EXOZODI_V_MAG_ARCSEC2,
             gt=0.0,
         )
         derive_exozodi_mag_from_scene_jmag: bool = True
         default_spectral_type: str = "G"
+        # Optional fixed solid angle per input; default is the single-mode
+        # etendue eta_d lambda^2 / A per bin.
         spaxel_arcsec2: float | None = PydanticField(default=None, gt=0.0)
-        aperture_area_lam_over_d2: float = PydanticField(default=1.0, gt=0.0)
-        routing: Literal["scene_planet_throughput", "dark_fraction"] = (
-            "scene_planet_throughput"
-        )
+        # "chip_unitary" is the only model. The legacy values still load and
+        # route the same way (review 2026-11-07 Issue 2a).
+        routing: Literal[
+            "chip_unitary",
+            "scene_planet_throughput",
+            "dark_fraction",
+        ] = "chip_unitary"
         n_subapertures: int | None = PydanticField(default=None, ge=1)
         area_source: Literal["effective", "collecting_area_per_mode"] = "effective"
 
@@ -139,7 +165,14 @@ class SpaceZodiBackground(BaseStage):
 
     def apply(self, state: SimulationState) -> SimulationState:
         params = self.params_model
+        if params.routing != "chip_unitary":
+            _LOG.warning(
+                "background.space_zodi routing=%r is deprecated; zodi is routed "
+                "through the deployed chip unitary.",
+                params.routing,
+            )
         wavelength_grid_um = _require_wavelength_grid_um(state)
+        n_bins = len(wavelength_grid_um)
         band = _resolve_band(params.band, wavelength_grid_um)
         n_subapertures = _resolve_n_subapertures(state, params.n_subapertures)
         area_per_sub_m2 = _resolve_area_per_sub_m2(
@@ -148,41 +181,30 @@ class SpaceZodiBackground(BaseStage):
             area_source=params.area_source,
         )
         spaxel_arcsec2 = _resolve_spaxel_arcsec2(
-            state=state,
             wavelength_grid_um=wavelength_grid_um,
+            area_per_sub_m2=area_per_sub_m2,
             configured=params.spaxel_arcsec2,
-            aperture_area_lam_over_d2=params.aperture_area_lam_over_d2,
+        )
+        bandwidth_um = _bandwidth_per_bin_um(wavelength_grid_um)
+        throughput = _rate_throughput_or_unity(state, n_bins)
+        # m^2 arcsec^2 collected by one physical input (per PBS arm).
+        per_input_etendue = float(area_per_sub_m2) * spaxel_arcsec2 * throughput
+        routing, dark_indices, routing_source = _diffuse_port_routing(state, n_bins)
+        route_dark = np.mean(routing[dark_indices], axis=0)
+        route_all = np.mean(routing, axis=0)
+        n_dark_ports, _n_total_ports = _detector_port_counts(state)
+
+        local_mag = _surface_brightness_in_band(params.local_zodi_v_mag_arcsec2, band)
+        local_sb_per_bin = float(params.local_zodi_level) * _photon_rate_per_bin(
+            local_mag, wavelength_grid_um, bandwidth_um, band
         )
 
-        bandwidth_um = _bandwidth_per_bin_um(wavelength_grid_um)
-        throughput = _space_rate_throughput_or_unity(state, len(wavelength_grid_um))
-        routing = _resolve_routing_throughput(
-            state,
-            routing=params.routing,
-        )
-        collecting_area_m2 = float(area_per_sub_m2) * int(n_subapertures)
-        local_mag = _surface_brightness_in_band(
-            params.local_zodi_v_mag_arcsec2,
-            band,
-        )
-        exozodi_mag, exozodi_mag_source, host_star_mag = _exozodi_mag_arcsec2(
+        exozodi = _exozodi_mag_at_1au(
             state=state,
             band=band,
             reference_v_mag_arcsec2=float(params.exozodi_v_mag_arcsec2),
             derive_from_scene=bool(params.derive_exozodi_mag_from_scene_jmag),
             default_spectral_type=str(params.default_spectral_type),
-        )
-        local_base_rate_per_bin_hz = _surface_brightness_rate_per_bin_hz(
-            mag_arcsec2=local_mag,
-            level=float(params.local_zodi_level),
-            wavelength_grid_um=wavelength_grid_um,
-            bandwidth_um=bandwidth_um,
-            band=band,
-            collecting_area_m2=collecting_area_m2,
-            spaxel_arcsec2=spaxel_arcsec2,
-            throughput=throughput,
-            routing_throughput=1.0,
-            n_dark_ports=routing.n_dark_ports,
         )
         exozodi_level, exozodi_level_source = _resolve_exozodi_level(
             state,
@@ -194,28 +216,44 @@ class SpaceZodiBackground(BaseStage):
             float(exozodi_level)
             * float(exozodi_morphology["surface_brightness_multiplier"])
         )
-        exozodi_base_rate_per_bin_hz = _surface_brightness_rate_per_bin_hz(
-            mag_arcsec2=exozodi_mag,
-            level=exozodi_effective_level,
-            wavelength_grid_um=wavelength_grid_um,
-            bandwidth_um=bandwidth_um,
-            band=band,
-            collecting_area_m2=collecting_area_m2,
-            spaxel_arcsec2=spaxel_arcsec2,
-            throughput=throughput,
-            routing_throughput=1.0,
-            n_dark_ports=routing.n_dark_ports,
+        exozodi_sb_1au_per_bin = exozodi_effective_level * _photon_rate_per_bin(
+            exozodi["mag_arcsec2"], wavelength_grid_um, bandwidth_um, band
         )
-        local_rate_per_bin_hz = local_base_rate_per_bin_hz * routing.throughput
-        exozodi_rate_per_bin_hz = exozodi_base_rate_per_bin_hz * routing.throughput
+        distance_pc = state.scene.star_distance_pc
+        inner_radius_au = _dust_inner_radius_au(exozodi["luminosity_lsun"])
+        if exozodi_effective_level > 0.0:
+            if distance_pc is None or distance_pc <= 0.0:
+                raise ValueError(
+                    "background.space_zodi requires scene.star_distance_pc for a "
+                    "nonzero exozodi level."
+                )
+            profile_dark, profile_all = (
+                _exozodi_profile_weight(
+                    state,
+                    wavelength_grid_um=wavelength_grid_um,
+                    port_indices=indices,
+                    distance_pc=float(distance_pc),
+                    inner_radius_au=inner_radius_au,
+                )
+                for indices in (dark_indices, np.arange(routing.shape[0]))
+            )
+        else:
+            profile_dark = profile_all = 0.0
+
+        local_rate_per_bin_hz = local_sb_per_bin * per_input_etendue * route_dark
+        exozodi_rate_per_bin_hz = (
+            exozodi_sb_1au_per_bin * profile_dark * per_input_etendue * route_dark
+        )
         total_rate_per_bin_hz = local_rate_per_bin_hz + exozodi_rate_per_bin_hz
         local_rate_hz_per_port = float(np.sum(local_rate_per_bin_hz))
         exozodi_rate_hz_per_port = float(np.sum(exozodi_rate_per_bin_hz))
         background_rate_hz_per_port = float(np.sum(total_rate_per_bin_hz))
-        curve_background_payload = _curve_background_payload(
-            routing=routing,
-            local_base_rate_per_bin_hz=local_base_rate_per_bin_hz,
-            exozodi_base_rate_per_bin_hz=exozodi_base_rate_per_bin_hz,
+        spectro_rate_hz_per_port = float(
+            np.sum(
+                (local_sb_per_bin + exozodi_sb_1au_per_bin * profile_all)
+                * per_input_etendue
+                * route_all
+            )
         )
 
         component_name = unique_component_name(
@@ -253,28 +291,42 @@ class SpaceZodiBackground(BaseStage):
             "local_zodi_v_mag_arcsec2": float(params.local_zodi_v_mag_arcsec2),
             "exozodi_v_mag_arcsec2": float(params.exozodi_v_mag_arcsec2),
             "local_zodi_mag_arcsec2": float(local_mag),
-            "exozodi_mag_arcsec2": float(exozodi_mag),
-            "exozodi_mag_source": exozodi_mag_source,
-            "host_star_mag_for_exozodi": (
-                None if host_star_mag is None else float(host_star_mag)
-            ),
+            # 1-zodi band surface brightness at 1 AU, before level scaling.
+            "exozodi_mag_arcsec2": float(exozodi["mag_arcsec2"]),
+            "exozodi_mag_source": exozodi["source"],
+            "host_star_mag_for_exozodi": exozodi["apparent_mag"],
+            "host_star_abs_mag_for_exozodi": exozodi["absolute_mag"],
+            "star_distance_pc": None if distance_pc is None else float(distance_pc),
             "derive_exozodi_mag_from_scene_jmag": bool(
                 params.derive_exozodi_mag_from_scene_jmag
             ),
-            "spaxel_arcsec2": float(spaxel_arcsec2),
-            "aperture_area_lam_over_d2": float(params.aperture_area_lam_over_d2),
+            "exozodi_inner_radius_au": float(inner_radius_au),
+            "exozodi_profile_weight_dark": float(profile_dark),
+            "exozodi_profile_weight_all_ports": float(profile_all),
+            # Unrouted, band-integrated brightness at the telescope entrance
+            # (photons / s / m^2 / arcsec^2), before throughput and QE.
+            "local_zodi_rate_hz_per_m2_per_arcsec2": float(np.sum(local_sb_per_bin)),
+            "exozodi_rate_hz_per_m2_per_arcsec2_at_scene_separation": (
+                _exozodi_sb_at_scene_separation(
+                    state, float(np.sum(exozodi_sb_1au_per_bin)), inner_radius_au
+                )
+            ),
+            # Band-center value for display; rates use the per-bin array.
+            "spaxel_arcsec2": float(spaxel_arcsec2[n_bins // 2]),
+            "spaxel_arcsec2_per_bin": spaxel_arcsec2.astype(np.float64, copy=True),
             "n_subapertures": int(n_subapertures),
             "area_source": params.area_source,
             "area_per_sub_m2": float(area_per_sub_m2),
-            "collecting_area_m2": float(collecting_area_m2),
+            "collecting_area_m2": float(area_per_sub_m2) * int(n_subapertures),
             "wavelength_grid_um": tuple(float(v) for v in wavelength_grid_um),
             "bandwidth_um": bandwidth_um.astype(np.float64, copy=True),
             "throughput_fraction": throughput.astype(np.float64, copy=True),
             "throughput_mean": float(np.mean(throughput)),
-            "routing": params.routing,
-            "routing_throughput": float(routing.throughput),
-            "routing_source": routing.source,
-            "n_physical_dark_ports": int(routing.n_dark_ports),
+            "routing": "chip_unitary",
+            "routing_throughput": float(np.mean(route_dark)),
+            "routing_fraction_dark_per_bin": route_dark.astype(np.float64, copy=True),
+            "routing_source": routing_source,
+            "n_physical_dark_ports": int(n_dark_ports),
             "local_zodi_rate_hz_per_bin": local_rate_per_bin_hz.astype(
                 np.float64,
                 copy=True,
@@ -291,24 +343,35 @@ class SpaceZodiBackground(BaseStage):
             "exozodi_rate_hz_per_dark_port": exozodi_rate_hz_per_port,
             "zodi_rate_hz_per_dark_port": background_rate_hz_per_port,
             "background_rate_hz_per_dark_port": background_rate_hz_per_port,
-            "background_rate_hz_per_spectro_port": background_rate_hz_per_port,
+            # Mean over all outputs, as in the ground sky stages: the
+            # characterization stages retune the spectro rows downstream.
+            "background_rate_hz_per_spectro_port": spectro_rate_hz_per_port,
             # Backward-compatible aliases for performance/output consumers that
             # still label any background-like term as sky.
             "sky_rate_hz_per_dark_port": background_rate_hz_per_port,
-            "sky_rate_hz_per_spectro_port": background_rate_hz_per_port,
+            "sky_rate_hz_per_spectro_port": spectro_rate_hz_per_port,
             "source_model": (
-                "Local zodiacal and exozodiacal surface brightness × "
-                "lambda/D photometric aperture × effective per-mode "
-                "collecting area × upstream throughput × off-axis "
-                "dark-port routing throughput. Local zodi uses an absolute "
-                "V-band surface brightness converted with approximate "
-                "solar colors; exozodi defaults to a 1-zodi surface "
-                "brightness scaled by the host-star band magnitude. Optional "
-                "HOSTS-style zodi-level sampling and inclined smooth-disk "
-                "surface-brightness scaling are applied before routing."
+                "Diffuse local zodi and exozodi: surface brightness x "
+                "single-mode etendue eta_d lambda^2 per input and bin x "
+                "upstream throughput (no point-source coupling) x deployed "
+                "chip routing sum_k |(U S)_jk|^2 averaged over dark ports. "
+                "Local zodi is an absolute V surface brightness converted "
+                "with solar colors. Exozodi is n zodis x 22 mag/arcsec^2 (V) "
+                "at 1 AU scaled by the host's absolute band magnitude, "
+                "falling as r^-2 outside the dust sublimation radius "
+                "(Stark et al. 2014), averaged with the PA-averaged dark "
+                "transmission T_dark(r) as weight. Optional HOSTS level "
+                "sampling and inclined-disk brightening multiply the level."
             ),
         }
-        payload.update(curve_background_payload)
+        payload.update(
+            _curve_background_payload(
+                state,
+                local_rate_hz_per_port=local_rate_hz_per_port,
+                exozodi_rate_hz_per_port=exozodi_rate_hz_per_port,
+                routing_throughput=float(np.mean(route_dark)),
+            )
+        )
         results = state.results.add_component(component_name, payload)
         return replace(state, results=results)
 
@@ -333,168 +396,287 @@ def _resolve_band(
 
 def _resolve_spaxel_arcsec2(
     *,
-    state: SimulationState,
     wavelength_grid_um: tuple[float, ...],
+    area_per_sub_m2: float,
     configured: float | None,
-    aperture_area_lam_over_d2: float,
-) -> float:
+) -> NDArray[np.float64]:
+    """Solid angle per input and bin: eta_d lambda^2 / A unless configured.
+
+    The single-mode etendue, not the primary's (lambda/D)^2 shared over the
+    dark ports (review 2026-11-07 Issue 2b). A times this solid angle is
+    eta_d lambda^2, independent of the mode area.
+    """
+
+    wavelength_m = np.asarray(wavelength_grid_um, dtype=np.float64) * 1.0e-6
     if configured is not None:
-        return float(configured)
-    diameter_m = state.geometry.diameter_m
-    if diameter_m is None or not math.isfinite(float(diameter_m)) or diameter_m <= 0.0:
-        raise ValueError(
-            "background.space_zodi requires geometry.diameter_m when "
-            "spaxel_arcsec2 is not configured."
-        )
-    center_wavelength_um = float(
-        np.mean(np.asarray(wavelength_grid_um, dtype=np.float64))
+        return np.full(wavelength_m.size, float(configured))
+    return (
+        DIFFUSE_SINGLE_MODE_ACCEPTANCE
+        * wavelength_m**2
+        / float(area_per_sub_m2)
+        * ARCSEC2_PER_STERADIAN
     )
-    lam_over_d_arcsec = (
-        center_wavelength_um * 1.0e-6 / float(diameter_m) * _ARCSEC_PER_RAD
-    )
-    return float(aperture_area_lam_over_d2) * lam_over_d_arcsec * lam_over_d_arcsec
 
 
 def _surface_brightness_in_band(v_mag_arcsec2: float, band: str) -> float:
     return float(v_mag_arcsec2) - _SOLAR_V_MINUS_BAND[band]
 
 
-def _space_rate_throughput_or_unity(
-    state: SimulationState,
-    n_wavelength_bins: int,
+def _photon_rate_per_bin(
+    mag_arcsec2: float,
+    wavelength_grid_um: tuple[float, ...],
+    bandwidth_um: NDArray[np.float64],
+    band: str,
 ) -> NDArray[np.float64]:
-    return (
-        _throughput_or_unity(state, n_wavelength_bins)
-        * _field_applied_throughput_or_unity(state, n_wavelength_bins)
-        * _single_mode_coupling_or_unity(state, n_wavelength_bins)
+    """Photons / s / m^2 / arcsec^2 per bin for a surface brightness."""
+
+    return np.array(
+        [
+            photon_rate_per_m2_per_bin(mag_arcsec2, float(wl), float(dl), band=band)
+            for wl, dl in zip(wavelength_grid_um, bandwidth_um, strict=True)
+        ],
+        dtype=np.float64,
     )
 
 
-def _single_mode_coupling_or_unity(
+def _exozodi_mag_at_1au(
+    *,
     state: SimulationState,
-    n_wavelength_bins: int,
+    band: str,
+    reference_v_mag_arcsec2: float,
+    derive_from_scene: bool,
+    default_spectral_type: str,
+) -> dict[str, Any]:
+    """1-zodi band surface brightness at 1 AU, and the host band luminosity.
+
+    Stark et al. (2014, ApJ 795, 122) scale the 1-zodi surface brightness
+    (22 mag/arcsec^2 in V at 1 AU for a solar twin) by the host's luminosity
+    in the band: ``SB = SB_ref + M_host - M_sun``. M_host is the absolute
+    magnitude ``m - 5 log10(d / 10 pc)``; using the apparent magnitude made
+    nearby hosts too bright and distant ones too faint (review 2026-11-07
+    Issue 2c). The band luminosity ratio also sets the dust inner edge.
+    """
+
+    in_band = _surface_brightness_in_band(reference_v_mag_arcsec2, band)
+    if not derive_from_scene:
+        return {
+            "mag_arcsec2": in_band,
+            "source": "absolute_v_mag_arcsec2_converted_with_solar_color",
+            "apparent_mag": None,
+            "absolute_mag": None,
+            "luminosity_lsun": 1.0,
+        }
+    if state.scene.star_jmag is None:
+        raise ValueError(
+            "background.space_zodi derive_exozodi_mag_from_scene_jmag=True "
+            "requires scene.star_jmag."
+        )
+    distance_pc = state.scene.star_distance_pc
+    if distance_pc is None or distance_pc <= 0.0:
+        raise ValueError(
+            "background.space_zodi derive_exozodi_mag_from_scene_jmag=True "
+            "requires scene.star_distance_pc."
+        )
+    apparent_mag = float(
+        stellar_band_magnitude_from_jmag(
+            float(state.scene.star_jmag),
+            band,
+            state.scene.star_spectral_type,
+            derive_from_jmag=True,
+            default_spectral_type=default_spectral_type,
+        )
+    )
+    absolute_mag = apparent_mag - 5.0 * math.log10(float(distance_pc) / 10.0)
+    solar_band_mag = SOLAR_V_MAG_AT_10PC - _SOLAR_V_MINUS_BAND[band]
+    return {
+        "mag_arcsec2": in_band + absolute_mag - solar_band_mag,
+        "source": (
+            "scene.star_jmag converted to a band absolute magnitude with "
+            "scene.star_distance_pc, relative to the Sun's"
+        ),
+        "apparent_mag": apparent_mag,
+        "absolute_mag": absolute_mag,
+        "luminosity_lsun": 10.0 ** (-0.4 * (absolute_mag - solar_band_mag)),
+    }
+
+
+def _dust_inner_radius_au(luminosity_lsun: float) -> float:
+    """Blackbody-grain sublimation radius, (278.3 K / T_sub)^2 sqrt(L) AU."""
+
+    ratio = _BLACKBODY_TEMPERATURE_1AU_K / _DUST_SUBLIMATION_TEMPERATURE_K
+    return ratio * ratio * math.sqrt(float(luminosity_lsun))
+
+
+def _exozodi_profile(
+    radius_au: NDArray[np.float64],
+    inner_radius_au: float,
 ) -> NDArray[np.float64]:
-    factor = np.ones(n_wavelength_bins, dtype=np.float64)
-    for name, payload in state.throughput.components.items():
-        if not name.startswith("single_mode_fiber") or not isinstance(payload, dict):
-            continue
-        coupling = payload.get("coupling_efficiency")
-        if coupling is None:
-            continue
-        component = np.asarray(coupling, dtype=np.float64)
-        if component.shape != (n_wavelength_bins,):
-            raise ValueError(
-                "background.space_zodi: single-mode coupling component "
-                f"{name!r} length {component.size} does not match wavelength "
-                f"grid length {n_wavelength_bins}."
-            )
-        factor *= component
-    return factor
+    """Exozodi surface brightness relative to 1 AU: r^-2 outside the inner edge."""
+
+    radius = np.asarray(radius_au, dtype=np.float64)
+    inside = radius < inner_radius_au
+    return np.where(inside, 0.0, 1.0 / np.where(inside, 1.0, radius) ** 2)
 
 
-def _resolve_routing_throughput(
+def _exozodi_sb_at_scene_separation(
+    state: SimulationState,
+    sb_1au: float,
+    inner_radius_au: float,
+) -> float | None:
+    separation_mas = state.scene.planet_separation_mas
+    distance_pc = state.scene.star_distance_pc
+    if separation_mas is None or distance_pc is None:
+        return None
+    radius_au = float(separation_mas) * 1.0e-3 * float(distance_pc)
+    return sb_1au * float(_exozodi_profile(np.array([radius_au]), inner_radius_au)[0])
+
+
+def _exozodi_profile_weight(
     state: SimulationState,
     *,
-    routing: str,
-) -> _RoutingThroughput:
-    n_dark_ports, n_total_ports = _detector_port_counts(state)
-    if routing == "dark_fraction":
-        return _RoutingThroughput(
-            throughput=float(n_dark_ports) / float(n_total_ports),
-            source="detector dark-port fraction",
-            n_dark_ports=n_dark_ports,
-        )
-    if routing != "scene_planet_throughput":
-        raise ValueError(f"background.space_zodi: unsupported routing={routing!r}.")
-    if state.scene.planet_separation_mas is None:
+    wavelength_grid_um: tuple[float, ...],
+    port_indices: NDArray[np.intp],
+    distance_pc: float,
+    inner_radius_au: float,
+) -> float:
+    """Exozodi profile averaged with the ports' T(r) as weight.
+
+    ``<p>_T = int p(r) T(r) r dr / int T(r) r dr``, with p the brightness
+    relative to 1 AU and T the PA- and band-averaged transmission into
+    ``port_indices`` from the planet-throughput machinery. A uniform source
+    (p = 1) gives exactly 1, so exozodi reduces to the local-zodi etendue rule
+    and the weight carries only the shape of T, not the normalization of the
+    angular-coupling envelope (review 2026-11-07 Issue 2a).
+    """
+
+    chip = _latest_chip_transfer(state)
+    if chip is None:
         raise ValueError(
-            "background.space_zodi routing='scene_planet_throughput' requires "
-            "scene.planet_separation_mas."
+            "background.space_zodi needs an upstream chip transfer stack to "
+            "route exozodi."
         )
-    sensitivity_name, sensitivity_payload = _find_sensitivity_component(state)
-    separations = np.asarray(sensitivity_payload["separations_mas"], dtype=np.float64)
-    throughputs = np.asarray(
-        sensitivity_payload["planet_throughputs"], dtype=np.float64
+    u_stack = np.asarray(chip[1]["u_stack"], dtype=np.complex128)
+    n_modes = u_stack.shape[1]
+    positions = state.geometry.aperture_positions_pupil_m
+    if positions is None or np.asarray(positions).shape != (n_modes, 2):
+        raise ValueError(
+            "background.space_zodi requires geometry.aperture_positions_pupil_m "
+            f"with shape ({n_modes}, 2) to route exozodi."
+        )
+    areas_m2, diameters_m = _mode_areas_and_diameters_m(state, n_modes)
+    wavelengths_m = np.asarray(wavelength_grid_um, dtype=np.float64) * 1.0e-6
+    theta_max_rad = (
+        _EXOZODI_PROFILE_MAX_LAMBDA_OVER_D
+        * float(np.max(wavelengths_m))
+        / float(np.min(diameters_m))
     )
-    if separations.shape != throughputs.shape or separations.size == 0:
-        raise ValueError(
-            "background.space_zodi: sensitivity separations and planet_throughputs "
-            "must be non-empty arrays with matching shape."
-        )
-    if not np.all(np.isfinite(separations)) or not np.all(np.isfinite(throughputs)):
-        raise ValueError(
-            "background.space_zodi: sensitivity separations and planet_throughputs "
-            "must be finite."
-        )
-    if np.any(throughputs < 0.0):
-        raise ValueError(
-            "background.space_zodi: sensitivity planet_throughputs must be "
-            "non-negative."
-        )
-    order = np.argsort(separations)
-    routed = float(
-        np.interp(
-            float(state.scene.planet_separation_mas),
-            separations[order],
-            throughputs[order],
-        )
+    theta_inner_rad = inner_radius_au / distance_pc / _ARCSEC_PER_RAD
+    theta_rad = np.geomspace(
+        1.0e-4 * theta_max_rad, theta_max_rad, _EXOZODI_PROFILE_N_RADII
     )
-    if not math.isfinite(routed) or routed < 0.0:
-        raise ValueError(
-            "background.space_zodi: interpolated scene planet throughput must be "
-            f"finite and non-negative, got {routed!r}."
-        )
-    return _RoutingThroughput(
-        throughput=routed,
-        source=f"sensitivity:{sensitivity_name}.planet_throughputs",
-        n_dark_ports=n_dark_ports,
-        separations_mas=separations.astype(np.float64, copy=True),
-        throughputs_per_sep=throughputs.astype(np.float64, copy=True),
+    if theta_inner_rad < theta_max_rad:
+        theta_rad = np.union1d(theta_rad, [theta_inner_rad])
+    transmission = compute_planet_throughput_vs_separation(
+        u_stack=u_stack,
+        wavelengths_m=wavelengths_m,
+        positions_m=np.asarray(positions, dtype=np.float64),
+        dark_indices=port_indices,
+        coupling_per_sub=np.ones(n_modes, dtype=np.float64),
+        sub_areas_m2=areas_m2,
+        sub_diameters_m=diameters_m,
+        separations_rad=theta_rad,
+        n_pa_samples=_EXOZODI_PROFILE_N_PA,
     )
+    weight = transmission * theta_rad
+    norm = float(np.trapezoid(weight, theta_rad))
+    if norm <= 0.0:
+        return 0.0
+    profile = _exozodi_profile(theta_rad * _ARCSEC_PER_RAD * distance_pc, inner_radius_au)
+    return float(np.trapezoid(profile * weight, theta_rad)) / norm
+
+
+def _mode_areas_and_diameters_m(
+    state: SimulationState,
+    n_modes: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Per-mode areas and diameters: vectors first, else the newest scalar.
+
+    Geometry components are walked newest first, so the chip-input modes
+    (``telescope.pupil_modes``) win over the primary that
+    ``telescope.fixed_aperture`` recorded earlier (review 2026-11-07 Issue 1).
+    """
+
+    areas = component_mode_areas_m2(state, n_modes)
+    diameters = component_mode_diameters_m(state, n_modes)
+    area_vec = None if areas is None else areas[0]
+    diameter_vec = None if diameters is None else diameters[0]
+    if diameter_vec is None:
+        diameter = _newest_component_scalar(state, "mode_diameter_m")
+        area = _newest_component_scalar(state, "mode_area_m2")
+        if diameter is not None:
+            diameter_vec = np.full(n_modes, diameter)
+        elif area_vec is not None:
+            diameter_vec = np.sqrt(4.0 * area_vec / np.pi)
+        elif area is not None:
+            diameter_vec = np.full(n_modes, math.sqrt(4.0 * area / math.pi))
+        else:
+            raise ValueError(
+                "background.space_zodi requires per-mode diameters or areas in "
+                "the geometry components to route exozodi."
+            )
+    if area_vec is None:
+        area_vec = np.pi * diameter_vec**2 / 4.0
+    return area_vec, diameter_vec
+
+
+def _newest_component_scalar(state: SimulationState, key: str) -> float | None:
+    for payload in reversed(tuple(state.geometry.components.values())):
+        if not isinstance(payload, dict) or payload.get(key) is None:
+            continue
+        scalar = float(payload[key])
+        if math.isfinite(scalar) and scalar > 0.0:
+            return scalar
+    return None
 
 
 def _curve_background_payload(
+    state: SimulationState,
     *,
-    routing: _RoutingThroughput,
-    local_base_rate_per_bin_hz: NDArray[np.float64],
-    exozodi_base_rate_per_bin_hz: NDArray[np.float64],
+    local_rate_hz_per_port: float,
+    exozodi_rate_hz_per_port: float,
+    routing_throughput: float,
 ) -> dict[str, object]:
-    if routing.separations_mas is None or routing.throughputs_per_sep is None:
-        return {}
+    """Per-separation copies on the sensitivity grid, kept for consumers.
 
-    local_base_rate_hz_per_port = float(np.sum(local_base_rate_per_bin_hz))
-    exozodi_base_rate_hz_per_port = float(np.sum(exozodi_base_rate_per_bin_hz))
-    route = routing.throughputs_per_sep.astype(np.float64, copy=True)
-    local_per_sep = route * local_base_rate_hz_per_port
-    exozodi_per_sep = route * exozodi_base_rate_hz_per_port
-    total_per_sep = local_per_sep + exozodi_per_sep
+    Both terms are diffuse and do not depend on where the planet sits, so the
+    vectors are constant.
+    """
+
+    separations = _sensitivity_separations_mas(state)
+    if separations is None:
+        return {}
+    ones = np.ones(separations.size, dtype=np.float64)
+    total = local_rate_hz_per_port + exozodi_rate_hz_per_port
     return {
-        "background_separations_mas": routing.separations_mas.astype(
-            np.float64,
-            copy=True,
-        ),
-        "background_routing_throughputs": route,
-        "local_zodi_rate_hz_per_dark_port_per_sep": local_per_sep.astype(
-            np.float64,
-            copy=True,
-        ),
-        "exozodi_rate_hz_per_dark_port_per_sep": exozodi_per_sep.astype(
-            np.float64,
-            copy=True,
-        ),
-        "zodi_rate_hz_per_dark_port_per_sep": total_per_sep.astype(
-            np.float64,
-            copy=True,
-        ),
-        "background_rate_hz_per_dark_port_per_sep": total_per_sep.astype(
-            np.float64,
-            copy=True,
-        ),
-        "sky_rate_hz_per_dark_port_per_sep": total_per_sep.astype(
-            np.float64,
-            copy=True,
-        ),
+        "background_separations_mas": separations,
+        "background_routing_throughputs": routing_throughput * ones,
+        "local_zodi_rate_hz_per_dark_port_per_sep": local_rate_hz_per_port * ones,
+        "exozodi_rate_hz_per_dark_port_per_sep": exozodi_rate_hz_per_port * ones,
+        "zodi_rate_hz_per_dark_port_per_sep": total * ones,
+        "background_rate_hz_per_dark_port_per_sep": total * ones,
+        "sky_rate_hz_per_dark_port_per_sep": total * ones,
     }
+
+
+def _sensitivity_separations_mas(state: SimulationState) -> NDArray[np.float64] | None:
+    for name, payload in reversed(tuple(state.results.components.items())):
+        if (
+            name.startswith("sensitivity.detection_curve")
+            and isinstance(payload, dict)
+            and "separations_mas" in payload
+        ):
+            return np.asarray(payload["separations_mas"], dtype=np.float64).copy()
+    return None
 
 
 def _detector_port_counts(state: SimulationState) -> tuple[int, int]:
@@ -518,60 +700,6 @@ def _detector_port_counts(state: SimulationState) -> tuple[int, int]:
     raise ValueError(
         "background.space_zodi requires an upstream detector component with "
         "dark-port labels or physical port counts."
-    )
-
-
-def _find_sensitivity_component(
-    state: SimulationState,
-) -> tuple[str, dict[str, object]]:
-    for name, payload in reversed(tuple(state.results.components.items())):
-        if not name.startswith("sensitivity.detection_curve"):
-            continue
-        if isinstance(payload, dict) and {
-            "separations_mas",
-            "planet_throughputs",
-        }.issubset(payload):
-            return name, payload
-    raise ValueError(
-        "background.space_zodi routing='scene_planet_throughput' requires an "
-        "upstream sensitivity.detection_curve component."
-    )
-
-
-def _exozodi_mag_arcsec2(
-    *,
-    state: SimulationState,
-    band: str,
-    reference_v_mag_arcsec2: float,
-    derive_from_scene: bool,
-    default_spectral_type: str,
-) -> tuple[float, str, float | None]:
-    if not derive_from_scene:
-        return (
-            _surface_brightness_in_band(reference_v_mag_arcsec2, band),
-            "absolute_v_mag_arcsec2_converted_with_solar_color",
-            None,
-        )
-    if state.scene.star_jmag is None:
-        raise ValueError(
-            "background.space_zodi derive_exozodi_mag_from_scene_jmag=True "
-            "requires scene.star_jmag."
-        )
-    host_star_mag = stellar_band_magnitude_from_jmag(
-        float(state.scene.star_jmag),
-        band,
-        state.scene.star_spectral_type,
-        derive_from_jmag=True,
-        default_spectral_type=default_spectral_type,
-    )
-    zodi_offset_mag = float(reference_v_mag_arcsec2) - SOLAR_V_MAG_AT_10PC
-    return (
-        float(host_star_mag + zodi_offset_mag),
-        (
-            "scene.star_jmag converted to band, plus 1-zodi surface-brightness "
-            "offset relative to the Sun at 10 pc"
-        ),
-        float(host_star_mag),
     )
 
 
@@ -655,43 +783,3 @@ def _resolve_exozodi_morphology(
         "raw_surface_brightness_multiplier": raw_multiplier,
         "surface_brightness_multiplier": multiplier,
     }
-
-
-def _surface_brightness_rate_per_bin_hz(
-    *,
-    mag_arcsec2: float,
-    level: float,
-    wavelength_grid_um: tuple[float, ...],
-    bandwidth_um: NDArray[np.float64],
-    band: str,
-    collecting_area_m2: float,
-    spaxel_arcsec2: float,
-    throughput: NDArray[np.float64],
-    routing_throughput: float,
-    n_dark_ports: int,
-) -> NDArray[np.float64]:
-    if level <= 0.0:
-        return np.zeros(len(wavelength_grid_um), dtype=np.float64)
-    if n_dark_ports <= 0:
-        raise ValueError("background.space_zodi requires n_dark_ports > 0.")
-    rates = np.array(
-        [
-            photon_rate_per_m2_per_bin(
-                mag_arcsec2,
-                float(wl_um),
-                float(delta_um),
-                band=band,
-            )
-            for wl_um, delta_um in zip(wavelength_grid_um, bandwidth_um, strict=True)
-        ],
-        dtype=np.float64,
-    )
-    return (
-        rates
-        * float(level)
-        * float(collecting_area_m2)
-        * float(spaxel_arcsec2)
-        * throughput
-        * float(routing_throughput)
-        / float(n_dark_ports)
-    )

@@ -279,10 +279,21 @@ def test_hwo_space_zodi_background_reaches_performance(fiducial_state) -> None:
         zodi["exozodi_level_zodi"] * zodi["exozodi_surface_brightness_multiplier"]
     )
     assert zodi["host_star_mag_for_exozodi"] == pytest.approx(2.58)
-    assert zodi["exozodi_mag_arcsec2"] == pytest.approx(2.58 + 22.0 - 4.83)
+    # Exozodi brightness scales with the host's absolute magnitude (5 pc).
+    host_abs_mag = 2.58 - 5.0 * math.log10(fiducial_state.scene.star_distance_pc / 10.0)
+    assert zodi["exozodi_mag_arcsec2"] == pytest.approx(host_abs_mag + 22.0 - 4.83)
     assert zodi["local_zodi_v_mag_arcsec2"] == pytest.approx(23.3)
-    expected_spaxel_arcsec2 = (0.8e-6 / 8.0 * 206_264.80624709636) ** 2
-    assert zodi["spaxel_arcsec2"] == pytest.approx(expected_spaxel_arcsec2)
+    # Single-mode etendue: eta_d lambda^2 per pupil mode, as a solid angle
+    # over the 1.12 m mode area, with eta_d = 1 - exp(-2 rho^2).
+    pupil = fiducial_state.geometry.components["pupil_modes"]
+    mode_area_m2 = math.pi * float(pupil["mode_diameter_m"]) ** 2 / 4.0
+    eta_d = 1.0 - math.exp(-2.0 * 1.120906422778534**2)
+    wavelengths_m = np.asarray(fiducial_state.field.wavelength_grid_um) * 1e-6
+    np.testing.assert_allclose(
+        zodi["spaxel_arcsec2_per_bin"],
+        eta_d * wavelengths_m**2 / mode_area_m2 * 206_264.80624709636**2,
+        rtol=1e-9,
+    )
     assert zodi["local_zodi_rate_hz_per_dark_port"] > 0.0
     assert zodi["exozodi_rate_hz_per_dark_port"] > 0.0
     assert zodi["background_rate_hz_per_dark_port"] == pytest.approx(
@@ -293,10 +304,8 @@ def test_hwo_space_zodi_background_reaches_performance(fiducial_state) -> None:
         zodi["background_separations_mas"],
         sensitivity["separations_mas"],
     )
-    np.testing.assert_allclose(
-        zodi["background_routing_throughputs"],
-        sensitivity["planet_throughputs"],
-    )
+    # Diffuse light is routed through the chip, not by planet throughput.
+    np.testing.assert_allclose(zodi["background_routing_throughputs"], 1.0)
 
     perf = next(
         payload

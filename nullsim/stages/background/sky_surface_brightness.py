@@ -13,17 +13,21 @@ from typing import Literal
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict
+from numpy.typing import NDArray
 from pydantic import Field as PydanticField
 
 from nullsim.pipeline import BaseStage, SimulationState, register_stage
 from nullsim.stages._science_bands import infer_band_from_wavelength_um
 from nullsim.stages._utils import unique_component_name
 from nullsim.stages.background.nayra_sky import (
+    ARCSEC2_PER_STERADIAN,
+    DIFFUSE_SINGLE_MODE_ACCEPTANCE,
     _bandwidth_per_bin_um,
     _rate_throughput_or_unity,
     _require_wavelength_grid_um,
     _resolve_area_per_sub_m2,
     _resolve_n_subapertures,
+    _routed_sky_payload,
     _sky_rate_per_bin_hz,
 )
 
@@ -56,46 +60,40 @@ DEFAULT_SPAXEL_ARCSEC2 = {
     "K": 0.007,
 }
 
-# 1 sr = (180*3600/pi)^2 arcsec^2.
-_ARCSEC2_PER_STERADIAN = (180.0 * 3600.0 / np.pi) ** 2
-
-
 def _single_mode_spaxel_arcsec2(
     *,
     area_per_sub_m2: float,
-    wavelength_center_m: float,
+    wavelength_m: float | NDArray[np.float64],
     n_polarizations: int,
-) -> float:
-    """Single-mode receiver sky spaxel from the A.Omega = n_pol.lambda^2 rule.
+) -> float | NDArray[np.float64]:
+    """Effective sky solid angle of one single-mode input, in arcsec^2.
 
-    A single-mode fiber/waveguide accepts the etendue A.Omega = n_pol.lambda^2,
-    so the on-sky solid angle is Omega = n_pol.lambda^2 / A. Returns Omega in
-    arcsec^2. The previous fixed 0.005 arcsec^2 table under-counted the sky by
-    ~4-9x for Keck-scale subapertures.
-
-    Args:
-        area_per_sub_m2: Collecting area per chip input mode (m^2).
-        wavelength_center_m: Band-center wavelength (m).
-        n_polarizations: Polarization modes the receiver detects (2 for an
-            MKID behind a PM fiber that carries both polarizations).
-
-    Returns:
-        Sky spaxel solid angle in arcsec^2.
+    A single guided mode collects ``B lambda^2 eta_d`` from a uniform source of
+    total-intensity surface brightness B, over both polarizations, with
+    ``eta_d = DIFFUSE_SINGLE_MODE_ACCEPTANCE`` the fraction of the
+    back-propagated mode that the circular aperture passes (antenna theorem,
+    Siegman 1966). Expressed as a solid angle on the per-mode collecting area
+    A this is ``Omega = n_pol * eta_d * lambda^2 / A``. Sky surface brightness
+    in mag/arcsec^2 is total intensity, so ``n_polarizations = 1`` is correct
+    for an input that carries both polarizations; a PBS downstream halves it
+    per arm through ``_physical_arm_fraction``. Evaluate at each bin's own
+    wavelength, not the band center.
 
     Raises:
-        ValueError: if ``area_per_sub_m2`` or ``wavelength_center_m`` is not
-            finite and positive, or ``n_polarizations`` is not positive.
+        ValueError: if ``area_per_sub_m2`` or ``wavelength_m`` is not finite and
+            positive, or ``n_polarizations`` is not positive.
     """
 
+    wavelength = np.asarray(wavelength_m, dtype=np.float64)
     if not (np.isfinite(area_per_sub_m2) and area_per_sub_m2 > 0.0):
         raise ValueError(
             "background.sky_surface_brightness: area_per_sub_m2 must be finite "
             f"and positive, got {area_per_sub_m2}."
         )
-    if not (np.isfinite(wavelength_center_m) and wavelength_center_m > 0.0):
+    if not (np.all(np.isfinite(wavelength)) and np.all(wavelength > 0.0)):
         raise ValueError(
-            "background.sky_surface_brightness: wavelength_center_m must be "
-            f"finite and positive, got {wavelength_center_m}."
+            "background.sky_surface_brightness: wavelength_m must be "
+            f"finite and positive, got {wavelength_m}."
         )
     if n_polarizations <= 0:
         raise ValueError(
@@ -103,9 +101,13 @@ def _single_mode_spaxel_arcsec2(
             f"positive, got {n_polarizations}."
         )
     omega_sr = (
-        float(n_polarizations) * wavelength_center_m ** 2 / float(area_per_sub_m2)
+        float(n_polarizations)
+        * DIFFUSE_SINGLE_MODE_ACCEPTANCE
+        * wavelength**2
+        / float(area_per_sub_m2)
     )
-    return omega_sr * _ARCSEC2_PER_STERADIAN
+    spaxel = omega_sr * ARCSEC2_PER_STERADIAN
+    return float(spaxel) if spaxel.ndim == 0 else spaxel
 
 
 def _resolve_spaxel_arcsec2(
@@ -115,27 +117,25 @@ def _resolve_spaxel_arcsec2(
     wavelength_grid_um: tuple[float, ...],
     n_polarizations: int,
     band: str,
-) -> tuple[float, str]:
-    """Resolve the sky spaxel, preferring the single-mode etendue.
+) -> tuple[NDArray[np.float64], str]:
+    """Resolve the sky spaxel per wavelength bin, preferring the étendue.
 
     Precedence: explicit ``spaxel_arcsec2`` override, then the single-mode
     etendue from the per-mode collecting area, then the legacy fixed table
     (only if the per-mode area is unusable).
     """
 
+    n_bins = len(wavelength_grid_um)
     if spaxel_override_arcsec2 is not None:
-        return float(spaxel_override_arcsec2), "param.spaxel_arcsec2"
+        return np.full(n_bins, float(spaxel_override_arcsec2)), "param.spaxel_arcsec2"
     if np.isfinite(area_per_sub_m2) and area_per_sub_m2 > 0.0:
-        wavelength_center_m = (
-            float(wavelength_grid_um[len(wavelength_grid_um) // 2]) * 1.0e-6
-        )
         spaxel = _single_mode_spaxel_arcsec2(
             area_per_sub_m2=area_per_sub_m2,
-            wavelength_center_m=wavelength_center_m,
+            wavelength_m=np.asarray(wavelength_grid_um, dtype=np.float64) * 1.0e-6,
             n_polarizations=n_polarizations,
         )
-        return spaxel, "single_mode_etendue"
-    return DEFAULT_SPAXEL_ARCSEC2[band], "legacy_fixed_table"
+        return np.asarray(spaxel, dtype=np.float64), "single_mode_etendue"
+    return np.full(n_bins, DEFAULT_SPAXEL_ARCSEC2[band]), "legacy_fixed_table"
 
 
 @register_stage
@@ -156,9 +156,11 @@ class SkySurfaceBrightness(BaseStage):
         band: Literal["Y", "J", "H", "K"] | None = None
         sky_mag_arcsec2: float | None = PydanticField(default=None, gt=0.0)
         spaxel_arcsec2: float | None = PydanticField(default=None, gt=0.0)
-        # Polarization modes the receiver detects (used only when
-        # spaxel_arcsec2 is None, to set the single-mode etendue spaxel).
-        n_polarizations: int = PydanticField(default=2, ge=1)
+        # Multiplier on the single-mode etendue (used only when
+        # spaxel_arcsec2 is None). 1 is physical: B lambda^2 already counts
+        # both polarizations of a total-intensity sky (review 2026-11-07
+        # Issue 12).
+        n_polarizations: int = PydanticField(default=1, ge=1)
         n_subapertures: int | None = PydanticField(default=None, ge=1)
         area_source: Literal["effective", "collecting_area_per_mode"] = "effective"
         thermal_background_hz_per_port: float = PydanticField(default=0.0, ge=0.0)
@@ -188,7 +190,7 @@ class SkySurfaceBrightness(BaseStage):
         )
         bandwidth_um = _bandwidth_per_bin_um(wavelength_grid_um)
         throughput = _rate_throughput_or_unity(state, len(wavelength_grid_um))
-        sky_rate_per_bin_hz = _sky_rate_per_bin_hz(
+        sky_rate_per_input_per_bin_hz = _sky_rate_per_bin_hz(
             sky_mag_arcsec2=sky_mag_arcsec2,
             wavelength_grid_um=wavelength_grid_um,
             bandwidth_um=bandwidth_um,
@@ -197,11 +199,9 @@ class SkySurfaceBrightness(BaseStage):
             spaxel_arcsec2=spaxel_arcsec2,
             throughput=throughput,
         )
-        sky_rate_hz_per_port = float(np.sum(sky_rate_per_bin_hz))
-        total_background_hz_per_port = (
-            sky_rate_hz_per_port
-            + float(params.thermal_background_hz_per_port)
-            + float(params.exozodi_background_hz_per_port)
+        routed = _routed_sky_payload(state, sky_rate_per_input_per_bin_hz)
+        additive_hz_per_port = float(params.thermal_background_hz_per_port) + float(
+            params.exozodi_background_hz_per_port
         )
 
         component_name = unique_component_name(
@@ -215,7 +215,9 @@ class SkySurfaceBrightness(BaseStage):
                 "site_profile": str(params.site_profile),
                 "band": band,
                 "sky_mag_arcsec2": sky_mag_arcsec2,
-                "spaxel_arcsec2": spaxel_arcsec2,
+                # Band-center value for display; rates use the per-bin array.
+                "spaxel_arcsec2": float(spaxel_arcsec2[len(spaxel_arcsec2) // 2]),
+                "spaxel_arcsec2_per_bin": spaxel_arcsec2.astype(np.float64, copy=True),
                 "spaxel_source": spaxel_source,
                 "n_polarizations": int(params.n_polarizations),
                 "n_subapertures": int(n_subapertures),
@@ -225,25 +227,25 @@ class SkySurfaceBrightness(BaseStage):
                 "bandwidth_um": bandwidth_um.astype(np.float64, copy=True),
                 "throughput_fraction": throughput.astype(np.float64, copy=True),
                 "throughput_mean": float(np.mean(throughput)),
-                "sky_rate_hz_per_bin": sky_rate_per_bin_hz.astype(
-                    np.float64,
-                    copy=True,
-                ),
-                "sky_rate_hz_per_dark_port": sky_rate_hz_per_port,
-                "sky_rate_hz_per_spectro_port": sky_rate_hz_per_port,
+                **routed,
                 "thermal_background_hz_per_port": float(
                     params.thermal_background_hz_per_port
                 ),
                 "exozodi_background_hz_per_port": float(
                     params.exozodi_background_hz_per_port
                 ),
-                "background_rate_hz_per_dark_port": total_background_hz_per_port,
-                "background_rate_hz_per_spectro_port": total_background_hz_per_port,
+                "background_rate_hz_per_dark_port": (
+                    routed["sky_rate_hz_per_dark_port"] + additive_hz_per_port
+                ),
+                "background_rate_hz_per_spectro_port": (
+                    routed["sky_rate_hz_per_spectro_port"] + additive_hz_per_port
+                ),
                 "source_model": (
-                    "Generic site sky surface brightness × spaxel area × "
-                    "active wavelength bins × sub-aperture area × upstream "
-                    "throughput. Shares downstream payload keys with "
-                    "background.nayra_sky."
+                    "Generic site sky surface brightness × single-mode "
+                    "etendue (B lambda^2 eta_d per input, per bin) × upstream "
+                    "throughput, routed per output as sum_k |(U S)_jk|^2 "
+                    "through the deployed chip stack. Shares downstream "
+                    "payload keys with background.nayra_sky."
                 ),
             },
         )

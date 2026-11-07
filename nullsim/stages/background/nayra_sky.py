@@ -20,7 +20,11 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, Field as PydanticField
 
 from nullsim.physics.photometry import photon_rate_per_m2_per_bin
+from nullsim.physics.ruilier_cassaing import (
+    OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO,
+)
 from nullsim.pipeline import BaseStage, SimulationState, register_stage
+from nullsim.stages._mode_splitter import splitter_physical_indices
 from nullsim.stages._science_bands import infer_band_from_wavelength_um
 from nullsim.stages._utils import unique_component_name
 
@@ -34,6 +38,24 @@ _SKY_MAG_ARCSEC2 = {
     "H": 13.0,
     "K": 12.0,
 }
+
+# 1 sr = (180*3600/pi)^2 arcsec^2.
+ARCSEC2_PER_STERADIAN = (180.0 * 3600.0 / np.pi) ** 2
+
+DIFFUSE_SINGLE_MODE_ACCEPTANCE = 1.0 - np.exp(
+    -2.0 * OPTIMAL_PUPIL_RADIUS_TO_MODE_FIELD_RADIUS_RATIO**2
+)
+"""Diffuse-light acceptance of a single-mode input behind a circular aperture.
+
+By the antenna theorem (Siegman 1966, Proc. IEEE 54, 1350) a single guided
+mode accepts the etendue A.Omega = lambda^2 of a uniform incoherent source of
+total-intensity surface brightness B, over both polarizations. A circular
+aperture of radius R in front of the input passes only the fraction
+``1 - exp(-2 rho^2)`` of the back-propagated Gaussian mode of field radius w,
+with ``rho = R / w``. At the Ruilier-Cassaing optimum rho = 1.1209 this is
+0.919, so the input collects ``B lambda^2 * 0.919`` per spectral bin. The
+point-source coupling eta = 0.8145 does not apply to diffuse light.
+"""
 
 _DARK_PORT_SPAXEL_ARCSEC2 = {
     "Y": 0.0035,
@@ -87,7 +109,7 @@ class NayraSkyBackground(BaseStage):
 
         bandwidth_um = _bandwidth_per_bin_um(wavelength_grid_um)
         throughput = _rate_throughput_or_unity(state, len(wavelength_grid_um))
-        sky_rate_per_bin_hz = _sky_rate_per_bin_hz(
+        sky_rate_per_input_per_bin_hz = _sky_rate_per_bin_hz(
             sky_mag_arcsec2=sky_mag_arcsec2,
             wavelength_grid_um=wavelength_grid_um,
             bandwidth_um=bandwidth_um,
@@ -96,11 +118,9 @@ class NayraSkyBackground(BaseStage):
             spaxel_arcsec2=spaxel_arcsec2,
             throughput=throughput,
         )
-        sky_rate_hz_per_port = float(np.sum(sky_rate_per_bin_hz))
-        total_background_hz_per_port = (
-            sky_rate_hz_per_port
-            + float(params.thermal_background_hz_per_port)
-            + float(params.exozodi_background_hz_per_port)
+        routed = _routed_sky_payload(state, sky_rate_per_input_per_bin_hz)
+        additive_hz_per_port = float(params.thermal_background_hz_per_port) + float(
+            params.exozodi_background_hz_per_port
         )
 
         component_name = unique_component_name(
@@ -121,24 +141,25 @@ class NayraSkyBackground(BaseStage):
                 "bandwidth_um": bandwidth_um.astype(np.float64, copy=True),
                 "throughput_fraction": throughput.astype(np.float64, copy=True),
                 "throughput_mean": float(np.mean(throughput)),
-                "sky_rate_hz_per_bin": sky_rate_per_bin_hz.astype(
-                    np.float64, copy=True
-                ),
-                "sky_rate_hz_per_dark_port": sky_rate_hz_per_port,
-                "sky_rate_hz_per_spectro_port": sky_rate_hz_per_port,
+                **routed,
                 "thermal_background_hz_per_port": float(
                     params.thermal_background_hz_per_port
                 ),
                 "exozodi_background_hz_per_port": float(
                     params.exozodi_background_hz_per_port
                 ),
-                "background_rate_hz_per_dark_port": total_background_hz_per_port,
-                "background_rate_hz_per_spectro_port": total_background_hz_per_port,
+                "background_rate_hz_per_dark_port": (
+                    routed["sky_rate_hz_per_dark_port"] + additive_hz_per_port
+                ),
+                "background_rate_hz_per_spectro_port": (
+                    routed["sky_rate_hz_per_spectro_port"] + additive_hz_per_port
+                ),
                 "source_model": (
                     "Rate-level port of nayra.sky_background: "
                     "band sky surface brightness × NAYRA spaxel area × "
                     "active wavelength bins × sub-aperture area × upstream "
-                    "throughput. Thermal/exozodi terms are additive scalar "
+                    "throughput, routed per output through the deployed chip "
+                    "stack. Thermal/exozodi terms are additive scalar "
                     "placeholders."
                 ),
             },
@@ -188,7 +209,10 @@ def _resolve_n_subapertures(
     if configured is not None:
         return int(configured)
     if state.field.amplitudes is not None:
-        return int(state.field.amplitudes.shape[0])
+        # Count physical guided modes: sky enters before any splitter fanout,
+        # whose copies _diffuse_port_routing accounts for.
+        n_chip_inputs = int(state.field.amplitudes.shape[0])
+        return _splitter_isometry(state, n_chip_inputs).shape[1]
     if state.geometry.aperture_positions_pupil_m is not None:
         return int(np.asarray(state.geometry.aperture_positions_pupil_m).shape[0])
     if state.geometry.n_apertures is not None:
@@ -250,43 +274,142 @@ def _rate_throughput_or_unity(
     state: SimulationState,
     n_wavelength_bins: int,
 ) -> NDArray[np.float64]:
-    """Return throughput appropriate for per-physical-port background rates."""
+    """Throughput from the sky to one physical input mode, per PBS arm.
+
+    Excludes the chip routing, which ``_diffuse_port_routing`` applies per
+    output port.
+    """
 
     throughput = _throughput_or_unity(state, n_wavelength_bins)
     return (
         throughput
         * _field_applied_throughput_or_unity(state, n_wavelength_bins)
         * _physical_arm_fraction(state)
-        * _splitter_input_fraction(state)
     )
 
 
-def _splitter_input_fraction(state: SimulationState) -> float:
-    """Sky-étendue correction for duplicated-input architectures.
+def _diffuse_port_routing(
+    state: SimulationState,
+    n_wavelength_bins: int,
+) -> tuple[NDArray[np.float64], NDArray[np.intp], str]:
+    """Share of one physical input's diffuse power reaching each chip output.
 
-    Sky enters through the PHYSICAL guided modes only; after an
-    ``injection.mode_splitter`` fanout each of the n_output chip modes
-    would otherwise be granted a full single-mode étendue, overcounting
-    the total sky by ``n_output / n_input`` (2x for copies=2 in
-    kilo_keck_6 — review 2026-06-10 Issue 4). For incoherent equal-power
-    inputs through a unitary, each output port carries the per-input-mode
-    power, i.e. ``n_input / n_output`` of a full étendue.
+    Diffuse sky enters every physical guided mode k as independent,
+    equal-power light, so output j receives
+    ``r_j = sum_k |(U S)_jk|^2`` times the per-input power, where U is the
+    deployed chip stack (per wavelength bin, per PBS arm when the chip is
+    deployed per arm) and S the ``injection.mode_splitter`` isometry that
+    sends input k to its copies with amplitude ``1/sqrt(n_copies)``. Copies
+    of one input are coherent, so the chip can steer them unequally: the
+    uniform ``n_in / n_out`` share holds only on average over all outputs
+    (review 2026-11-07 Issue 11). With no chip upstream U is the identity.
+
+    Returns:
+        ``(routing, dark_indices, source)``: routing has shape
+        ``(n_outputs, n_wavelength_bins)``, averaged over PBS arms (each arm
+        already carries ``1/n_arm`` of the power through
+        ``_physical_arm_fraction``).
     """
 
-    for payload in reversed(tuple(state.geometry.components.values())):
-        if not isinstance(payload, Mapping):
-            continue
-        n_input = payload.get("n_input_modes")
-        n_output = payload.get("n_output_modes")
-        if n_input is None or n_output is None:
-            continue
-        try:
-            fraction = float(n_input) / float(n_output)
-        except (TypeError, ValueError, ZeroDivisionError):
-            continue
-        if np.isfinite(fraction) and 0.0 < fraction <= 1.0:
-            return fraction
-    return 1.0
+    chip = _latest_chip_transfer(state)
+    if chip is None:
+        if state.field.amplitudes is None:
+            raise ValueError("background stages require field amplitudes.")
+        n_chip_inputs = int(np.asarray(state.field.amplitudes).shape[0])
+        stacks = np.eye(n_chip_inputs, dtype=np.complex128)[
+            np.newaxis, :, :, np.newaxis
+        ]
+        source = "identity (no chip transfer stack upstream)"
+        n_bright, n_dark = 0, None
+    else:
+        name, payload = chip
+        per_arm = payload.get("u_stack_per_arm")
+        stacks = np.asarray(
+            payload["u_stack"] if per_arm is None else per_arm,
+            dtype=np.complex128,
+        )
+        if per_arm is None:
+            stacks = stacks[np.newaxis]
+        if stacks.shape[3] != n_wavelength_bins:
+            raise ValueError(
+                f"background: chip component {name!r} stack has "
+                f"{stacks.shape[3]} wavelength bins, expected {n_wavelength_bins}."
+            )
+        n_chip_inputs = stacks.shape[2]
+        source = f"results.{name}." + ("u_stack" if per_arm is None else "u_stack_per_arm")
+        n_bright = int(payload.get("n_bright_ports", 0))
+        n_dark = payload.get("n_dark_ports")
+
+    splitter = _splitter_isometry(state, n_chip_inputs)
+    routed = np.einsum("aoiw,ip->aopw", stacks, splitter)
+    routing = np.mean(np.sum(np.abs(routed) ** 2, axis=2), axis=0)
+    n_outputs = routing.shape[0]
+    if n_dark:
+        dark_indices = np.arange(n_bright, n_bright + int(n_dark), dtype=np.intp)
+    else:
+        dark_indices = np.arange(n_outputs, dtype=np.intp)
+    if routing.shape[1] == 1 and n_wavelength_bins > 1:
+        routing = np.repeat(routing, n_wavelength_bins, axis=1)
+    return routing, dark_indices, source
+
+
+def _latest_chip_transfer(
+    state: SimulationState,
+) -> tuple[str, Mapping[str, Any]] | None:
+    for name, payload in reversed(tuple(state.results.components.items())):
+        if name.startswith("chip.") and isinstance(payload, Mapping) and (
+            "u_stack" in payload
+        ):
+            return name, payload
+    return None
+
+
+def _splitter_isometry(
+    state: SimulationState,
+    n_chip_inputs: int,
+) -> NDArray[np.float64]:
+    """Matrix S (n_chip_inputs, n_physical) of the guided-mode fanout."""
+
+    found = splitter_physical_indices(state, n_chip_inputs)
+    if found is None:
+        return np.eye(n_chip_inputs, dtype=np.float64)
+    physical = found[0]
+    counts = np.bincount(physical)
+    isometry = np.zeros((n_chip_inputs, counts.size), dtype=np.float64)
+    isometry[np.arange(n_chip_inputs), physical] = 1.0 / np.sqrt(counts[physical])
+    return isometry
+
+
+def _routed_sky_payload(
+    state: SimulationState,
+    rate_per_input_per_bin_hz: NDArray[np.float64],
+) -> dict[str, Any]:
+    """Route a per-input diffuse rate through the chip to its output ports.
+
+    The dark-port keys carry the mean over the deployed chip's dark rows.
+    The spectro-port keys carry the mean over all outputs, which is exact
+    for any unitary (``n_in / n_out`` of a full input), because the
+    characterization stages retune the spectro rows downstream and the
+    detection chip's spectro rows do not describe the port they observe.
+    """
+
+    routing, dark_indices, source = _diffuse_port_routing(
+        state, rate_per_input_per_bin_hz.size,
+    )
+    dark_per_bin = rate_per_input_per_bin_hz * np.mean(routing[dark_indices], axis=0)
+    all_port_per_bin = rate_per_input_per_bin_hz * np.mean(routing, axis=0)
+    return {
+        "sky_rate_hz_per_input_mode": float(np.sum(rate_per_input_per_bin_hz)),
+        "sky_routing_fraction_per_port": routing.astype(np.float64, copy=True),
+        "sky_routing_dark_port_indices": dark_indices.astype(np.int64, copy=True),
+        "sky_routing_source": source,
+        "sky_rate_hz_per_output_port": (
+            routing @ rate_per_input_per_bin_hz
+        ).astype(np.float64, copy=True),
+        "sky_rate_hz_per_bin": dark_per_bin.astype(np.float64, copy=True),
+        "sky_rate_hz_per_dark_port": float(np.sum(dark_per_bin)),
+        "sky_rate_hz_per_spectro_port": float(np.sum(all_port_per_bin)),
+    }
 
 
 def _field_applied_throughput_or_unity(
@@ -372,9 +495,14 @@ def _sky_rate_per_bin_hz(
     bandwidth_um: NDArray[np.float64],
     band: str,
     area_per_sub_m2: float,
-    spaxel_arcsec2: float,
+    spaxel_arcsec2: float | NDArray[np.float64],
     throughput: NDArray[np.float64],
 ) -> NDArray[np.float64]:
+    """Sky photon rate per bin into one physical input mode (before routing).
+
+    ``spaxel_arcsec2`` is a scalar or one solid angle per wavelength bin.
+    """
+
     rates = np.array(
         [
             photon_rate_per_m2_per_bin(
@@ -387,4 +515,4 @@ def _sky_rate_per_bin_hz(
         ],
         dtype=np.float64,
     )
-    return rates * float(area_per_sub_m2) * float(spaxel_arcsec2) * throughput
+    return rates * float(area_per_sub_m2) * np.asarray(spaxel_arcsec2) * throughput

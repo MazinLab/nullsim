@@ -291,6 +291,13 @@ def _throughput_component(
         # detector reads the top-level transmission_fraction and gets it from
         # |field|^2.
         "field_amplitude_applied": True,
+        # The Strehl x overlap coupling is a point-source factor: a diffuse
+        # background's single-mode coupling is fixed by the étendue, so
+        # background stages read diffuse_transmission_fraction instead. This
+        # coupling has no Fresnel term, so nothing is lost for diffuse light
+        # (same exemption as injection.ideal; review 2026-11-07 row 42).
+        "point_source_coupling_only": True,
+        "diffuse_transmission_fraction": tuple(1.0 for _ in wavelength_grid_um),
     }
 
 
