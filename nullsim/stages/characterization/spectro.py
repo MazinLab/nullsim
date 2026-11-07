@@ -15,7 +15,9 @@ from pydantic import Field as PydanticField
 from nullsim.physics.characterization import (
     build_unitary_stack_from_params,
     disk_sample_stellar_stack,
+    mode_piston_opd_covariance_m2,
     optimize_characterization,
+    piston_averaged_port_power,
     spectro_disk_leak,
     spectro_disk_leak_from_stack,
 )
@@ -490,13 +492,14 @@ class SpectroCharacterization(BaseStage):
             "scene.planet_contrast",
         )
 
-        realized_spectro_floor, realized_spectro_floor_model = (
+        realized_spectro_floor, realized_spectro_floor_model, spectro_leak_rms = (
             _realized_spectro_floor_for_stack(
                 sensitivity=sensitivity,
                 u_stack=u_stack,
                 base_amplitudes=base_amplitudes,
                 spectro_idx=spectro_idx,
                 wavelengths_m=wavelengths_m,
+                stellar_rate_weights=detected_stellar_rate_by_wavelength_hz,
                 n_dark_ports=params.n_dark_ports,
                 n_spectro_ports=params.n_spectro_ports,
             )
@@ -544,6 +547,12 @@ class SpectroCharacterization(BaseStage):
             planet_contrast=planet_contrast,
             disk_leak_per_wavelength=band_disk_leak_per_wl,
             stellar_angular_diameter_mas=state.scene.star_angular_diameter_mas,
+            piston_opd_covariance_m2=_mc_piston_opd_covariance_m2(
+                sensitivity, params.n_modes,
+            ),
+            fiber_phase_noise_rms_rad=float(
+                _optional_float(sensitivity.get("fiber_phase_noise_rms_rad")) or 0.0
+            ),
         )
         static_leak_fraction_for_rates = float(
             band_metrics["static_leak_fraction"]
@@ -555,7 +564,11 @@ class SpectroCharacterization(BaseStage):
         )
         leakage_rate_hz = spectro_leak_fraction * detected_stellar_rate_hz
 
-        null_instability = float(sensitivity.get("null_instability", 0.0))
+        null_instability, null_instability_source = _spectro_null_instability(
+            sensitivity=sensitivity,
+            leak_rms=spectro_leak_rms,
+            leak_fraction=spectro_leak_fraction,
+        )
         eps_systematic = _combined_systematic_eps(
             null_instability=null_instability
             / float(params.nsc_systematic_reduction),
@@ -563,17 +576,10 @@ class SpectroCharacterization(BaseStage):
                 params.residual_speckle_stability_factor
             ),
         )
-        servo_bw_hz = float(
-            sensitivity.get("effective_systematic_bandwidth_hz")
-            or params.default_servo_bw_hz
-        )
-        sky_rate_hz_per_spectro_port, sky_rate_source = (
-            _resolve_background_rate_hz_per_port(
-                state=state,
-                configured_rate_hz_per_port=params.n_sky_background_hz,
-                port_kind="spectro",
-            )
-        )
+        servo_bw_hz = _servo_bw_hz(sensitivity, params)
+        n_pol_arms, sky_rate_hz_per_spectro_arm, sky_rate_hz_per_spectro_port, (
+            sky_rate_source
+        ) = _spectro_sky_rate_hz(state, detector, params.n_sky_background_hz)
         snr_breakdown = _compute_snr(
             planet_rate_hz=planet_signal_rate_hz,
             leakage_rate_hz=leakage_rate_hz,
@@ -750,6 +756,8 @@ class SpectroCharacterization(BaseStage):
             "D": float(snr_breakdown["D"]),
             "Sky": float(snr_breakdown["Sky"]),
             "sky_rate_hz_per_spectro_port": float(sky_rate_hz_per_spectro_port),
+            "sky_rate_hz_per_spectro_arm": float(sky_rate_hz_per_spectro_arm),
+            "n_pol_arms": int(n_pol_arms),
             "sky_rate_source": sky_rate_source,
             "systematic_var": float(snr_breakdown["systematic_var"]),
             "max_spectral_resolution": float(achievable_max_r),
@@ -758,9 +766,17 @@ class SpectroCharacterization(BaseStage):
             "band_lambda_m": float(wl_design_m),
             "band_bandwidth_m": float(band_bandwidth_m),
             "null_instability": float(null_instability),
+            "null_instability_source": null_instability_source,
+            "spectro_leak_rms_fraction": (
+                None if spectro_leak_rms is None else float(spectro_leak_rms)
+            ),
+            "detection_null_instability": float(
+                sensitivity.get("null_instability", 0.0)
+            ),
             "eps_systematic": float(eps_systematic),
             "nsc_systematic_reduction": float(params.nsc_systematic_reduction),
             "null_floor": float(params.null_floor),
+            # 0 when with_fringe_tracking is false: the quasi-static branch.
             "servo_bw_hz": float(servo_bw_hz),
             # Which branch of _systematic_variance produced systematic_var.
             # Downstream consumers (characterization.hdc_ccf) otherwise have to
@@ -823,10 +839,15 @@ def _snr_limited_max_spectral_resolution(
     sky_rate_hz_per_spectro_port: float,
     pixels_per_resolution_element: int,
 ) -> float:
+    # Rates are pre-spectrograph; the AWG's optical throughput applies to
+    # every optical term, as in ``awg_spectrum``. Sky is summed over all
+    # spectro ports to match the summed planet and leakage rates.
     return max_spectral_resolution(
         planet_rate_total_hz=planet_signal_rate_hz,
         leakage_rate_total_hz=leakage_rate_hz,
-        spectro_throughput=1.0,
+        spectro_throughput=(
+            params.awg_throughput if params.spectrograph == "awg" else 1.0
+        ),
         band_lambda_m=wl_design_m,
         band_bandwidth_m=band_bandwidth_m,
         integration_time_s=integration_time_s,
@@ -837,9 +858,50 @@ def _snr_limited_max_spectral_resolution(
         snr_min=params.snr_min_per_bin,
         resolving_power_cap=params.resolving_power_cap,
         resolving_power_floor=params.resolving_power_floor,
-        sky_rate_hz_per_spectro_port=sky_rate_hz_per_spectro_port,
+        sky_rate_hz_per_spectro_port=(
+            sky_rate_hz_per_spectro_port * params.n_spectro_ports
+        ),
         pixels_per_resolution_element=pixels_per_resolution_element,
     )
+
+
+def _servo_bw_hz(sensitivity: dict[str, Any], params: Any) -> float:
+    """Systematic averaging bandwidth, or 0 (quasi-static) without fringe tracking.
+
+    ``physics.spectroscopy`` treats a zero bandwidth as the unaveraged
+    systematic branch, so every spectrograph SNR call honors
+    ``with_fringe_tracking`` the way the headline ``_compute_snr`` does.
+    """
+
+    if not params.with_fringe_tracking:
+        return 0.0
+    return float(
+        sensitivity.get("effective_systematic_bandwidth_hz")
+        or params.default_servo_bw_hz
+    )
+
+
+def _spectro_sky_rate_hz(
+    state: SimulationState,
+    detector: dict[str, Any],
+    configured_rate_hz_per_port: float,
+) -> tuple[int, float, float, str]:
+    """Return ``(n_pol_arms, sky per arm, sky per logical spectro port, source)``.
+
+    Background stages and ``n_sky_background_hz`` give the sky per physical
+    detector channel. A dual-pol pipeline feeds each logical spectro port
+    from ``n_pol_arms`` PBS arms, each carrying that sky, while the spectro
+    stellar and planet rates are arm totals; charge every arm, as
+    ``performance.standard`` counts every dark channel.
+    """
+
+    sky_per_arm_hz, source = _resolve_background_rate_hz_per_port(
+        state=state,
+        configured_rate_hz_per_port=configured_rate_hz_per_port,
+        port_kind="spectro",
+    )
+    n_pol_arms = max(int(detector.get("n_pol_arms") or 1), 1)
+    return n_pol_arms, sky_per_arm_hz, sky_per_arm_hz * n_pol_arms, source
 
 
 def _result_u_stack_or_build(
@@ -1237,29 +1299,38 @@ def _realized_spectro_floor_for_stack(
     base_amplitudes: NDArray[np.float64],
     spectro_idx: NDArray[np.intp],
     wavelengths_m: NDArray[np.float64],
+    stellar_rate_weights: NDArray[np.float64],
     n_dark_ports: int,
     n_spectro_ports: int,
-) -> tuple[float, str]:
-    """Return dynamic spectro leakage for the retuned characterization chip."""
+) -> tuple[float, str, float | None]:
+    """Return dynamic spectro leakage for the retuned characterization chip.
 
-    retuned_floor = _retuned_spectro_dynamic_floor(
+    Returns ``(floor, model, leak_rms)``. ``leak_rms`` is the RMS of the
+    photon-weighted band leakage fraction of the retuned spectro ports, or
+    ``None`` on the legacy path where the retuned MC cannot run.
+    """
+
+    retuned = _retuned_spectro_dynamic_floor(
         sensitivity=sensitivity,
         u_stack=u_stack,
         base_amplitudes=base_amplitudes,
         spectro_idx=spectro_idx,
         wavelengths_m=wavelengths_m,
+        stellar_rate_weights=stellar_rate_weights,
     )
     override_extra = _spectro_override_extra(
         sensitivity=sensitivity,
         n_dark_ports=n_dark_ports,
         n_spectro_ports=n_spectro_ports,
     )
-    if retuned_floor is not None:
+    if retuned is not None:
+        retuned_floor, leak_rms = retuned
         return (
             float(retuned_floor + override_extra),
             "retuned spectro unitary realized-null MC using the upstream "
             "piston/scintillation covariance, with detection-mode static "
-            "terms removed",
+            "terms removed; photon-weighted over the band",
+            leak_rms,
         )
 
     return (
@@ -1271,6 +1342,57 @@ def _realized_spectro_floor_for_stack(
         "legacy upstream realized dynamic floor after removing detection-chip "
         "static terms, assigned to retuned spectro ports in proportion to "
         "their share of the detection dark-port set",
+        None,
+    )
+
+
+def _spectro_null_instability(
+    *,
+    sensitivity: dict[str, Any],
+    leak_rms: float | None,
+    leak_fraction: float,
+) -> tuple[float, str]:
+    """Return the spectro port's leakage CV used as characterization epsilon.
+
+    The CV is the retuned port's band-leakage RMS over its total (static plus
+    dynamic) leak fraction, so ``eps * leakage_rate`` is the leakage-rate
+    fluctuation in the same normalization as the rates. Without the retuned
+    MC, fall back to the detection chip's published CV.
+    """
+
+    if leak_rms is None:
+        return (
+            float(sensitivity.get("null_instability", 0.0)),
+            "sensitivity.detection_curve null_instability (retuned MC unavailable)",
+        )
+    cv = leak_rms / leak_fraction if leak_fraction > 0.0 else 0.0
+    return float(cv), "retuned spectro port band-leakage RMS / spectro_leak_fraction"
+
+
+def _mc_piston_opd_covariance_m2(
+    sensitivity: dict[str, Any],
+    n_modes: int,
+) -> NDArray[np.float64] | None:
+    """Per-mode piston covariance the retuned realized-floor MC draws from.
+
+    ``None`` when that MC does not run, so planet and stellar leakage see the
+    same piston (or none).
+    """
+
+    n_per_az = _optional_int(sensitivity.get("n_realizations_per_azimuth"))
+    if n_per_az is None or n_per_az <= 0:
+        return None
+    return mode_piston_opd_covariance_m2(
+        n_modes=n_modes,
+        opd_rms_per_sub_m=_optional_array_or_scalar(
+            sensitivity.get("ao_piston_opd_rms_per_sub_m"), default=0.0,
+        ),
+        opd_covariance_m2=_optional_matrix(
+            sensitivity.get("ao_piston_opd_covariance_m2")
+        ),
+        mode_group_indices=_optional_index_array(
+            sensitivity.get("realized_null_mode_group_indices"), n_modes=n_modes,
+        ),
     )
 
 
@@ -1281,7 +1403,17 @@ def _retuned_spectro_dynamic_floor(
     base_amplitudes: NDArray[np.float64],
     spectro_idx: NDArray[np.intp],
     wavelengths_m: NDArray[np.float64],
-) -> float | None:
+    stellar_rate_weights: NDArray[np.float64],
+) -> tuple[float, float] | None:
+    """Return the retuned port's photon-weighted dynamic floor and leak RMS.
+
+    Both use per-realization band leakage ``L_r = sum_k w_k N_kr`` with
+    ``w`` the normalized detected stellar rate per bin: the floor is
+    ``E[L] - L_static`` and the RMS is the within-azimuth standard deviation
+    of ``L_r``. The MC shares one piston draw across wavelength bins, so the
+    bins are paired realizations.
+    """
+
     n_per_az = _optional_int(sensitivity.get("n_realizations_per_azimuth"))
     if n_per_az is None:
         return None
@@ -1315,7 +1447,20 @@ def _retuned_spectro_dynamic_floor(
             _optional_float(sensitivity.get("fiber_phase_noise_rms_rad")) or 0.0
         ),
     )
-    return max(float(mc.mean_null_depth - mc.ideal_null_depth), 0.0)
+    if mc.samples_by_wavelength is None:  # MC disabled: no dynamic term
+        return 0.0, 0.0
+    weights = np.asarray(stellar_rate_weights, dtype=np.float64)
+    weights = weights / np.sum(weights)
+    out = np.einsum("pmk,m->kp", u_stack, base_amplitudes.astype(np.complex128))
+    power = np.abs(out) ** 2
+    ideal_per_wl = np.sum(power[:, spectro_idx], axis=1) / np.sum(power, axis=1)
+    samples = mc.samples_by_wavelength.reshape(
+        wavelengths_m.size, mc.n_azimuths, mc.n_realizations_per_azimuth,
+    )
+    band_leak = np.einsum("k,kar->ar", weights, samples)
+    floor = max(float(np.mean(band_leak) - weights @ ideal_per_wl), 0.0)
+    leak_rms = math.sqrt(float(np.mean(np.var(band_leak, axis=1))))
+    return floor, leak_rms
 
 
 def _spectro_override_extra(
@@ -1373,8 +1518,16 @@ def _band_evaluated_spectro_metrics(
     planet_contrast: float,
     disk_leak_per_wavelength: NDArray[np.float64],
     stellar_angular_diameter_mas: float | None,
+    piston_opd_covariance_m2: NDArray[np.float64] | None = None,
+    fiber_phase_noise_rms_rad: float = 0.0,
 ) -> dict[str, Any]:
-    """Evaluate deployed spectro leakage and planet signal over the band."""
+    """Evaluate deployed spectro leakage and planet signal over the band.
+
+    With ``piston_opd_covariance_m2`` (the realized-floor MC's per-mode
+    covariance) the planet throughput is the piston expectation
+    ``E|U_s(X exp(i phi))|^2`` with phase covariance ``k^2 C + sigma_f^2 I``,
+    ``k = 2 pi / lambda``, matching the piston the stellar floor carries.
+    """
 
     expected_shape = (base_amplitudes.size, base_amplitudes.size, wavelengths_m.size)
     if u_stack.shape != expected_shape:
@@ -1403,6 +1556,13 @@ def _band_evaluated_spectro_metrics(
     planet_throughput = np.zeros(wavelengths_m.size, dtype=np.float64)
     planet_to_star_ratio = np.zeros(wavelengths_m.size, dtype=np.float64)
     planet_rate_by_wavelength = np.zeros(wavelengths_m.size, dtype=np.float64)
+    n_modes = base_amplitudes.size
+    if piston_opd_covariance_m2 is None:
+        opd_covariance = np.zeros((n_modes, n_modes), dtype=np.float64)
+        phase_noise_covariance = opd_covariance
+    else:
+        opd_covariance = np.asarray(piston_opd_covariance_m2, dtype=np.float64)
+        phase_noise_covariance = fiber_phase_noise_rms_rad**2 * np.eye(n_modes)
 
     for index, wavelength_m in enumerate(wavelengths_m):
         unitary = u_stack[:, :, index]
@@ -1426,11 +1586,14 @@ def _band_evaluated_spectro_metrics(
         )
         planet_total = float(np.sum(np.abs(planet_field) ** 2))
         if planet_total > 0.0:
-            planet_output = unitary @ planet_field
-            planet_throughput[index] = (
-                float(np.sum(np.abs(planet_output[spectro_idx]) ** 2))
-                / planet_total
-            )
+            k = 2.0 * math.pi / float(wavelength_m)
+            phase_covariance = k * k * opd_covariance + phase_noise_covariance
+            planet_throughput[index] = piston_averaged_port_power(
+                unitary=unitary,
+                field=planet_field,
+                port_indices=spectro_idx,
+                phase_covariance_rad2=phase_covariance,
+            ) / planet_total
         ang_power_planet = np.asarray(
             angular_coupling_factor(separation_rad, sub_diameters_m, wavelength_m),
             dtype=np.float64,

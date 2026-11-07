@@ -20,6 +20,11 @@ from nullsim.physics.clements import (
     reconstruct_clements,
 )
 from nullsim.physics.fringe_observability import intensity_response_matrix
+from nullsim.physics.realized_null import (
+    _sigma_for_mode_or_group,
+    _validate_mode_group_indices,
+    _validate_piston_covariance,
+)
 from nullsim.physics.ruilier_cassaing import angular_coupling_factor
 
 __all__ = [
@@ -27,7 +32,9 @@ __all__ = [
     "build_unitary_from_params",
     "build_unitary_stack_from_params",
     "disk_sample_stellar_stack",
+    "mode_piston_opd_covariance_m2",
     "optimize_characterization",
+    "piston_averaged_port_power",
     "spectro_disk_leak",
     "spectro_disk_leak_from_stack",
 ]
@@ -270,6 +277,65 @@ def spectro_disk_leak_from_stack(
             n_pa=n_pa,
         )
     return float(np.mean(leak_per_wl)), leak_per_wl
+
+
+def mode_piston_opd_covariance_m2(
+    *,
+    n_modes: int,
+    opd_rms_per_sub_m: float | NDArray[np.float64] = 0.0,
+    opd_covariance_m2: NDArray[np.float64] | None = None,
+    mode_group_indices: NDArray[np.intp] | None = None,
+) -> NDArray[np.float64]:
+    """Per-chip-mode piston OPD covariance drawn by :func:`realized_null_depth_mc`.
+
+    Expands the realized-null MC's piston inputs to an ``(M, M)`` covariance
+    in m^2: an explicit covariance wins (expanded from groups to modes when
+    ``mode_group_indices`` is set); otherwise independent per-mode or
+    per-group RMS values, with modes of one group fully correlated.
+    """
+
+    groups = _validate_mode_group_indices(mode_group_indices, n_modes=n_modes)
+    covariance = _validate_piston_covariance(
+        opd_covariance_m2, n_modes=n_modes, group_indices=groups,
+    )
+    if covariance is not None:
+        matrix, cov_groups = covariance
+        return matrix if cov_groups is None else matrix[np.ix_(cov_groups, cov_groups)]
+    sigma, sigma_groups = _sigma_for_mode_or_group(
+        opd_rms_per_sub_m,
+        n_modes=n_modes,
+        group_indices=groups,
+        name="ao_piston_opd_rms_per_sub_m",
+    )
+    if sigma_groups is None:
+        return np.diag(sigma**2)
+    same_group = sigma_groups[:, None] == sigma_groups[None, :]
+    return np.where(same_group, sigma[sigma_groups][:, None] ** 2, 0.0)
+
+
+def piston_averaged_port_power(
+    *,
+    unitary: NDArray[np.complex128],
+    field: NDArray[np.complex128],
+    port_indices: NDArray[np.intp] | Sequence[int],
+    phase_covariance_rad2: NDArray[np.float64],
+) -> float:
+    """Expected output power ``E sum_s |U_s (X * exp(i phi))|^2`` over Gaussian phase.
+
+    For zero-mean jointly Gaussian input phases ``phi`` with covariance
+    ``Sigma``, ``E exp(i(phi_m - phi_n)) = exp(-(Sigma_mm + Sigma_nn -
+    2 Sigma_mn) / 2)`` (the Gaussian characteristic function), so the
+    expectation is ``sum_s a_s^T G conj(a_s)`` with ``a_s = U_s * X``.
+    Piston scatters a planet's coherent output between ports the same way
+    it scatters starlight into the null.
+    """
+
+    rows = np.asarray(unitary, dtype=np.complex128)[np.asarray(port_indices, dtype=np.intp)]
+    amplitudes = rows * np.asarray(field, dtype=np.complex128)[None, :]
+    cov = np.asarray(phase_covariance_rad2, dtype=np.float64)
+    var = np.diag(cov)
+    coherence = np.exp(-0.5 * (var[:, None] + var[None, :] - 2.0 * cov))
+    return float(np.real(np.einsum("sm,mn,sn->", amplitudes, coherence, amplitudes.conj())))
 
 
 def optimize_characterization(

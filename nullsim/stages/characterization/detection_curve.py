@@ -44,6 +44,8 @@ from nullsim.stages.characterization.spectro import (
     _characterization_wavelength_grid,
     _detected_stellar_rate_by_wavelength_hz,
     _find_sensitivity_component,
+    _mc_piston_opd_covariance_m2,
+    _optional_float,
     _payload_array,
     _port_indices,
     _realized_spectro_floor_for_stack,
@@ -52,6 +54,9 @@ from nullsim.stages.characterization.spectro import (
     _resolve_band_bandwidth_m,
     _resolve_wavelengths_m,
     _result_u_stack_or_build,
+    _servo_bw_hz,
+    _spectro_null_instability,
+    _spectro_sky_rate_hz,
 )
 from nullsim.stages.chip_optimization import _tracker_piston_basis_from_state
 from nullsim.stages.performance.standard import (
@@ -59,7 +64,6 @@ from nullsim.stages.performance.standard import (
     _compute_snr,
     _contrast_curve,
     _find_detector_component,
-    _resolve_background_rate_hz_per_port,
 )
 
 _CHIP_OPT_PREFIX = "chip_optimization"
@@ -304,24 +308,15 @@ class CharacterizationDetectionCurve(BaseStage):
                 "characterization.detection_curve aperture weights sum to zero."
             )
 
-        null_instability = float(sensitivity.get("null_instability", 0.0))
-        eps_systematic = _combined_systematic_eps(
-            null_instability=null_instability
-            / float(params.nsc_systematic_reduction),
-            residual_speckle_stability_factor=float(
-                params.residual_speckle_stability_factor
-            ),
+        servo_bw_hz = _servo_bw_hz(sensitivity, params)
+        n_pol_arms, sky_rate_hz_per_spectro_arm, sky_rate_hz_per_spectro_port, (
+            sky_rate_source
+        ) = _spectro_sky_rate_hz(state, detector, params.n_sky_background_hz)
+        piston_opd_covariance_m2 = _mc_piston_opd_covariance_m2(
+            sensitivity, params.n_modes,
         )
-        servo_bw_hz = float(
-            sensitivity.get("effective_systematic_bandwidth_hz")
-            or params.default_servo_bw_hz
-        )
-        sky_rate_hz_per_spectro_port, sky_rate_source = (
-            _resolve_background_rate_hz_per_port(
-                state=state,
-                configured_rate_hz_per_port=params.n_sky_background_hz,
-                port_kind="spectro",
-            )
+        fiber_phase_noise_rms_rad = float(
+            _optional_float(sensitivity.get("fiber_phase_noise_rms_rad")) or 0.0
         )
         integration_time_s = float(detector["integration_time_s"])
 
@@ -334,6 +329,8 @@ class CharacterizationDetectionCurve(BaseStage):
         leak_fraction_per = np.empty(params.n_anchors, dtype=np.float64)
         leakage_rate_per = np.empty(params.n_anchors, dtype=np.float64)
         snr_per = np.empty(params.n_anchors, dtype=np.float64)
+        null_instability_per = np.empty(params.n_anchors, dtype=np.float64)
+        eps_systematic_per = np.empty(params.n_anchors, dtype=np.float64)
         optimization_success_per = np.empty(params.n_anchors, dtype=bool)
         constraint_margin_per = np.empty(params.n_anchors, dtype=np.float64)
         full_band_constraint_margin_per = np.empty(params.n_anchors, dtype=np.float64)
@@ -530,14 +527,17 @@ class CharacterizationDetectionCurve(BaseStage):
                 planet_contrast=1.0,
                 disk_leak_per_wavelength=band_disk_leak_per_wl,
                 stellar_angular_diameter_mas=state.scene.star_angular_diameter_mas,
+                piston_opd_covariance_m2=piston_opd_covariance_m2,
+                fiber_phase_noise_rms_rad=fiber_phase_noise_rms_rad,
             )
-            realized_spectro_floor, realized_spectro_floor_model = (
+            realized_spectro_floor, realized_spectro_floor_model, leak_rms = (
                 _realized_spectro_floor_for_stack(
                     sensitivity=sensitivity,
                     u_stack=u_stack,
                     base_amplitudes=base_amplitudes,
                     spectro_idx=spectro_idx,
                     wavelengths_m=wavelengths_m,
+                    stellar_rate_weights=detected_stellar_rate_by_wavelength_hz,
                     n_dark_ports=params.n_dark_ports,
                     n_spectro_ports=params.n_spectro_ports,
                 )
@@ -554,6 +554,19 @@ class CharacterizationDetectionCurve(BaseStage):
                 disk_leak = float(np.mean(band_disk_leak_per_wl))
             leak_fraction = static_leak_fraction + realized_spectro_floor
             leakage_rate_hz = leak_fraction * detected_stellar_rate_hz
+            # Epsilon is this anchor's retuned spectro-port leakage CV.
+            null_instability, null_instability_source = _spectro_null_instability(
+                sensitivity=sensitivity,
+                leak_rms=leak_rms,
+                leak_fraction=leak_fraction,
+            )
+            eps_systematic = _combined_systematic_eps(
+                null_instability=null_instability
+                / float(params.nsc_systematic_reduction),
+                residual_speckle_stability_factor=float(
+                    params.residual_speckle_stability_factor
+                ),
+            )
             planet_rate_per_unit_contrast_hz = float(
                 band_metrics["planet_signal_rate_hz"]
             )
@@ -610,6 +623,8 @@ class CharacterizationDetectionCurve(BaseStage):
             leak_fraction_per[index] = float(leak_fraction)
             leakage_rate_per[index] = float(leakage_rate_hz)
             snr_per[index] = float(snr_payload["snr"])
+            null_instability_per[index] = null_instability
+            eps_systematic_per[index] = eps_systematic
             optimization_success_per[index] = bool(result.optimization_success)
             constraint_margin_per[index] = float(result.constraint_margin)
             full_band_constraint_margin_per[index] = band_constraint_margin
@@ -721,13 +736,27 @@ class CharacterizationDetectionCurve(BaseStage):
                 "using photon-rate-weighted characterization SNR proxy"
             ),
             "sky_rate_hz_per_spectro_port": float(sky_rate_hz_per_spectro_port),
+            "sky_rate_hz_per_spectro_arm": float(sky_rate_hz_per_spectro_arm),
+            "n_pol_arms": int(n_pol_arms),
             "sky_rate_source": sky_rate_source,
             "position_angle_deg": float(params.position_angle_deg),
             "target_snr": float(params.target_snr),
             "n_anchors": int(params.n_anchors),
             "n_workers": int(params.n_workers),
             "null_floor": float(params.null_floor),
-            "eps_systematic": float(eps_systematic),
+            # Scalars are anchor medians, like realized_spectro_floor.
+            "null_instability": float(np.nanmedian(null_instability_per)),
+            "null_instability_per_anchor": null_instability_per.astype(
+                np.float64, copy=True,
+            ),
+            "null_instability_source": null_instability_source,
+            "eps_systematic": float(np.nanmedian(eps_systematic_per)),
+            "eps_systematic_per_anchor": eps_systematic_per.astype(
+                np.float64, copy=True,
+            ),
+            # 0 when with_fringe_tracking is false: the quasi-static branch.
+            "servo_bw_hz": float(servo_bw_hz),
+            "with_fringe_tracking": bool(params.with_fringe_tracking),
             "nsc_systematic_reduction": float(params.nsc_systematic_reduction),
             "throughput_weight": float(params.throughput_weight),
             "bright_weight": float(params.bright_weight),

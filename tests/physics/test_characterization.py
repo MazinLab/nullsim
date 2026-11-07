@@ -11,7 +11,9 @@ from nullsim.physics.characterization import (
     build_unitary_from_params,
     build_unitary_stack_from_params,
     disk_sample_stellar_stack,
+    mode_piston_opd_covariance_m2,
     optimize_characterization,
+    piston_averaged_port_power,
     spectro_disk_leak,
     spectro_disk_leak_from_stack,
 )
@@ -596,3 +598,64 @@ def test_torch_preserve_bright_rows_can_start_fresh() -> None:
     assert result.n_restarts_completed >= 1
     assert result.optimal_u_stack is not None
     assert result.tracker_crlb_rms_nm is not None
+
+
+def test_piston_averaged_port_power_matches_bracewell_closed_form() -> None:
+    """Hadamard pair, IID phase sigma per arm: Var(dphi) = 2 sigma^2, so the
+    difference port sees (1 - exp(-sigma^2) cos psi)/2 of a unit-power field
+    whose arms differ in phase by psi."""
+
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=np.complex128) / np.sqrt(2.0)
+    sigma_rad, psi = 0.4, 2.1
+    field = np.array([1.0, np.exp(1j * psi)]) / np.sqrt(2.0)
+    covariance = sigma_rad**2 * np.eye(2)
+
+    dark = piston_averaged_port_power(
+        unitary=hadamard, field=field, port_indices=[1], phase_covariance_rad2=covariance,
+    )
+    bright = piston_averaged_port_power(
+        unitary=hadamard, field=field, port_indices=[0], phase_covariance_rad2=covariance,
+    )
+
+    assert dark == pytest.approx(0.5 * (1.0 - np.exp(-sigma_rad**2) * np.cos(psi)))
+    assert dark + bright == pytest.approx(1.0)
+
+
+def test_piston_averaged_port_power_matches_monte_carlo_with_correlated_phase() -> None:
+    rng = np.random.default_rng(7)
+    n_modes = 4
+    q, _ = np.linalg.qr(rng.normal(size=(n_modes, n_modes)) + 1j * rng.normal(size=(n_modes, n_modes)))
+    field = rng.normal(size=n_modes) + 1j * rng.normal(size=n_modes)
+    a = rng.normal(size=(n_modes, n_modes)) * 0.3
+    covariance = a @ a.T
+    ports = [1, 3]
+
+    phases = rng.multivariate_normal(np.zeros(n_modes), covariance, size=200_000)
+    outputs = (field[None, :] * np.exp(1j * phases)) @ q.T
+    mc_power = float(np.mean(np.sum(np.abs(outputs[:, ports]) ** 2, axis=1)))
+
+    assert piston_averaged_port_power(
+        unitary=q, field=field, port_indices=ports, phase_covariance_rad2=covariance,
+    ) == pytest.approx(mc_power, rel=5.0e-3)
+
+
+def test_mode_piston_covariance_expands_groups_like_realized_null_mc() -> None:
+    groups = np.array([0, 0, 1], dtype=np.intp)
+
+    from_rms = mode_piston_opd_covariance_m2(
+        n_modes=3, opd_rms_per_sub_m=np.array([2.0, 3.0]), mode_group_indices=groups,
+    )
+    np.testing.assert_allclose(
+        from_rms, [[4.0, 4.0, 0.0], [4.0, 4.0, 0.0], [0.0, 0.0, 9.0]],
+    )
+
+    group_cov = np.array([[4.0, 1.0], [1.0, 9.0]])
+    from_cov = mode_piston_opd_covariance_m2(
+        n_modes=3, opd_covariance_m2=group_cov, mode_group_indices=groups,
+    )
+    np.testing.assert_allclose(
+        from_cov, [[4.0, 4.0, 1.0], [4.0, 4.0, 1.0], [1.0, 1.0, 9.0]],
+    )
+    np.testing.assert_allclose(
+        mode_piston_opd_covariance_m2(n_modes=2, opd_rms_per_sub_m=2.0), 4.0 * np.eye(2),
+    )

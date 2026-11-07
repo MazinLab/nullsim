@@ -25,7 +25,9 @@ from nullsim.stages.characterization import (
     SpectroCharacterization,
 )
 from nullsim.stages.characterization.spectro import (
+    _band_evaluated_spectro_metrics,
     _characterization_wavelength_grid,
+    _mc_piston_opd_covariance_m2,
     _realized_spectro_floor_for_stack,
     _realized_spectro_floor,
     _static_spectro_leak_fraction,
@@ -524,9 +526,11 @@ def test_characterization_curve_reports_full_band_leak_margin(
 
     floor_calls: list[object] = []
 
-    def fake_realized_spectro_floor_for_stack(**kwargs: object) -> tuple[float, str]:
+    def fake_realized_spectro_floor_for_stack(
+        **kwargs: object,
+    ) -> tuple[float, str, float | None]:
         floor_calls.append(kwargs["u_stack"])
-        return 1.0e-6 * len(floor_calls), "fake retuned floor"
+        return 1.0e-6 * len(floor_calls), "fake retuned floor", None
 
     monkeypatch.setattr(
         detection_curve_module,
@@ -663,21 +667,23 @@ def test_realized_spectro_floor_replays_retuned_unitary_mc() -> None:
         "fiber_phase_noise_rms_rad": 0.0,
     }
 
-    interferometric_floor, model = _realized_spectro_floor_for_stack(
+    interferometric_floor, model, _ = _realized_spectro_floor_for_stack(
         sensitivity=sensitivity,
         u_stack=hadamard[:, :, np.newaxis],
         base_amplitudes=base,
         spectro_idx=np.array([1], dtype=np.intp),
         wavelengths_m=wavelengths_m,
+        stellar_rate_weights=np.ones(1),
         n_dark_ports=1,
         n_spectro_ports=1,
     )
-    identity_floor, _ = _realized_spectro_floor_for_stack(
+    identity_floor, _, _ = _realized_spectro_floor_for_stack(
         sensitivity=sensitivity,
         u_stack=identity[:, :, np.newaxis],
         base_amplitudes=base,
         spectro_idx=np.array([1], dtype=np.intp),
         wavelengths_m=wavelengths_m,
+        stellar_rate_weights=np.ones(1),
         n_dark_ports=1,
         n_spectro_ports=1,
     )
@@ -872,3 +878,185 @@ def test_per_bin_metrics_share_headline_eps_convention(tmp_path: Path) -> None:
     # ...and the SNR-limited max resolving power must improve with it too
     # (same eps convention), instead of staying pinned at the raw value.
     assert reduced["max_spectral_resolution"] > raw["max_spectral_resolution"]
+
+
+_HADAMARD = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=np.complex128) / np.sqrt(2.0)
+
+
+def _spectro_stage(tmp_path: Path, **overrides: object) -> SpectroCharacterization:
+    params: dict[str, object] = {
+        "n_modes": 2,
+        "n_bright_ports": 1,
+        "n_dark_ports": 0,
+        "n_spectro_ports": 1,
+        "null_floor": 1.0,
+        "n_restarts": 1,
+        "max_iter": 50,
+        "seed": 0,
+        "broadband_n_wavelengths": 1,
+    }
+    params.update(overrides)
+    return SpectroCharacterization(params=params, context=_context(tmp_path))
+
+
+def _with_sensitivity(state: SimulationState, **updates: object) -> SimulationState:
+    components = dict(state.results.components)
+    sens = dict(components["sensitivity.detection_curve"])
+    sens.update(updates)
+    components["sensitivity.detection_curve"] = sens
+    return replace(state, results=replace(state.results, components=components))
+
+
+def test_retuned_spectro_floor_is_photon_weighted_band_leakage() -> None:
+    """Hadamard pair with IID OPD sigma: the difference port leaks
+    (1 - cos(k dOPD))/2 with dOPD ~ N(0, 2 sigma^2). The band leakage
+    L = sum_k w_k (1 - cos(k_k dOPD))/2 is a function of one Gaussian, so
+    its mean and RMS follow from Gauss-Hermite quadrature."""
+
+    wavelengths_m = np.array([1.0e-6, 2.0e-6])
+    rates = np.array([3.0, 1.0])
+    sigma_opd_m = 60.0e-9
+    floor, _, leak_rms = _realized_spectro_floor_for_stack(
+        sensitivity={
+            "ao_piston_opd_rms_per_sub_m": sigma_opd_m,
+            "n_realizations_per_azimuth": 40_000,
+            "mc_seed": 11,
+        },
+        u_stack=np.repeat(_HADAMARD[:, :, None], 2, axis=2),
+        base_amplitudes=np.ones(2),
+        spectro_idx=np.array([1], dtype=np.intp),
+        wavelengths_m=wavelengths_m,
+        stellar_rate_weights=rates,
+        n_dark_ports=1,
+        n_spectro_ports=1,
+    )
+
+    nodes, gh_weights = np.polynomial.hermite_e.hermegauss(60)
+    gh_weights = gh_weights / gh_weights.sum()
+    d_opd = np.sqrt(2.0) * sigma_opd_m * nodes
+    k = 2.0 * np.pi / wavelengths_m
+    band = (rates / rates.sum()) @ (0.5 * (1.0 - np.cos(k[:, None] * d_opd[None, :])))
+    expected_mean = float(gh_weights @ band)
+    expected_rms = float(np.sqrt(gh_weights @ (band - expected_mean) ** 2))
+    unweighted_mean = float(np.mean(0.5 * (1.0 - np.exp(-(k * sigma_opd_m) ** 2))))
+
+    assert floor == pytest.approx(expected_mean, rel=0.03)
+    assert abs(floor - unweighted_mean) > 0.2 * expected_mean
+    assert leak_rms == pytest.approx(expected_rms, rel=0.03)
+
+
+def test_spectro_eps_is_retuned_port_cv_not_detection_null_instability(
+    tmp_path: Path,
+) -> None:
+    state = _with_sensitivity(
+        _state(),
+        null_instability=0.5,
+        ao_piston_opd_rms_per_sub_m=30.0e-9,
+        n_realizations_per_azimuth=500,
+        mc_seed=1,
+    )
+    payload = _spectro_stage(tmp_path).apply(state).results.components[
+        "characterization.spectro"
+    ]
+
+    expected_cv = payload["spectro_leak_rms_fraction"] / payload["spectro_leak_fraction"]
+    assert payload["spectro_leak_rms_fraction"] > 0.0
+    assert payload["null_instability"] == pytest.approx(expected_cv)
+    assert payload["eps_systematic"] == pytest.approx(expected_cv)
+    assert payload["detection_null_instability"] == pytest.approx(0.5)
+
+
+def test_band_metrics_planet_throughput_includes_piston_expectation() -> None:
+    """Planet arms differ in phase by psi = 2 pi B theta / lambda; with IID
+    phase sigma the difference port receives (1 - exp(-sigma^2) cos psi)/2."""
+
+    wavelength_m = 1.25e-6
+    baseline_m, separation_rad = 10.0, 30.0 / 206265e3
+    sigma_opd_m = 80.0e-9
+    sensitivity = {
+        "ao_piston_opd_rms_per_sub_m": sigma_opd_m,
+        "n_realizations_per_azimuth": 10,
+    }
+    covariance = _mc_piston_opd_covariance_m2(sensitivity, 2)
+    metrics = _band_evaluated_spectro_metrics(
+        u_stack=_HADAMARD[:, :, None],
+        wavelengths_m=np.array([wavelength_m]),
+        detected_stellar_rate_by_wavelength_hz=np.array([1.0e6]),
+        positions_m=np.array([[0.0, 0.0], [baseline_m, 0.0]]),
+        coupling_per_sub=np.ones(2),
+        sub_areas_m2=np.ones(2),
+        sub_diameters_m=np.ones(2),
+        base_amplitudes=np.ones(2),
+        spectro_idx=np.array([1], dtype=np.intp),
+        separation_rad=separation_rad,
+        position_angle_rad=math.pi / 2.0,
+        planet_contrast=1.0,
+        disk_leak_per_wavelength=np.zeros(1),
+        stellar_angular_diameter_mas=0.0,
+        piston_opd_covariance_m2=covariance,
+    )
+
+    psi = 2.0 * np.pi * baseline_m * separation_rad / wavelength_m
+    sigma_rad = 2.0 * np.pi * sigma_opd_m / wavelength_m
+    assert metrics["planet_throughput_per_wavelength"][0] == pytest.approx(
+        0.5 * (1.0 - np.exp(-sigma_rad**2) * np.cos(psi))
+    )
+    assert _mc_piston_opd_covariance_m2(
+        {**sensitivity, "n_realizations_per_azimuth": 0}, 2
+    ) is None
+
+
+def test_spectrograph_snr_uses_quasi_static_branch_without_fringe_tracking(
+    tmp_path: Path,
+) -> None:
+    """Without fringe tracking a single AWG bin cannot beat the band SNR, and
+    each bin's systematic is (eps * leakage counts)^2, not servo averaged."""
+
+    state = _with_sensitivity(_state(), null_instability=0.2)
+    payload = _spectro_stage(
+        tmp_path, with_fringe_tracking=False, awg_resolving_power=100.0,
+    ).apply(state).results.components["characterization.spectro"]
+    awg = payload["awg"]
+    t_s = 100.0
+    signal = awg["planet_rate_hz_per_bin"] * t_s
+    leak = awg["leakage_rate_hz_per_bin"] * t_s
+    expected = signal / np.sqrt(signal + leak + (payload["eps_systematic"] * leak) ** 2)
+
+    assert payload["servo_bw_hz"] == 0.0
+    np.testing.assert_allclose(awg["snr_per_bin"], expected, rtol=1.0e-12)
+    assert payload["awg_min_snr_per_bin"] < payload["snr"]
+
+
+def test_max_spectral_resolution_applies_awg_throughput(tmp_path: Path) -> None:
+    """At the returned R the per-bin SNR, with AWG throughput 0.5 on every
+    optical rate and n_bins = 2 R dlambda / lambda, equals snr_min."""
+
+    state = replace(_state(), scene=replace(_state().scene, planet_contrast=1.0e-4))
+    payload = _spectro_stage(
+        tmp_path,
+        awg_throughput=0.5,
+        resolving_power_cap=1.0e9,
+        snr_min_per_bin=5.0,
+    ).apply(state).results.components["characterization.spectro"]
+    r_max = payload["max_spectral_resolution"]
+    n_bins = 2.0 * r_max * payload["band_bandwidth_m"] / payload["band_lambda_m"]
+    signal = payload["planet_signal_rate_hz"] * 0.5 * 100.0 / n_bins
+    leak = payload["leakage_rate_hz"] * 0.5 * 100.0 / n_bins
+
+    assert 1.0 < r_max < 1.0e9
+    assert signal / math.sqrt(signal + leak) == pytest.approx(5.0, rel=1.0e-3)
+
+
+def test_spectro_sky_charges_every_polarization_arm(tmp_path: Path) -> None:
+    state = _state()
+    components = dict(state.results.components)
+    components["detector.mkid"] = {**components["detector.mkid"], "n_pol_arms": 2}
+    state = replace(state, results=replace(state.results, components=components))
+    payload = _spectro_stage(
+        tmp_path, n_sky_background_hz=100.0, awg_throughput=0.5,
+    ).apply(state).results.components["characterization.spectro"]
+
+    assert payload["n_pol_arms"] == 2
+    assert payload["sky_rate_hz_per_spectro_arm"] == pytest.approx(100.0)
+    assert payload["Sky"] == pytest.approx(200.0 * 100.0)
+    assert payload["awg_total_sky_rate_hz"] == pytest.approx(200.0 * 0.5)
