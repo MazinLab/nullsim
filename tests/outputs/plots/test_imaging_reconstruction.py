@@ -13,6 +13,7 @@ from nullsim.config.loader import resolve_config
 from nullsim.config.schema import ImagingPlanetConfig
 from nullsim.outputs import RunCollection, RunRecord
 from nullsim.outputs.plots.imaging_reconstruction import (
+    _build_imaging_inputs,
     _planet_views,
     imaging_reconstruction,
 )
@@ -131,6 +132,7 @@ def test_imaging_reconstruction_writes_plot_json_and_arrays(tmp_path: Path) -> N
     assert record["include_exozodi_glow"] is True
     assert record["sky_rate_hz_per_port"] == pytest.approx(0.06)
     assert record["exozodi_glow_total_contrast"] > 0.0
+    assert record["nnls_converged"] is True
 
 
 def test_imaging_planet_reflected_light_model_derives_contrast(tmp_path: Path) -> None:
@@ -218,7 +220,67 @@ def test_reflected_light_imaging_planet_requires_semi_major_axis() -> None:
         )
 
 
-def _imaging_state() -> SimulationState:
+@pytest.mark.parametrize(
+    ("with_fringe_tracking", "expected_servo_bw_hz"),
+    [(False, 0.0), (True, 2000.0)],
+)
+def test_imaging_inputs_use_physical_star_and_performance_systematic(
+    tmp_path: Path,
+    with_fringe_tracking: bool,
+    expected_servo_bw_hz: float,
+) -> None:
+    # Saturated bright ports: the capped readout total (1e8 Hz) understates
+    # the star; the planet and leakage scale with the physical 3.8e8 Hz. The
+    # systematic is performance's combined eps (0.01), not the bare
+    # sensitivity null_instability (0), and it is averaged over servo cycles
+    # only when performance charged it that way.
+    config = resolve_config(
+        {
+            "run": {"name": "imaging_inputs", "seed": 3},
+            "grid": {
+                "wavelength_center_um": 1.0,
+                "wavelength_bandwidth_um": 0.1,
+                "n_wavelength_bins": 3,
+            },
+            "scene": {
+                "star": {"jmag": 5.0, "angular_diameter_mas": 1.0, "distance_pc": 5.0},
+                "planet": {
+                    "contrast": 5.0e-7,
+                    "separation_mas": 20.0,
+                    "position_angle_deg": 90.0,
+                },
+            },
+            "observation": {"integration_time_s": 60.0},
+            "pipeline": {"stages": [{"id": "scene", "type": "scene.point_source"}]},
+            "output": {"imaging_reconstruction": {"n_pix": 8, "fov_mas": 45.0}},
+        }
+    )
+    state = _imaging_state(
+        performance_overrides={
+            "stellar_rate_hz_total_uncapped": 3.8e8,
+            "eps_systematic_used": 0.01,
+            "with_fringe_tracking": with_fringe_tracking,
+            "servo_bw_hz": 2000.0,
+        }
+    )
+    record = RunRecord(
+        config=config,
+        result=RunResult(
+            state=state, diagnostics={}, timings=(), cache_hit_count=0, config_hash="cfg"
+        ),
+        run_dir=tmp_path,
+        coord_tuple=(),
+    )
+
+    inputs = _build_imaging_inputs(record, config.output.imaging_reconstruction)
+
+    assert inputs.stellar_photon_rate_hz == pytest.approx(3.8e8)
+    assert float(np.sum(inputs.stellar_rate_hz_by_wavelength)) == pytest.approx(3.8e8)
+    assert inputs.eps_systematic == pytest.approx(0.01)
+    assert inputs.servo_bw_hz == expected_servo_bw_hz
+
+
+def _imaging_state(performance_overrides: dict | None = None) -> SimulationState:
     state = SimulationState.empty({"wavelength_grid_um": (0.95, 1.0, 1.05)})
     geometry = Geometry(
         diameter_m=1.0,
@@ -310,6 +372,7 @@ def _imaging_state() -> SimulationState:
                 "sky_rate_hz_per_port": 0.1,
                 "null_instability": 0.0,
                 "servo_bw_hz": 0.0,
+                **(performance_overrides or {}),
             },
         ),
     ):

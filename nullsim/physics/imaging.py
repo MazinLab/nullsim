@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Sequence
+import warnings
 
 import numpy as np
 from numpy.typing import NDArray
@@ -68,6 +69,9 @@ class ObservationData:
     baseline_counts: NDArray[np.float64] | None = None
     variance_counts: NDArray[np.float64] | None = None
     wavelengths_m: NDArray[np.float64] | None = None
+    # Band weights (stellar photon fraction per wavelength, summing to one)
+    # used to build the band-averaged response rows. None means uniform.
+    wavelength_weights: NDArray[np.float64] | None = None
 
 
 @dataclass(frozen=True)
@@ -79,7 +83,11 @@ class ReconstructedImage:
     clean_components: tuple[tuple[int, int, float], ...]
     synthesized_beam: NDArray[np.float64]
     method: str
-    n_iterations: int
+    n_iterations: int | None
+    converged: bool = True
+    solver_status: int | None = None
+    solver_message: str = ""
+    residual_norm: float | None = None
 
 
 def create_scene(
@@ -234,8 +242,16 @@ def build_response_matrix(
     latitude_rad: float = MAUNAKEA_LAT_RAD,
     unitaries_by_wavelength: Sequence[tuple[NDArray[np.complex128], float]] = (),
     roll_angles_rad: NDArray[np.float64] | None = None,
+    wavelength_weights: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
-    """Build the linear response matrix mapping contrast pixels to dark ports."""
+    """Build the linear response matrix mapping contrast pixels to dark ports.
+
+    Each row is the band average of the per-wavelength beams, weighted by
+    ``wavelength_weights`` (the star's photon fraction in each bin, summing to
+    one; uniform when None). A planet of flat contrast ``c`` contributes
+    ``c * F_lambda`` photons in each bin, so its band count is
+    ``c * F_total * sum_lambda w_lambda B_lambda``.
+    """
 
     wl_pairs = _unitary_wavelength_pairs(unitary, wavelength_m, unitaries_by_wavelength)
     n_time = int(len(hour_angles_rad))
@@ -257,6 +273,7 @@ def build_response_matrix(
                 m_coords=m_coords,
                 latitude_rad=latitude_rad,
                 unitary_wavelength_pairs=wl_pairs,
+                wavelength_weights=wavelength_weights,
             )
         )
     return response
@@ -367,7 +384,13 @@ def simulate_phase_chopped_observation(
     dark_count_rate_hz_per_port_by_wavelength: NDArray[np.float64] | None = None,
     sky_rate_hz_per_port_by_wavelength: NDArray[np.float64] | None = None,
 ) -> ObservationData:
-    """Simulate a signed phase-chopped dark-port observation."""
+    """Simulate a signed phase-chopped dark-port observation.
+
+    The plus and minus rows are a unitary recombination of the dark pairs, so
+    together they carry the dark power once: each state's rows receive their
+    share of the realized dark leakage, the same share they take of a
+    planet's light.
+    """
 
     if stellar_photon_rate_hz < 0.0:
         raise ValueError("stellar_photon_rate_hz must be non-negative.")
@@ -388,15 +411,24 @@ def simulate_phase_chopped_observation(
     )
     n_chop = int(chop_indices.size)
     wavelengths = np.asarray([wavelength for _unitary, wavelength in plus_pairs])
+    n_wl = int(len(plus_pairs))
+    stellar_rates_by_wl = _rates_by_wavelength(
+        total_rate_hz=float(stellar_photon_rate_hz),
+        rates_by_wavelength=stellar_photon_rate_hz_by_wavelength,
+        n_wavelengths=n_wl,
+        name="stellar_photon_rate_hz_by_wavelength",
+    )
+    weights = _band_weights(stellar_rates_by_wl)
+    leakage_plus, leakage_minus = _chopped_leakage_counts(
+        amplitudes=amplitudes,
+        plus_pairs=plus_pairs,
+        minus_pairs=minus_pairs,
+        null_depth=float(null_depth),
+        stellar_photon_rate_hz_by_wavelength=stellar_rates_by_wl,
+        integration_time_per_step_s=dt_state,
+    )
 
     if wavelength_resolved:
-        n_wl = int(len(plus_pairs))
-        stellar_rates_by_wl = _rates_by_wavelength(
-            total_rate_hz=float(stellar_photon_rate_hz),
-            rates_by_wavelength=stellar_photon_rate_hz_by_wavelength,
-            n_wavelengths=n_wl,
-            name="stellar_photon_rate_hz_by_wavelength",
-        )
         dark_rates_by_wl = _rates_by_wavelength(
             total_rate_hz=float(dark_count_rate_hz_per_port),
             rates_by_wavelength=dark_count_rate_hz_per_port_by_wavelength,
@@ -445,24 +477,6 @@ def simulate_phase_chopped_observation(
         response_diff = response_plus - response_minus
         planet_plus = response_scale * (response_plus @ scene.image.ravel())
         planet_minus = response_scale * (response_minus @ scene.image.ravel())
-        leakage_plus = _stellar_leakage_counts_per_wavelength(
-            amplitudes=amplitudes,
-            unitary=plus_pairs[0][0],
-            dark_port_indices=chop_indices,
-            null_depth=float(null_depth),
-            stellar_photon_rate_hz_by_wavelength=stellar_rates_by_wl,
-            integration_time_per_step_s=dt_state,
-            unitaries_by_wavelength=plus_pairs,
-        )
-        leakage_minus = _stellar_leakage_counts_per_wavelength(
-            amplitudes=amplitudes,
-            unitary=minus_pairs[0][0],
-            dark_port_indices=chop_indices,
-            null_depth=float(null_depth),
-            stellar_photon_rate_hz_by_wavelength=stellar_rates_by_wl,
-            integration_time_per_step_s=dt_state,
-            unitaries_by_wavelength=minus_pairs,
-        )
         leakage_scales = _leakage_time_scales(
             n_time=n_time,
             null_instability=float(null_instability),
@@ -523,6 +537,7 @@ def simulate_phase_chopped_observation(
             baseline_counts=(baseline_plus - baseline_minus).reshape(measurement_shape),
             variance_counts=(expected_plus + expected_minus).reshape(measurement_shape),
             wavelengths_m=wavelengths.astype(np.float64, copy=True),
+            wavelength_weights=weights,
         )
 
     response_plus = build_response_matrix(
@@ -538,6 +553,7 @@ def simulate_phase_chopped_observation(
         latitude_rad=latitude_rad,
         unitaries_by_wavelength=plus_pairs,
         roll_angles_rad=roll_angles_rad,
+        wavelength_weights=weights,
     )
     response_minus = build_response_matrix(
         subapertures=subapertures,
@@ -552,6 +568,7 @@ def simulate_phase_chopped_observation(
         latitude_rad=latitude_rad,
         unitaries_by_wavelength=minus_pairs,
         roll_angles_rad=roll_angles_rad,
+        wavelength_weights=weights,
     )
     response_scale = np.full(
         n_time * n_chop,
@@ -561,24 +578,8 @@ def simulate_phase_chopped_observation(
     response_diff = response_plus - response_minus
     planet_plus = response_scale * (response_plus @ scene.image.ravel())
     planet_minus = response_scale * (response_minus @ scene.image.ravel())
-    leakage_plus = _stellar_leakage_counts_per_port(
-        amplitudes=amplitudes,
-        unitary=plus_pairs[0][0],
-        dark_port_indices=chop_indices,
-        null_depth=float(null_depth),
-        stellar_photon_rate_hz=float(stellar_photon_rate_hz),
-        integration_time_per_step_s=dt_state,
-        unitaries_by_wavelength=plus_pairs,
-    )
-    leakage_minus = _stellar_leakage_counts_per_port(
-        amplitudes=amplitudes,
-        unitary=minus_pairs[0][0],
-        dark_port_indices=chop_indices,
-        null_depth=float(null_depth),
-        stellar_photon_rate_hz=float(stellar_photon_rate_hz),
-        integration_time_per_step_s=dt_state,
-        unitaries_by_wavelength=minus_pairs,
-    )
+    leakage_plus = leakage_plus.sum(axis=0)
+    leakage_minus = leakage_minus.sum(axis=0)
     leakage_scales = _leakage_time_scales(
         n_time=n_time,
         null_instability=float(null_instability),
@@ -639,7 +640,33 @@ def simulate_phase_chopped_observation(
         baseline_counts=(baseline_plus - baseline_minus).reshape(n_time, n_chop),
         variance_counts=(expected_plus + expected_minus).reshape(n_time, n_chop),
         wavelengths_m=wavelengths.astype(np.float64, copy=True),
+        wavelength_weights=weights,
     )
+
+
+def _chopped_leakage_counts(
+    *,
+    amplitudes: NDArray[np.complex128],
+    plus_pairs: Sequence[tuple[NDArray[np.complex128], float]],
+    minus_pairs: Sequence[tuple[NDArray[np.complex128], float]],
+    null_depth: float,
+    stellar_photon_rate_hz_by_wavelength: NDArray[np.float64],
+    integration_time_per_step_s: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Split one realized dark leakage over the plus and minus rows jointly."""
+
+    joint = _stellar_leakage_counts_per_wavelength(
+        amplitudes=amplitudes,
+        rows_by_wavelength=[
+            np.vstack((plus, minus))
+            for (plus, _wl), (minus, _wl2) in zip(plus_pairs, minus_pairs)
+        ],
+        null_depth=null_depth,
+        stellar_photon_rate_hz_by_wavelength=stellar_photon_rate_hz_by_wavelength,
+        integration_time_per_step_s=integration_time_per_step_s,
+    )
+    n_chop = int(plus_pairs[0][0].shape[0])
+    return joint[:, :n_chop], joint[:, n_chop:]
 
 
 def simulate_observation(
@@ -688,14 +715,23 @@ def simulate_observation(
     wavelengths = np.asarray([wavelength for _unitary, wavelength in wl_pairs])
     total_area = _positive_total_amplitude_power(amplitudes)
     dt = float(integration_time_per_step_s)
+    stellar_rates_by_wl = _rates_by_wavelength(
+        total_rate_hz=float(stellar_photon_rate_hz),
+        rates_by_wavelength=stellar_photon_rate_hz_by_wavelength,
+        n_wavelengths=n_wl,
+        name="stellar_photon_rate_hz_by_wavelength",
+    )
+    weights = _band_weights(stellar_rates_by_wl)
+    dark = np.asarray(dark_port_indices, dtype=np.intp)
+    leakage_by_wl_port = _stellar_leakage_counts_per_wavelength(
+        amplitudes=amplitudes,
+        rows_by_wavelength=[u_wl[dark, :] for u_wl, _wl in wl_pairs],
+        null_depth=float(null_depth),
+        stellar_photon_rate_hz_by_wavelength=stellar_rates_by_wl,
+        integration_time_per_step_s=dt,
+    )
 
     if wavelength_resolved:
-        stellar_rates_by_wl = _rates_by_wavelength(
-            total_rate_hz=float(stellar_photon_rate_hz),
-            rates_by_wavelength=stellar_photon_rate_hz_by_wavelength,
-            n_wavelengths=n_wl,
-            name="stellar_photon_rate_hz_by_wavelength",
-        )
         dark_rates_by_wl = _rates_by_wavelength(
             total_rate_hz=float(dark_count_rate_hz_per_port),
             rates_by_wavelength=dark_count_rate_hz_per_port_by_wavelength,
@@ -728,15 +764,6 @@ def simulate_observation(
             / total_area
         )
         planet_counts = response_scale * (response @ scene.image.ravel())
-        leakage_by_wl_port = _stellar_leakage_counts_per_wavelength(
-            amplitudes=amplitudes,
-            unitary=unitary,
-            dark_port_indices=dark_port_indices,
-            null_depth=float(null_depth),
-            stellar_photon_rate_hz_by_wavelength=stellar_rates_by_wl,
-            integration_time_per_step_s=dt,
-            unitaries_by_wavelength=wl_pairs,
-        )
         leakage_tiled = _time_tiled_leakage(
             leakage_per_port=leakage_by_wl_port.ravel(),
             n_time=n_time,
@@ -770,6 +797,7 @@ def simulate_observation(
             baseline_counts=baseline.reshape(measurement_shape),
             variance_counts=expected.reshape(measurement_shape),
             wavelengths_m=wavelengths.astype(np.float64, copy=True),
+            wavelength_weights=weights,
         )
 
     response = build_response_matrix(
@@ -785,22 +813,12 @@ def simulate_observation(
         latitude_rad=latitude_rad,
         unitaries_by_wavelength=unitaries_by_wavelength,
         roll_angles_rad=roll_angles_rad,
+        wavelength_weights=weights,
     )
 
     response_scale = np.full(n_time * n_dark, float(stellar_photon_rate_hz) * dt / total_area)
-    planet_counts = (
-        float(stellar_photon_rate_hz) * dt / total_area
-    ) * (response @ scene.image.ravel())
-
-    leakage_per_port = _stellar_leakage_counts_per_port(
-        amplitudes=amplitudes,
-        unitary=unitary,
-        dark_port_indices=dark_port_indices,
-        null_depth=float(null_depth),
-        stellar_photon_rate_hz=float(stellar_photon_rate_hz),
-        integration_time_per_step_s=dt,
-        unitaries_by_wavelength=unitaries_by_wavelength,
-    )
+    planet_counts = response_scale * (response @ scene.image.ravel())
+    leakage_per_port = leakage_by_wl_port.sum(axis=0)
     leakage_tiled = _time_tiled_leakage(
         leakage_per_port=leakage_per_port,
         n_time=n_time,
@@ -838,6 +856,7 @@ def simulate_observation(
         baseline_counts=baseline.reshape(n_time, n_dark),
         variance_counts=expected.reshape(n_time, n_dark),
         wavelengths_m=wavelengths.astype(np.float64, copy=True),
+        wavelength_weights=weights,
     )
 
 
@@ -855,6 +874,7 @@ def compute_synthesized_beam(
     latitude_rad: float = MAUNAKEA_LAT_RAD,
     unitaries_by_wavelength: Sequence[tuple[NDArray[np.complex128], float]] = (),
     roll_angles_rad: NDArray[np.float64] | None = None,
+    wavelength_weights: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
     """Compute the normalized synthesized beam for the dark-port set."""
 
@@ -873,6 +893,7 @@ def compute_synthesized_beam(
             m_coords=m_coords,
             latitude_rad=latitude_rad,
             unitary_wavelength_pairs=wl_pairs,
+            wavelength_weights=wavelength_weights,
         )
         synth_flat += beams_flat.sum(axis=0)
 
@@ -1057,6 +1078,7 @@ def _response_matrix_for_reconstruction(
         latitude_rad=latitude_rad,
         unitaries_by_wavelength=unitaries_by_wavelength,
         roll_angles_rad=roll_angles_rad,
+        wavelength_weights=data.wavelength_weights,
     )
 
 
@@ -1143,6 +1165,7 @@ def reconstruct_nnls(
             latitude_rad=latitude_rad,
             unitaries_by_wavelength=unitaries_by_wavelength,
             roll_angles_rad=roll_angles_rad,
+            wavelength_weights=data.wavelength_weights,
         )
     if data.baseline_counts is not None and data.baseline_counts.size == n_rows:
         rhs = data.measurements.ravel() - np.asarray(
@@ -1179,12 +1202,12 @@ def reconstruct_nnls(
             rhs,
             regularization_fraction=float(regularization_fraction),
         )
-    solution, _residual_norm = _solve_nnls(design_matrix, rhs)
+    solve = _solve_nnls(design_matrix, rhs)
     if selected_indices is None:
-        image_flat = solution
+        image_flat = solve.x
     else:
         image_flat = np.zeros(full_n_pix, dtype=np.float64)
-        image_flat[selected_indices] = solution
+        image_flat[selected_indices] = solve.x
     if (
         not has_row_scale
         and stellar_photon_rate_hz is not None
@@ -1216,31 +1239,96 @@ def reconstruct_nnls(
             latitude_rad=latitude_rad,
             unitaries_by_wavelength=unitaries_by_wavelength,
             roll_angles_rad=roll_angles_rad,
+            wavelength_weights=data.wavelength_weights,
         ),
         method="nnls",
-        n_iterations=0,
+        n_iterations=solve.n_iterations,
+        converged=solve.converged,
+        solver_status=solve.status,
+        solver_message=solve.message,
+        residual_norm=solve.residual_norm,
     )
+
+
+@dataclass(frozen=True)
+class _NNLSSolution:
+    x: NDArray[np.float64]
+    residual_norm: float
+    n_iterations: int | None
+    converged: bool
+    status: int | None
+    message: str
+
+
+_LSQ_MAX_ITER = 200
 
 
 def _solve_nnls(
     design_matrix: NDArray[np.float64],
     rhs: NDArray[np.float64],
-) -> tuple[NDArray[np.float64], float]:
-    if np.any(design_matrix < 0.0):
-        result = lsq_linear(
-            design_matrix,
+) -> _NNLSSolution:
+    """Non-negative least squares, never returning a failed solve silently.
+
+    Unsigned designs use scipy's active-set ``nnls``, which raises at its own
+    iteration limit and reports no iteration count. Signed (phase-chopped)
+    designs use ``lsq_linear``, which always returns an iterate: a status of
+    0 (iteration limit) or -1 (no progress) is retried on the
+    column-normalized design with ``max(200, 20 * n_columns)`` iterations.
+    A solve that still fails is returned with ``converged=False`` and a
+    warning.
+    """
+
+    if not np.any(design_matrix < 0.0):
+        x, rnorm = nnls(design_matrix, rhs)
+        return _NNLSSolution(x, float(rnorm), None, True, None, "")
+
+    result = _lsq_nonnegative(design_matrix, rhs, max_iter=_LSQ_MAX_ITER)
+    n_iterations = int(result.nit)
+    x = np.asarray(result.x, dtype=np.float64)
+    if result.status <= 0:
+        column_norms = np.linalg.norm(design_matrix, axis=0)
+        scale = np.where(column_norms > 0.0, column_norms, 1.0)
+        result = _lsq_nonnegative(
+            design_matrix / scale,
             rhs,
-            bounds=(0.0, np.inf),
-            method="trf",
-            tol=1.0e-8,
-            lsmr_tol="auto",
-            max_iter=200,
+            max_iter=max(_LSQ_MAX_ITER, 20 * design_matrix.shape[1]),
         )
-        if not result.success and result.x.size == 0:
-            raise RuntimeError(f"bounded NNLS solve failed: {result.message}")
-        residual = design_matrix @ result.x - rhs
-        return np.asarray(result.x, dtype=np.float64), float(np.linalg.norm(residual))
-    return nnls(design_matrix, rhs)
+        n_iterations += int(result.nit)
+        x = np.where(column_norms > 0.0, result.x / scale, 0.0)
+    converged = bool(result.status > 0)
+    if not converged:
+        warnings.warn(
+            "bounded NNLS solve did not converge after column normalization "
+            f"(status {result.status}: {result.message}); the reconstruction "
+            "is a non-converged iterate.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return _NNLSSolution(
+        x=x,
+        residual_norm=float(np.linalg.norm(design_matrix @ x - rhs)),
+        n_iterations=n_iterations,
+        converged=converged,
+        status=int(result.status),
+        message=str(result.message),
+    )
+
+
+def _lsq_nonnegative(
+    design_matrix: NDArray[np.float64],
+    rhs: NDArray[np.float64],
+    *,
+    max_iter: int,
+):
+    return lsq_linear(
+        design_matrix,
+        rhs,
+        bounds=(0.0, np.inf),
+        method="trf",
+        tol=1.0e-8,
+        lsmr_tol="auto",
+        max_iter=int(max_iter),
+    )
 
 
 def _regularized_design(
@@ -1331,16 +1419,20 @@ def _band_averaged_beams_flat(
     m_coords: NDArray[np.float64],
     latitude_rad: float,
     unitary_wavelength_pairs: Sequence[tuple[NDArray[np.complex128], float]],
+    wavelength_weights: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
     n_dark = int(len(dark_port_indices))
     n_pix_sq = int(len(l_coords) * len(m_coords))
     beams_flat = np.zeros((n_dark, n_pix_sq), dtype=np.float64)
+    weights = _validated_wavelength_weights(
+        wavelength_weights, len(unitary_wavelength_pairs)
+    )
     sub_diameters = np.asarray(
         [sub.diameter_m for sub in subapertures],
         dtype=np.float64,
     )
 
-    for unitary, wavelength in unitary_wavelength_pairs:
+    for weight, (unitary, wavelength) in zip(weights, unitary_wavelength_pairs):
         if roll_angle_rad is None:
             u_sub, v_sub = subapertures_to_uv(
                 subapertures,
@@ -1366,9 +1458,34 @@ def _band_averaged_beams_flat(
             sub_diameters_m=sub_diameters,
             wavelength_m=wavelength,
         )
-        beams_flat += beams.reshape(n_dark, n_pix_sq)
+        beams_flat += weight * beams.reshape(n_dark, n_pix_sq)
 
-    return beams_flat / float(len(unitary_wavelength_pairs))
+    return beams_flat
+
+
+def _validated_wavelength_weights(
+    wavelength_weights: NDArray[np.float64] | None,
+    n_wavelengths: int,
+) -> NDArray[np.float64]:
+    if wavelength_weights is None:
+        return np.full(int(n_wavelengths), 1.0 / float(n_wavelengths))
+    weights = np.asarray(wavelength_weights, dtype=np.float64)
+    if weights.shape != (int(n_wavelengths),):
+        raise ValueError(
+            "wavelength_weights must have one value per wavelength "
+            f"({weights.shape} != ({int(n_wavelengths)},))."
+        )
+    return weights
+
+
+def _band_weights(rates_by_wavelength: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Normalize per-bin stellar rates to band weights; uniform for a dark star."""
+
+    rates = np.asarray(rates_by_wavelength, dtype=np.float64)
+    total = float(np.sum(rates))
+    if total > 0.0:
+        return rates / total
+    return np.full(rates.size, 1.0 / float(rates.size))
 
 
 def _wavelength_resolved_beams_flat(
@@ -1470,72 +1587,65 @@ def _validated_roll_angles(
     return values
 
 
-def _stellar_leakage_counts_per_port(
-    *,
-    amplitudes: NDArray[np.complex128],
-    unitary: NDArray[np.complex128],
-    dark_port_indices: NDArray[np.intp],
-    null_depth: float,
-    stellar_photon_rate_hz: float,
-    integration_time_per_step_s: float,
-    unitaries_by_wavelength: Sequence[tuple[NDArray[np.complex128], float]],
-) -> NDArray[np.float64]:
-    wl_pairs = _unitary_wavelength_pairs(unitary, 1.0, unitaries_by_wavelength)
-    rates_by_wl = np.full(
-        len(wl_pairs),
-        float(stellar_photon_rate_hz) / float(len(wl_pairs)),
-        dtype=np.float64,
-    )
-    return np.sum(
-        _stellar_leakage_counts_per_wavelength(
-            amplitudes=amplitudes,
-            unitary=unitary,
-            dark_port_indices=dark_port_indices,
-            null_depth=null_depth,
-            stellar_photon_rate_hz_by_wavelength=rates_by_wl,
-            integration_time_per_step_s=integration_time_per_step_s,
-            unitaries_by_wavelength=wl_pairs,
-        ),
-        axis=0,
-    )
-
-
 def _stellar_leakage_counts_per_wavelength(
     *,
     amplitudes: NDArray[np.complex128],
-    unitary: NDArray[np.complex128],
-    dark_port_indices: NDArray[np.intp],
+    rows_by_wavelength: Sequence[NDArray[np.complex128]],
     null_depth: float,
     stellar_photon_rate_hz_by_wavelength: NDArray[np.float64],
     integration_time_per_step_s: float,
-    unitaries_by_wavelength: Sequence[tuple[NDArray[np.complex128], float]],
 ) -> NDArray[np.float64]:
-    wl_pairs = _unitary_wavelength_pairs(unitary, 1.0, unitaries_by_wavelength)
+    """Distribute the realized null over the dark rows, per wavelength.
+
+    ``null_depth`` is the band dark-power fraction ``L / F_total`` the
+    upstream budget realized (static chip residual plus piston, amplitude, and
+    other random errors). It is split into two parts:
+
+    * the nominal chip's static coherent residual ``|sum_m U_dm a_m|^2 / A``,
+      which lands in the ports it lands in;
+    * the excess ``null - static``, distributed in proportion to
+      ``sum_m |U_dm|^2 |a_m|^2``, the IID-piston leakage shape.
+
+    For independent, identically distributed input phase errors with
+    characteristic function ``chi = <exp(i phi)>``, the cross terms of
+    ``<|sum_m U_dm a_m exp(i phi_m)|^2>`` average to ``|chi|^2``, so the mean
+    port power is ``|chi|^2 |sum_m U_dm a_m|^2 + (1 - |chi|^2) sum_m
+    |U_dm|^2 |a_m|^2``. The split here is that result with ``|chi|^2 -> 1``
+    on the static term, which is exact to first order in the phase variance.
+    The shape no longer depends on the nominal chip's coherent residual,
+    which a deep null makes arbitrary (a 1e-10 rad rotation can move all of
+    it into one port).
+
+    Both parts are weighted by the per-bin stellar rate, so the band total is
+    ``null * sum(F_lambda)``. If the static residual alone exceeds the
+    realized null (a calibrated null below the chip floor), the static pattern
+    is scaled down to the realized total.
+
+    ``rows_by_wavelength`` holds one ``(n_rows, M)`` output-row matrix per
+    wavelength; the result has shape ``(n_wavelength, n_rows)`` in counts.
+    """
+
+    a = np.asarray(amplitudes, dtype=np.complex128)
+    area = _positive_total_amplitude_power(a)
+    rows = np.stack([np.asarray(r, dtype=np.complex128) for r in rows_by_wavelength])
     rates = np.asarray(stellar_photon_rate_hz_by_wavelength, dtype=np.float64)
-    if rates.shape != (len(wl_pairs),):
+    if rates.shape != (rows.shape[0],):
         raise ValueError(
             "stellar_photon_rate_hz_by_wavelength must have one value per "
-            f"wavelength ({rates.shape} != ({len(wl_pairs)},))."
+            f"wavelength ({rates.shape} != ({rows.shape[0]},))."
         )
-    leakage = np.zeros((len(wl_pairs), len(dark_port_indices)), dtype=np.float64)
-    for wl_index, (u_wl, _wavelength) in enumerate(wl_pairs):
-        output = np.asarray(u_wl, dtype=np.complex128) @ np.asarray(
-            amplitudes,
-            dtype=np.complex128,
-        )
-        port_powers = np.abs(output[dark_port_indices]) ** 2
-        total = float(np.sum(port_powers))
-        if total > 0.0:
-            fractions = port_powers / total
-        else:
-            fractions = np.full(len(dark_port_indices), 1.0 / len(dark_port_indices))
-        leakage[wl_index, :] = (
-            fractions
-            * float(null_depth)
-            * float(rates[wl_index])
-            * float(integration_time_per_step_s)
-        )
-    return leakage
+    static = rates[:, None] * np.abs(rows @ a) ** 2 / area
+    incoherent = rates[:, None] * ((np.abs(rows) ** 2) @ (np.abs(a) ** 2)) / area
+    target = float(null_depth) * float(np.sum(rates))
+    static_total = float(np.sum(static))
+    if static_total >= target:
+        leakage = static * (target / static_total) if static_total > 0.0 else static
+    else:
+        if float(np.sum(incoherent)) <= 0.0:
+            # Rows uncoupled to every input: spread the excess uniformly.
+            incoherent = np.repeat(rates[:, None], rows.shape[1], axis=1)
+        leakage = static + (target - static_total) * incoherent / np.sum(incoherent)
+    return leakage * float(integration_time_per_step_s)
 
 
 def _time_tiled_leakage(

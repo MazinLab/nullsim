@@ -36,6 +36,7 @@ from nullsim.physics.imaging import (
     MAS_PER_RAD,
     SkyScene,
     SubAperture,
+    ReconstructedImage,
     build_response_matrix,
     create_scene,
     reconstruct_nnls,
@@ -91,7 +92,8 @@ class _ImagingInputs:
     sky_rate_hz_per_port: float
     sky_rate_hz_per_port_by_wavelength: NDArray[np.float64]
     integration_time_s: float
-    null_instability: float
+    eps_systematic: float
+    with_fringe_tracking: bool
     servo_bw_hz: float
     mkid_max_count_rate_hz: float | None
     planets: tuple[_PlanetView, ...]
@@ -166,13 +168,14 @@ def imaging_reconstruction(
             sky_rate_hz_per_port=inputs.sky_rate_hz_per_port,
             seed=_record_seed(config, record, index),
             latitude_rad=inputs.latitude_rad,
-            null_instability=inputs.null_instability,
+            null_instability=inputs.eps_systematic,
             ft_servo_bandwidth_hz=inputs.servo_bw_hz,
             mkid_max_count_rate_hz=inputs.mkid_max_count_rate_hz,
             unitaries_by_wavelength=inputs.unitary_wavelength_pairs,
             roll_angles_rad=inputs.roll_angles_rad,
             poisson=bool(config.poisson),
             keep_response_matrix=config.chop_mode == "chip_phase",
+            stellar_photon_rate_hz_by_wavelength=inputs.stellar_rate_hz_by_wavelength,
         )
         reconstruction = reconstruct_snr_map(
             data=observation,
@@ -184,12 +187,13 @@ def imaging_reconstruction(
             l_coords=scene.l_coords,
             m_coords=scene.m_coords,
             latitude_rad=inputs.latitude_rad,
-            null_instability=inputs.null_instability,
+            null_instability=inputs.eps_systematic,
             ft_servo_bandwidth_hz=inputs.servo_bw_hz,
             integration_time_per_step_s=integration_time_per_step_s,
             unitaries_by_wavelength=inputs.unitary_wavelength_pairs,
             roll_angles_rad=inputs.roll_angles_rad,
         )
+        nnls = None
         nnls_image: NDArray[np.float64] | None = None
         nnls_snr_image: NDArray[np.float64] | None = None
         nnls_observation = observation
@@ -214,7 +218,7 @@ def imaging_reconstruction(
                     sky_rate_hz_per_port=inputs.sky_rate_hz_per_port,
                     seed=_record_seed(config, record, index),
                     latitude_rad=inputs.latitude_rad,
-                    null_instability=inputs.null_instability,
+                    null_instability=inputs.eps_systematic,
                     ft_servo_bandwidth_hz=inputs.servo_bw_hz,
                     mkid_max_count_rate_hz=inputs.mkid_max_count_rate_hz,
                     unitaries_by_wavelength=inputs.unitary_wavelength_pairs,
@@ -344,6 +348,7 @@ def imaging_reconstruction(
                     nnls_snr_image if nnls_snr_image is not None else reconstruction.image
                 ),
                 nnls_image=nnls_image,
+                nnls=nnls,
                 nnls_observation=nnls_observation if nnls_image is not None else None,
                 planets=inputs.planets,
                 exozodi_glow=exozodi_glow,
@@ -413,9 +418,7 @@ def _build_imaging_inputs(
         "integration_time_s",
     )
     stellar_rate_hz = _positive_float(
-        performance.get("stellar_rate_hz_total")
-        if performance is not None
-        else np.sum(np.asarray(detector["port_rates"], dtype=np.float64)),
+        _physical_stellar_rate_hz(performance, detector),
         "stellar_photon_rate_hz",
     )
     null_depth = _nonnegative_float(
@@ -459,6 +462,9 @@ def _build_imaging_inputs(
         sky_rate_hz_per_port,
         exozodi_payload,
     )
+    with_fringe_tracking = bool(
+        _first_present(performance, ("with_fringe_tracking",), True)
+    )
 
     return _ImagingInputs(
         subapertures=subapertures,
@@ -487,13 +493,24 @@ def _build_imaging_inputs(
             exclude_exozodi=exozodi_payload is not None,
         ),
         integration_time_s=integration_time_s,
-        null_instability=_nonnegative_float(
-            _first_present(performance, ("null_instability",), 0.0),
-            "null_instability",
+        # The fractional rms of the leakage that performance.standard charged
+        # as its systematic term (null instability and residual speckle
+        # combined), not the bare sensitivity null_instability.
+        eps_systematic=_nonnegative_float(
+            _first_present(performance, ("eps_systematic_used",), 0.0),
+            "eps_systematic_used",
         ),
-        servo_bw_hz=_nonnegative_float(
-            _first_present(performance, ("servo_bw_hz",), 0.0),
-            "servo_bw_hz",
+        with_fringe_tracking=with_fringe_tracking,
+        # Without fringe tracking the systematic is not averaged over servo
+        # cycles: performance.standard charges (eps * L * t)^2, so imaging
+        # draws the leakage scale with rms eps and no 1/sqrt(2 f t) factor.
+        servo_bw_hz=(
+            _nonnegative_float(
+                _first_present(performance, ("servo_bw_hz",), 0.0),
+                "servo_bw_hz",
+            )
+            if with_fringe_tracking
+            else 0.0
         ),
         mkid_max_count_rate_hz=_detector_cap_hz(detector),
         planets=_planet_views(record, config),
@@ -505,6 +522,29 @@ def _build_imaging_inputs(
         roll_angles_rad=roll_angles_rad,
         rotation_mode=str(config.rotation_mode),
     )
+
+
+def _physical_stellar_rate_hz(
+    performance: dict[str, Any] | None,
+    detector: dict[str, Any],
+) -> float:
+    """Stellar band total before detector saturation.
+
+    A planet at contrast ``c`` delivers ``c`` times the star's physical rate,
+    whatever the bright-port pixels can count, and the realized null is a
+    fraction of that same physical rate. The capped readout total understates
+    both by the saturation ratio (review Issue 9), so the uncapped total wins
+    whenever it is published.
+    """
+
+    if performance is not None:
+        return _first_present(
+            performance,
+            ("stellar_rate_hz_total_uncapped", "stellar_rate_hz_total"),
+            None,
+        )
+    rates = detector.get("uncapped_port_rates", detector["port_rates"])
+    return float(np.sum(np.asarray(rates, dtype=np.float64)))
 
 
 def _scene_with_exozodi_glow(
@@ -615,6 +655,10 @@ def _exozodi_unit_rate_hz_per_port(
         latitude_rad=inputs.latitude_rad,
         unitaries_by_wavelength=inputs.unitary_wavelength_pairs,
         roll_angles_rad=inputs.roll_angles_rad,
+        wavelength_weights=(
+            inputs.stellar_rate_hz_by_wavelength
+            / np.sum(inputs.stellar_rate_hz_by_wavelength)
+        ),
     )
     total_area = float(np.sum(np.abs(inputs.amplitudes) ** 2))
     if total_area <= 0.0:
@@ -968,6 +1012,7 @@ def _nnls_response_matrix(
         latitude_rad=inputs.latitude_rad,
         unitaries_by_wavelength=inputs.unitary_wavelength_pairs,
         roll_angles_rad=inputs.roll_angles_rad,
+        wavelength_weights=observation.wavelength_weights,
     )
 
 
@@ -1018,6 +1063,7 @@ def _summary_payload(
     fov_mas: float,
     snr_map: NDArray[np.float64],
     nnls_image: NDArray[np.float64] | None,
+    nnls: ReconstructedImage | None,
     nnls_observation: Any | None,
     planets: tuple[_PlanetView, ...],
     exozodi_glow: _ExozodiGlowView | None,
@@ -1102,7 +1148,8 @@ def _summary_payload(
         "exozodi_radial_power": (
             None if exozodi_glow is None else float(exozodi_glow.radial_power)
         ),
-        "null_instability": float(inputs.null_instability),
+        "eps_systematic_used": float(inputs.eps_systematic),
+        "with_fringe_tracking": bool(inputs.with_fringe_tracking),
         "servo_bw_hz": float(inputs.servo_bw_hz),
         "n_dark_ports": int(inputs.dark_port_indices.size),
         "n_wavelengths": int(len(inputs.unitary_wavelength_pairs)),
@@ -1138,6 +1185,11 @@ def _summary_payload(
         "nnls_rows": (
             None if nnls_observation is None else int(nnls_observation.measurements.size)
         ),
+        "nnls_converged": None if nnls is None else bool(nnls.converged),
+        "nnls_solver_status": None if nnls is None else nnls.solver_status,
+        "nnls_solver_message": None if nnls is None else nnls.solver_message,
+        "nnls_n_iterations": None if nnls is None else nnls.n_iterations,
+        "nnls_residual_norm": None if nnls is None else nnls.residual_norm,
         "planets": planet_rows,
         "skipped_records": int(skipped_records),
     }
