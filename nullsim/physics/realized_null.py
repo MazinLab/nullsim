@@ -44,6 +44,7 @@ from numpy.typing import NDArray
 __all__ = [
     "RealizedNullResult",
     "band_leakage_statistics",
+    "bias_cross_variance",
     "normalized_wavelength_weights",
     "piston_covariance_with_common_mode_m2",
     "realized_null_depth_mc",
@@ -144,6 +145,29 @@ def band_leakage_statistics(
     return float(np.mean(band)), float(
         np.sqrt(np.mean(np.var(per_azimuth, axis=1)))
     )
+
+
+def bias_cross_variance(
+    *,
+    phase_fluctuation_rms: float,
+    phase_dynamic_null: float,
+    bias_leakage: float,
+) -> float:
+    """Leakage variance from a static phase bias beating with random phase.
+
+    For leakage quadratic in phase, ``L = (x + b)^T Q (x + b)`` with
+    ``x ~ N(0, C)``, ``Var L = 2 tr(QCQC) + 4 b^T QCQ b``. When ``QC`` has
+    equal nonzero eigenvalues and ``b`` lies in their span, the cross term is
+    ``2 (sigma_phase^2 / L_phase,dyn) L_b``, with ``sigma_phase^2 =
+    2 tr(QCQC)`` and ``L_phase,dyn = tr(QC)`` taken from a phase-only MC
+    (piston and fiber phase; no scintillation, which sits in the orthogonal
+    quadrature and does not beat with a phase bias) and ``L_b = b^T Q b`` the
+    bias leakage. Derivation and toy checks: tests/physics/notes/sensitivity_null.md.
+    """
+
+    if phase_dynamic_null <= 0.0 or bias_leakage <= 0.0:
+        return 0.0
+    return 2.0 * phase_fluctuation_rms**2 / phase_dynamic_null * bias_leakage
 
 
 def _chip_null_depth(

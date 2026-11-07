@@ -47,27 +47,59 @@ so T(0) is not zero. The test integrates `T - T(0)` independently with
 
 ## Null fluctuation with a static bias
 
-For leakage quadratic in the phase, `L = (x + b)^T Q (x + b)` with
-`x ~ N(0, C)` and a deterministic offset `b` (setpoint residual and dither):
+The setpoint residual and the dither are a static phase offset `b`. For
+leakage quadratic in the phase, `L = (x + b)^T Q (x + b)` with random phase
+`x ~ N(0, C)` (piston and fiber phase):
 
 ```text
 Var L = 2 tr(QCQC) + 4 b^T QCQ b.
 ```
 
 Assume `QC` has `N_eff` equal nonzero eigenvalues `q c` and that `b` lies in
-their span. Then `L_dyn = E[x^T Q x] = N_eff q c`, `CV_MC^2 = 2 / N_eff`,
-`L_b = b^T Q b`, and `4 b^T QCQ b = 4 q c L_b = 2 CV_MC^2 L_dyn L_b`. The stage
-publishes
+their span. Then:
 
 ```text
-sigma_L^2 = sigma_MC^2 + 2 CV_MC^2 L_dyn L_b,
-L_dyn = MC mean - static ideal null,   L_b = setpoint + dither leakage.
+sigma_phase^2 = 2 tr(QCQC) = 2 N_eff (q c)^2,   L_phase,dyn = tr(QC) = N_eff q c,
+4 b^T QCQ b = 4 q c L_b = 2 (sigma_phase^2 / L_phase,dyn) L_b,   L_b = b^T Q b.
 ```
 
-This is an approximation. It is exact only for the equal-eigenvalue case, and
-in general it misses how `b` is aligned with the eigenvectors of `QC`. The disk
-floor comes from sky points incoherent with the on-axis star and adds no
-variance. `null_instability = sigma_L / effective_null`, so consumers that
+Both moments come from a phase-only MC leg: piston and fiber phase on,
+scintillation off. `L_phase,dyn` is that leg's mean minus the static chip
+null. Amplitude (scintillation) errors sit in the orthogonal quadrature and do
+not beat with a phase bias. The stage publishes
+
+```text
+sigma_L^2 = sigma_MC^2 + 2 (sigma_phase^2 / L_phase,dyn) L_b,
+L_b = setpoint + dither leakage.
+```
+
+`sigma_MC` comes from the full MC, amplitude included. When the run has no
+amplitude noise, the main MC already is the phase-only leg.
+
+The first version used `2 CV_MC^2 L_dyn L_b`, taking the CV of the full MC.
+That CV is normalized by the total mean (static leakage included) and its
+moments include amplitude noise. On the toys below it was 6.5x low and 4.1x
+high in RMS.
+
+`test_bias_cross_term_matches_direct_biased_monte_carlo` uses a two-input
+nuller at 1.25 um with a 0.02 rad bias, applied as a deterministic input phase
+in a direct MC. Bias leakage is `L_b = a1 a2 (1 - cos b) / (a1^2 + a2^2)`.
+
+| Inputs `a` | Piston (rad) | Intensity RMS | Direct MC | Prediction | Old form |
+|---|---|---|---|---|---|
+| (1, 0.98) | 0.003 | 0 | 4.288e-5 | 4.298e-5 | 6.62e-6 |
+| (1, 1) | 0 | 0.01 | 1.777e-5 | 1.777e-5 | 7.33e-5 |
+| (1, 0.98) | 0.003 | 0.01 | 8.514e-5 | 8.528e-5 | 8.24e-5 |
+
+The predictions are within 0.2% of the direct MC (2e5 draws). The residual is
+the non-quadratic `1 - cos` leakage plus MC noise, and the test pins it at 1%.
+In general the form is an approximation: it is exact only for equal
+eigenvalues and misses how `b` aligns with the eigenvectors of `QC`. A
+two-input nuller has one dynamic eigenvector, so it does not exercise that
+error.
+
+The disk floor comes from sky points incoherent with the on-axis star and adds
+no variance. `null_instability = sigma_L / effective_null`, so consumers that
 multiply by the effective null get `sigma_L`.
 
 ## Planet throughput under piston
@@ -99,3 +131,9 @@ perturbation, using the same seeds. For a Bracewell pair with equal input RMS
 sigma (phase in rad, fractional intensity), the leakage variances are
 `2 (sigma^2/2)^2` and `2 (sigma^2/8)^2`. Piston therefore carries 16/17 of the
 variance, where weighting by input variance would give it 1/2.
+
+The bias cross term is phase driven, so it averages at the piston bandwidth
+and is added to the piston leg's variance. On equal inputs with 0.003 rad
+piston, 1% intensity RMS, a 0.02 rad bias, and bandwidths of 2000 Hz (piston)
+and 11.1 Hz (amplitude), `f_eff` goes from 12.5 Hz without the term to 73.9 Hz
+with it. Leaving it out overstated the averaged systematic variance 5.9x.

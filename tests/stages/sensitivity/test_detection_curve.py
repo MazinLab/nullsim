@@ -26,6 +26,7 @@ from nullsim.stages.sensitivity import DetectionCurve
 from nullsim.stages.sensitivity.detection_curve import (
     _angular_jitter_convolve_profile,
     _combine_realized_null_results,
+    _ft_published_f_3db_hz,
     _resolve_amp_servo_photon_rate_hz,
     _per_azimuth_stellar_fields,
     _planet_input_transport_scales,
@@ -120,6 +121,19 @@ def test_angular_jitter_convolution_smooths_radial_profiles() -> None:
     assert smoothed[0] > 0.0
     assert smoothed[2] > 0.0
     assert smoothed[0] == pytest.approx(smoothed[2])
+
+
+def test_ft_published_bandwidth_reads_newest_fringe_tracking_component() -> None:
+    """A later fringe-tracking stage supersedes an earlier one, as in the
+    residual lookup."""
+
+    state = SimulationState.empty({"wavelength_grid_um": (1.25,)})
+    state = replace(state, results=Results(components={
+        "fringe_tracking.closed_loop.early": {"f_3db_hz": 50.0},
+        "detector.mkid": {},
+        "fringe_tracking.closed_loop.late": {"f_3db_hz": 400.0},
+    }))
+    assert _ft_published_f_3db_hz(state) == 400.0
 
 
 def test_angular_jitter_kernel_is_unbiased_on_nonuniform_grid() -> None:
@@ -1901,6 +1915,7 @@ def test_detection_curve_auto_amplitude_servo_derives_sigma_i_and_f_eff(
             "auto_amp_servo_photon_rate_per_sub_hz": photon_rate_per_sub_hz,
             "auto_scintillation_anchor_h5m_zenith": anchor,
             "auto_f_piston_hz": f_piston_hz,
+            "null_setpoint_residual_nm": 2.0,
         },
         context=_context(tmp_path),
     )
@@ -1943,10 +1958,27 @@ def test_detection_curve_auto_amplitude_servo_derives_sigma_i_and_f_eff(
         n_realizations_per_azimuth=payload["n_realizations_per_azimuth"],
         seed=0,
     )
-    v_phi = realized_null_depth_mc(
+    piston_leg = realized_null_depth_mc(
         ao_piston_opd_rms_per_sub_m=payload["ao_piston_opd_rms_per_sub_m"],
         **leg_common,
-    ).null_fluctuation_rms ** 2
+    )
+    # The setpoint bias beats with the phase-only leg (no fiber noise here,
+    # so it is the piston leg), normalized by that leg's dynamic mean; the
+    # phase-driven cross term joins the piston leg of the blend.
+    bias_leakage = payload["null_fluctuation_bias_leakage"]
+    assert bias_leakage > 0.0
+    cross = (
+        2.0 * piston_leg.null_fluctuation_rms ** 2
+        / (piston_leg.mean_null_depth - piston_leg.ideal_null_depth)
+        * bias_leakage
+    )
+    assert payload["null_fluctuation_bias_cross_variance"] == pytest.approx(
+        cross, rel=1e-10,
+    )
+    assert payload["null_fluctuation_rms"] == pytest.approx(
+        math.sqrt(payload["null_fluctuation_rms_mc"] ** 2 + cross), rel=1e-10,
+    )
+    v_phi = piston_leg.null_fluctuation_rms ** 2 + cross
     v_I = realized_null_depth_mc(
         ao_piston_opd_rms_per_sub_m=0.0,
         scintillation_index_per_sub=expected_residual.sigma_I_residual,

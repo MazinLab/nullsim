@@ -70,6 +70,7 @@ from nullsim.physics.planet_throughput import (
 from nullsim.physics.realized_null import (
     RealizedNullResult,
     band_leakage_statistics,
+    bias_cross_variance,
     piston_covariance_with_common_mode_m2,
     realized_null_depth_mc,
 )
@@ -2440,7 +2441,9 @@ def _ft_published_f_3db_hz(state: SimulationState) -> float | None:
     2026-06-10 Issue 2).
     """
 
-    for name, payload in state.results.components.items():
+    # Newest first, like the residual lookup: a later fringe-tracking stage
+    # supersedes an earlier one.
+    for name, payload in reversed(tuple(state.results.components.items())):
         if not name.startswith("fringe_tracking."):
             continue
         if not isinstance(payload, dict):
@@ -4020,20 +4023,32 @@ class DetectionCurve(BaseStage):
             )
 
         # Null fluctuation (review 2026-11-07 Issue 19). The MC gives the
-        # random part sigma_MC of the band leakage. A deterministic offset b
-        # (setpoint residual and dither) couples to the random piston x
-        # through the cross term of the quadratic leakage L = (x+b)^T Q (x+b):
-        # Var L = 2 tr(QCQC) + 4 b^T QCQ b. If Q C has N_eff equal nonzero
-        # eigenvalues, CV_MC^2 = 2/N_eff and 4 b^T QCQ b = 2 CV_MC^2 L_dyn L_b,
-        # with L_dyn = E[x^T Q x] the dynamic part of the MC mean and
-        # L_b = b^T Q b. The disk floor is incoherent with the on-axis
-        # piston and adds no variance; the bias itself is static.
-        dynamic_null = max(float(mc.mean_null_depth) - float(mc.ideal_null_depth), 0.0)
+        # random part sigma_MC of the band leakage. The setpoint residual and
+        # dither are a static phase offset b, which beats with the random
+        # phase (piston, fiber) but not with scintillation, the orthogonal
+        # quadrature. The cross term comes from a phase-only MC leg (the main
+        # MC when there is no amplitude noise); see bias_cross_variance. The
+        # disk floor is incoherent with the on-axis star and adds no variance.
         bias_leakage = float(null_setpoint_leakage) + float(setpoint_dither_leakage)
         null_instability_mc = float(mc.null_instability)
+        bias_cross = 0.0
+        if run_realized_mc and bias_leakage > 0.0:
+            has_amplitude_noise = bool(
+                np.any(np.asarray(sigma_I_per_sub, dtype=np.float64) > 0.0)
+            )
+            phase_mc = (
+                run_mc(scintillation_index_per_sub=0.0)[1]
+                if has_amplitude_noise
+                else mc
+            )
+            bias_cross = bias_cross_variance(
+                phase_fluctuation_rms=float(phase_mc.null_fluctuation_rms),
+                phase_dynamic_null=float(phase_mc.mean_null_depth)
+                - float(phase_mc.ideal_null_depth),
+                bias_leakage=bias_leakage,
+            )
         null_fluctuation_rms = math.sqrt(
-            float(mc.null_fluctuation_rms) ** 2
-            + 2.0 * null_instability_mc ** 2 * dynamic_null * bias_leakage
+            float(mc.null_fluctuation_rms) ** 2 + bias_cross
         )
         null_instability_out = (
             null_fluctuation_rms / float(effective_null) if effective_null > 0.0 else 0.0
@@ -4045,7 +4060,9 @@ class DetectionCurve(BaseStage):
         #   (2) leakage-variance-weighted blend when
         #       auto_amplitude_servo_residual is enabled (Tier 2.5b); the leg
         #       variances come from MC reruns with one perturbation each
-        #       (same seeds, so the draws are those of the full MC),
+        #       (same seeds, so the draws are those of the full MC); the
+        #       phase-driven bias cross term averages at the piston
+        #       bandwidth, so it joins the piston leg,
         #   (3) None (performance stage uses its own default).
         piston_leakage_variance = 0.0
         amplitude_leakage_variance = 0.0
@@ -4062,7 +4079,9 @@ class DetectionCurve(BaseStage):
                 ao_piston_opd_covariance_m2=None,
                 fiber_phase_noise_rms_rad=0.0,
             )
-            piston_leakage_variance = float(piston_only.null_fluctuation_rms) ** 2
+            piston_leakage_variance = (
+                float(piston_only.null_fluctuation_rms) ** 2 + bias_cross
+            )
             amplitude_leakage_variance = float(amplitude_only.null_fluctuation_rms) ** 2
         resolved_amp_bw_hz = (
             None
@@ -4204,6 +4223,7 @@ class DetectionCurve(BaseStage):
             "null_fluctuation_rms": float(null_fluctuation_rms),
             "null_fluctuation_rms_mc": float(mc.null_fluctuation_rms),
             "null_fluctuation_bias_leakage": float(bias_leakage),
+            "null_fluctuation_bias_cross_variance": float(bias_cross),
             "ideal_chip_null_depth": float(mc.ideal_null_depth),
             "ideal_chip_null_depth_per_arm": tuple(
                 float(arm_result.ideal_null_depth) for arm_result in mc_per_arm

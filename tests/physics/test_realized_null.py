@@ -9,6 +9,7 @@ import pytest
 
 from nullsim.physics.realized_null import (
     band_leakage_statistics,
+    bias_cross_variance,
     normalized_wavelength_weights,
     piston_covariance_with_common_mode_m2,
     realized_null_depth_mc,
@@ -621,3 +622,48 @@ def test_n_realizations_required() -> None:
             wavelengths_m=np.array([1.25e-6]),
             seed=0,
         )
+
+
+@pytest.mark.parametrize(
+    ("amplitudes", "piston_rad", "sigma_i"),
+    [
+        ((1.0, 0.98), 0.003, 0.0),  # phase noise, static amplitude imbalance
+        ((1.0, 1.0), 0.0, 0.01),  # amplitude noise only: no cross term
+        ((1.0, 0.98), 0.003, 0.01),  # both
+    ],
+)
+def test_bias_cross_term_matches_direct_biased_monte_carlo(
+    amplitudes: tuple[float, float], piston_rad: float, sigma_i: float,
+) -> None:
+    """Issue 19: a static 0.02 rad phase bias on a two-input nuller.
+
+    The prediction sigma_MC^2 + bias_cross_variance(phase-only leg) must
+    match the fluctuation of an MC with the bias applied as a deterministic
+    input phase. Bias leakage L_b = a1 a2 (1 - cos b) / (a1^2 + a2^2). The
+    earlier form 2 CV_full^2 L_dyn L_b was 6.5x low in RMS for the phase
+    case and 4.1x high for the amplitude case.
+    """
+
+    wavelength_m, bias_rad = 1.25e-6, 0.02
+    a1, a2 = amplitudes
+
+    def run(bias: float, sigma_amp: float):
+        return realized_null_depth_mc(
+            u_stack=_make_50_50_combiner(1),
+            stellar_field=np.array([a1, a2 * np.exp(1j * bias)], dtype=np.complex128),
+            dark_indices=np.array([1], dtype=np.intp),
+            ao_piston_opd_rms_per_sub_m=piston_rad * wavelength_m / (2.0 * math.pi),
+            scintillation_index_per_sub=sigma_amp,
+            wavelengths_m=np.array([wavelength_m]),
+            n_realizations_per_azimuth=100_000,
+            seed=1,
+        )
+
+    unbiased, phase_leg = run(0.0, sigma_i), run(0.0, 0.0)
+    cross = bias_cross_variance(
+        phase_fluctuation_rms=phase_leg.null_fluctuation_rms,
+        phase_dynamic_null=phase_leg.mean_null_depth - phase_leg.ideal_null_depth,
+        bias_leakage=a1 * a2 * (1.0 - math.cos(bias_rad)) / (a1**2 + a2**2),
+    )
+    predicted = math.sqrt(unbiased.null_fluctuation_rms**2 + cross)
+    assert predicted == pytest.approx(run(bias_rad, sigma_i).null_fluctuation_rms, rel=0.01)
