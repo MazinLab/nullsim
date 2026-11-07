@@ -24,7 +24,7 @@ from nullsim.physics.characterization import (
 from nullsim.physics.mkid import mkid_resolving_power
 from nullsim.physics.photometry import photon_rate_per_m2_per_bin
 from nullsim.physics.planet_throughput import planet_input_field
-from nullsim.physics.realized_null import realized_null_depth_mc
+from nullsim.physics.realized_null import bias_cross_variance, realized_null_depth_mc
 from nullsim.physics.ruilier_cassaing import angular_coupling_factor
 from nullsim.physics.spectroscopy import (
     AWGSpectrum,
@@ -1406,18 +1406,24 @@ def _realized_spectro_floor_for_stack(
         n_spectro_ports=n_spectro_ports,
     )
     if retuned is not None:
-        retuned_floor, var_mc, var_phase, dyn_phase = retuned
+        retuned_floor, var_mc, mc_result = retuned
         # Issue 19 bias cross term (tests/physics/notes/sensitivity_null.md):
-        # the setpoint/dither phase offset b couples to the random piston as
-        # 4 b^T QCQ b = 2 (sigma_phase^2 / L_phase,dyn) L_b, from a phase-only
-        # MC (scintillation off), since the bias is a phase offset.
+        # the setpoint/dither offset, i.i.d. across chip input phases, beats
+        # linearly with each draw's static-subtracted spectro-row field.
         bias_leakage = _spectro_bias_leakage(
             sensitivity=sensitivity,
             n_dark_ports=n_dark_ports,
             n_spectro_ports=n_spectro_ports,
         )
         cross_var = (
-            2.0 * var_phase / dyn_phase * bias_leakage if dyn_phase > 0.0 else 0.0
+            0.0
+            if mc_result is None
+            else bias_cross_variance(
+                mc_result,
+                np.asarray(stellar_rate_weights, dtype=np.float64)
+                / float(np.sum(stellar_rate_weights)),
+                bias_leakage,
+            )
         )
         leak_rms = math.sqrt(var_mc + cross_var)
         return (
@@ -1499,17 +1505,16 @@ def _retuned_spectro_dynamic_floor(
     spectro_idx: NDArray[np.intp],
     wavelengths_m: NDArray[np.float64],
     stellar_rate_weights: NDArray[np.float64],
-) -> tuple[float, float, float, float] | None:
+) -> tuple[float, float, Any] | None:
     """Return the retuned port's band leakage statistics.
 
-    Returns ``(floor, var_mc, var_phase, dyn_phase)``. All use
-    per-realization band leakage ``L_r = sum_k w_k N_kr`` with ``w`` the
-    normalized detected stellar rate per bin: the floor is
-    ``E[L] - L_static`` and ``var_mc`` the within-azimuth variance of
-    ``L_r``. ``var_phase`` and ``dyn_phase`` are the same variance and
-    ``E[L] - L_static`` from a phase-only MC (scintillation off, same draws),
-    which set the bias cross term. The MC shares one piston draw across
-    wavelength bins, so the bins are paired realizations.
+    Returns ``(floor, var_mc, mc)``. Both use per-realization band leakage
+    ``L_r = sum_k w_k N_kr`` with ``w`` the normalized detected stellar rate
+    per bin: the floor is ``E[L] - L_static`` and ``var_mc`` the
+    within-azimuth variance of ``L_r``. ``mc`` is the MC result with its
+    dark fields, which sets the bias cross term (``None`` when the MC is
+    disabled). The MC shares one piston draw across wavelength bins, so the
+    bins are paired realizations.
     """
 
     n_per_az = _optional_int(sensitivity.get("n_realizations_per_azimuth"))
@@ -1530,6 +1535,7 @@ def _retuned_spectro_dynamic_floor(
 
     def run_mc(scintillation_index_per_sub: Any) -> Any:
         return realized_null_depth_mc(
+            return_dark_fields=True,
             u_stack=np.asarray(u_stack, dtype=np.complex128),
             stellar_field=np.asarray(base_amplitudes, dtype=np.complex128),
             dark_indices=np.asarray(spectro_idx, dtype=np.intp),
@@ -1550,7 +1556,7 @@ def _retuned_spectro_dynamic_floor(
 
     mc = run_mc(scintillation)
     if mc.samples_by_wavelength is None:  # MC disabled: no dynamic term
-        return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, None
     weights = np.asarray(stellar_rate_weights, dtype=np.float64)
     weights = weights / np.sum(weights)
     out = np.einsum("pmk,m->kp", u_stack, base_amplitudes.astype(np.complex128))
@@ -1568,11 +1574,7 @@ def _retuned_spectro_dynamic_floor(
         return dynamic, float(np.mean(np.var(band_leak, axis=1)))
 
     floor, var_mc = band_stats(mc)
-    if np.any(np.asarray(scintillation) > 0.0):
-        dyn_phase, var_phase = band_stats(run_mc(0.0))
-    else:
-        dyn_phase, var_phase = floor, var_mc
-    return floor, var_mc, var_phase, dyn_phase
+    return floor, var_mc, mc
 
 
 def _spectro_override_extra(

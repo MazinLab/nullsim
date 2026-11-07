@@ -9,6 +9,7 @@ import pytest
 
 from nullsim.physics.realized_null import (
     band_leakage_statistics,
+    bias_cross_moments,
     bias_cross_variance,
     normalized_wavelength_weights,
     piston_covariance_with_common_mode_m2,
@@ -624,46 +625,77 @@ def test_n_realizations_required() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    ("amplitudes", "piston_rad", "sigma_i"),
-    [
-        ((1.0, 0.98), 0.003, 0.0),  # phase noise, static amplitude imbalance
-        ((1.0, 1.0), 0.0, 0.01),  # amplitude noise only: no cross term
-        ((1.0, 0.98), 0.003, 0.01),  # both
-    ],
-)
-def test_bias_cross_term_matches_direct_biased_monte_carlo(
-    amplitudes: tuple[float, float], piston_rad: float, sigma_i: float,
-) -> None:
-    """Issue 19: a static 0.02 rad phase bias on a two-input nuller.
+_DFT3 = np.exp(-2j * np.pi * np.outer(np.arange(3), np.arange(3)) / 3) / math.sqrt(3)
+_BRACEWELL = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=np.complex128) / math.sqrt(2.0)
 
-    The prediction sigma_MC^2 + bias_cross_variance(phase-only leg) must
-    match the fluctuation of an MC with the bias applied as a deterministic
-    input phase. Bias leakage L_b = a1 a2 (1 - cos b) / (a1^2 + a2^2). The
-    earlier form 2 CV_full^2 L_dyn L_b was 6.5x low in RMS for the phase
-    case and 4.1x high for the amplitude case.
+
+@pytest.mark.parametrize(
+    ("unitary", "field", "piston_rad", "sigma_i", "old_fails"),
+    [
+        # (a) Bracewell, static amplitude imbalance, piston, amplitude noise
+        (_BRACEWELL, np.array([1.0, 0.98], dtype=np.complex128), 0.003, 0.01, False),
+        # (b) Bracewell with a 0.02 rad static phase error and piston
+        (_BRACEWELL, np.array([1.0, np.exp(0.02j)]), 0.003, 0.0, True),
+        # (c) three-input DFT nulled row, amplitude noise only
+        (_DFT3, np.ones(3, dtype=np.complex128), 0.0, 0.01, True),
+    ],
+    ids=["bracewell", "static_phase_error", "dft3_amplitude"],
+)
+def test_bias_cross_term_matches_bias_averaged_direct_monte_carlo(
+    unitary: np.ndarray,
+    field: np.ndarray,
+    piston_rad: float,
+    sigma_i: float,
+    old_fails: bool,
+) -> None:
+    """Issue 19: setpoint bias b, i.i.d. across inputs with RMS 0.02 rad.
+
+    The reference applies every sign pattern b in {+-beta}^M as a
+    deterministic input phase, so E[b b^T] = beta^2 I exactly, and averages
+    the direct MC variance over them. The prediction sigma_MC^2 +
+    4 L_b S / D (L_b = beta^2 D) agrees to the linearization residual
+    (~4e-4 here). The earlier phase-only form 2 sigma_phase^2 / L_phase,dyn
+    L_b misses (b), whose variance holds the static-error x piston beat, and
+    (c), where amplitude noise couples to a phase bias in a complex row.
     """
 
-    wavelength_m, bias_rad = 1.25e-6, 0.02
-    a1, a2 = amplitudes
+    import itertools
 
-    def run(bias: float, sigma_amp: float):
+    wavelength_m, beta = 1.25e-6, 0.02
+
+    def run(input_field: np.ndarray, sigma_amp: float, fields: bool = False):
         return realized_null_depth_mc(
-            u_stack=_make_50_50_combiner(1),
-            stellar_field=np.array([a1, a2 * np.exp(1j * bias)], dtype=np.complex128),
+            u_stack=unitary[:, :, np.newaxis],
+            stellar_field=input_field,
             dark_indices=np.array([1], dtype=np.intp),
             ao_piston_opd_rms_per_sub_m=piston_rad * wavelength_m / (2.0 * math.pi),
             scintillation_index_per_sub=sigma_amp,
             wavelengths_m=np.array([wavelength_m]),
-            n_realizations_per_azimuth=100_000,
+            n_realizations_per_azimuth=20_000,
             seed=1,
+            return_dark_fields=fields,
         )
 
-    unbiased, phase_leg = run(0.0, sigma_i), run(0.0, 0.0)
-    cross = bias_cross_variance(
-        phase_fluctuation_rms=phase_leg.null_fluctuation_rms,
-        phase_dynamic_null=phase_leg.mean_null_depth - phase_leg.ideal_null_depth,
-        bias_leakage=a1 * a2 * (1.0 - math.cos(bias_rad)) / (a1**2 + a2**2),
+    weights = np.ones(1)
+    unbiased = run(field, sigma_i, fields=True)
+    _, d_moment = bias_cross_moments(unbiased, weights)
+    bias_leakage = beta**2 * d_moment
+    predicted = unbiased.null_fluctuation_rms**2 + bias_cross_variance(
+        unbiased, weights, bias_leakage,
     )
-    predicted = math.sqrt(unbiased.null_fluctuation_rms**2 + cross)
-    assert predicted == pytest.approx(run(bias_rad, sigma_i).null_fluctuation_rms, rel=0.01)
+    direct = np.mean([
+        run(field * np.exp(1j * beta * np.array(signs)), sigma_i).null_fluctuation_rms**2
+        for signs in itertools.product((-1.0, 1.0), repeat=field.size)
+    ])
+    assert predicted == pytest.approx(direct, rel=2e-3)
+    assert direct > 1.3 * unbiased.null_fluctuation_rms**2  # the bias matters
+
+    phase_leg = run(field, 0.0)
+    dynamic = phase_leg.mean_null_depth - phase_leg.ideal_null_depth
+    old = unbiased.null_fluctuation_rms**2 + (
+        2.0 * phase_leg.null_fluctuation_rms**2 / dynamic * bias_leakage
+        if dynamic > 0.0
+        else 0.0
+    )
+    if old_fails:
+        assert abs(old / direct - 1.0) > 0.5

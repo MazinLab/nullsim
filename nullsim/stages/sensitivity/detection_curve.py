@@ -70,7 +70,7 @@ from nullsim.physics.planet_throughput import (
 from nullsim.physics.realized_null import (
     RealizedNullResult,
     band_leakage_statistics,
-    bias_cross_variance,
+    bias_cross_moments,
     piston_covariance_with_common_mode_m2,
     realized_null_depth_mc,
 )
@@ -3809,6 +3809,7 @@ class DetectionCurve(BaseStage):
             "mode_group_indices": mode_group_indices,
             "fiber_phase_noise_rms_rad": float(params.fiber_phase_noise_rms_rad),
             "wavelength_weights": wavelength_weights,
+            "return_dark_fields": True,
         }
 
         def run_mc(**overrides: Any) -> tuple[tuple[RealizedNullResult, ...], RealizedNullResult]:
@@ -4024,29 +4025,30 @@ class DetectionCurve(BaseStage):
 
         # Null fluctuation (review 2026-11-07 Issue 19). The MC gives the
         # random part sigma_MC of the band leakage. The setpoint residual and
-        # dither are a static phase offset b, which beats with the random
-        # phase (piston, fiber) but not with scintillation, the orthogonal
-        # quadrature. The cross term comes from a phase-only MC leg (the main
-        # MC when there is no amplitude noise); see bias_cross_variance. The
-        # disk floor is incoherent with the on-axis star and adds no variance.
+        # dither are modeled as a static phase offset, i.i.d. across chip
+        # input modes, whose dark field beats linearly with each draw's
+        # static-subtracted dark field (phase and amplitude, as the output
+        # rows couple them); see bias_cross_moments. Pol arms are separate
+        # chips with independent trim offsets, so their cross terms add with
+        # squared flux weights. The disk floor is incoherent with the on-axis
+        # star and adds no variance.
         bias_leakage = float(null_setpoint_leakage) + float(setpoint_dither_leakage)
         null_instability_mc = float(mc.null_instability)
-        bias_cross = 0.0
-        if run_realized_mc and bias_leakage > 0.0:
-            has_amplitude_noise = bool(
-                np.any(np.asarray(sigma_I_per_sub, dtype=np.float64) > 0.0)
+
+        def arm_bias_cross(per_arm: Sequence[RealizedNullResult]) -> float:
+            moments = [bias_cross_moments(r, wavelength_weights) for r in per_arm]
+            s_moment = sum(
+                float(w) ** 2 * m[0]
+                for w, m in zip(unitary_arm_weights, moments, strict=True)
             )
-            phase_mc = (
-                run_mc(scintillation_index_per_sub=0.0)[1]
-                if has_amplitude_noise
-                else mc
+            d_moment = sum(
+                float(w) * m[1]
+                for w, m in zip(unitary_arm_weights, moments, strict=True)
             )
-            bias_cross = bias_cross_variance(
-                phase_fluctuation_rms=float(phase_mc.null_fluctuation_rms),
-                phase_dynamic_null=float(phase_mc.mean_null_depth)
-                - float(phase_mc.ideal_null_depth),
-                bias_leakage=bias_leakage,
-            )
+            return 4.0 * bias_leakage * s_moment / d_moment if d_moment > 0.0 else 0.0
+
+        bias_active = run_realized_mc and bias_leakage > 0.0
+        bias_cross = arm_bias_cross(mc_per_arm) if bias_active else 0.0
         null_fluctuation_rms = math.sqrt(
             float(mc.null_fluctuation_rms) ** 2 + bias_cross
         )
@@ -4060,9 +4062,9 @@ class DetectionCurve(BaseStage):
         #   (2) leakage-variance-weighted blend when
         #       auto_amplitude_servo_residual is enabled (Tier 2.5b); the leg
         #       variances come from MC reruns with one perturbation each
-        #       (same seeds, so the draws are those of the full MC); the
-        #       phase-driven bias cross term averages at the piston
-        #       bandwidth, so it joins the piston leg,
+        #       (same seeds, so the draws are those of the full MC); the bias
+        #       cross term is split the same way, each part computed from its
+        #       own leg's draws and averaging at that leg's bandwidth,
         #   (3) None (performance stage uses its own default).
         piston_leakage_variance = 0.0
         amplitude_leakage_variance = 0.0
@@ -4071,18 +4073,20 @@ class DetectionCurve(BaseStage):
             and params.effective_systematic_bandwidth_hz_override is None
             and params.auto_amplitude_servo_residual
         ):
-            _, piston_only = run_mc(
+            piston_arms, piston_only = run_mc(
                 scintillation_index_per_sub=0.0, fiber_phase_noise_rms_rad=0.0,
             )
-            _, amplitude_only = run_mc(
+            amplitude_arms, amplitude_only = run_mc(
                 ao_piston_opd_rms_per_sub_m=0.0,
                 ao_piston_opd_covariance_m2=None,
                 fiber_phase_noise_rms_rad=0.0,
             )
-            piston_leakage_variance = (
-                float(piston_only.null_fluctuation_rms) ** 2 + bias_cross
+            piston_leakage_variance = float(piston_only.null_fluctuation_rms) ** 2 + (
+                arm_bias_cross(piston_arms) if bias_active else 0.0
             )
-            amplitude_leakage_variance = float(amplitude_only.null_fluctuation_rms) ** 2
+            amplitude_leakage_variance = float(
+                amplitude_only.null_fluctuation_rms
+            ) ** 2 + (arm_bias_cross(amplitude_arms) if bias_active else 0.0)
         resolved_amp_bw_hz = (
             None
             if amp_servo_diagnostics is None

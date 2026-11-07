@@ -36,6 +36,7 @@ inputs receive the same piston and scintillation draw.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -44,6 +45,7 @@ from numpy.typing import NDArray
 __all__ = [
     "RealizedNullResult",
     "band_leakage_statistics",
+    "bias_cross_moments",
     "bias_cross_variance",
     "normalized_wavelength_weights",
     "piston_covariance_with_common_mode_m2",
@@ -94,6 +96,17 @@ class RealizedNullResult:
         default=None, repr=False, compare=False,
     )
     samples_by_wavelength_kilo: NDArray[np.float64] | None = field(
+        default=None, repr=False, compare=False,
+    )
+    # Only with ``return_dark_fields=True``: per-draw dark fields minus the
+    # static dark fields, each normalized by the square root of its own total
+    # output power, shape (n_wl, n_azimuths * n_draws, n_dark); and the
+    # linear dark-field response to an input phase, c_dk = U_dk a_k /
+    # sqrt(P_static), shape (n_azimuths, n_wl, n_dark, M).
+    dark_field_deviations: NDArray[np.complex128] | None = field(
+        default=None, repr=False, compare=False,
+    )
+    bias_dark_response: NDArray[np.complex128] | None = field(
         default=None, repr=False, compare=False,
     )
 
@@ -147,27 +160,65 @@ def band_leakage_statistics(
     )
 
 
-def bias_cross_variance(
-    *,
-    phase_fluctuation_rms: float,
-    phase_dynamic_null: float,
-    bias_leakage: float,
-) -> float:
-    """Leakage variance from a static phase bias beating with random phase.
+def bias_cross_moments(
+    result: RealizedNullResult,
+    wavelength_weights: NDArray[np.float64],
+) -> tuple[float, float]:
+    """Moments ``(S, D)`` that set the bias cross term (see below).
 
-    For leakage quadratic in phase, ``L = (x + b)^T Q (x + b)`` with
-    ``x ~ N(0, C)``, ``Var L = 2 tr(QCQC) + 4 b^T QCQ b``. When ``QC`` has
-    equal nonzero eigenvalues and ``b`` lies in their span, the cross term is
-    ``2 (sigma_phase^2 / L_phase,dyn) L_b``, with ``sigma_phase^2 =
-    2 tr(QCQC)`` and ``L_phase,dyn = tr(QC)`` taken from a phase-only MC
-    (piston and fiber phase; no scintillation, which sits in the orthogonal
-    quadrature and does not beat with a phase bias) and ``L_b = b^T Q b`` the
-    bias leakage. Derivation and toy checks: tests/physics/notes/sensitivity_null.md.
+    A static phase bias ``b_k`` on chip input ``k`` adds the dark field
+    ``i sum_k c_dk b_k`` to linear order. Against a fluctuation draw with
+    static-subtracted dark field ``dE_d(x)``, the band leakage gains
+    ``sum_l w_l 2 Re sum_d conj(i sum_k c_dk b_k) dE_d(x) = 2 sum_k b_k g_k(x)``
+    with ``g_k(x) = sum_l w_l sum_d Im(conj(c_dk) dE_d(x))``. Returns
+    ``S = mean_a sum_k Var_r g_k`` (within azimuth, like the leakage RMS) and
+    ``D = mean_a sum_l w_l sum_dk |c_dk|^2``, the bias leakage per unit
+    ``b_k^2``.
     """
 
-    if phase_dynamic_null <= 0.0 or bias_leakage <= 0.0:
+    deviations = result.dark_field_deviations
+    response = result.bias_dark_response
+    if deviations is None or response is None:
+        raise ValueError(
+            "bias_cross_moments needs a realized_null_depth_mc result run "
+            "with return_dark_fields=True."
+        )
+    weights = np.asarray(wavelength_weights, dtype=np.float64)
+    n_az = int(result.n_azimuths)
+    n_wl, n_samples, n_dark = deviations.shape
+    per_az = deviations.reshape(n_wl, n_az, n_samples // n_az, n_dark)
+    g = np.einsum("l,aldk,lard->ark", weights, response.conj(), per_az).imag
+    s_moment = float(np.mean(np.sum(np.var(g, axis=1), axis=1)))
+    d_moment = float(
+        np.mean(np.einsum("l,aldk->a", weights, np.abs(response) ** 2))
+    )
+    return s_moment, d_moment
+
+
+def bias_cross_variance(
+    result: RealizedNullResult,
+    wavelength_weights: NDArray[np.float64],
+    bias_leakage: float,
+) -> float:
+    """Band leakage variance from a static phase bias beating with fluctuations.
+
+    The setpoint residual and dither are modeled as an unknown static phase
+    offset ``b``, independent across chip input modes with
+    ``E[b_k b_l] = beta^2 delta_kl``. Averaged over ``b``, the cross term of
+    :func:`bias_cross_moments` has variance ``4 beta^2 S``, and the bias
+    leakage is ``L_b = beta^2 D``, so the cross variance is
+    ``4 L_b S / D``. This is exact to linear order in ``b`` and in the
+    fluctuation, needs no equal-eigenvalue assumption, and couples both
+    phase and amplitude fluctuations as the output row geometry dictates
+    (amplitude drops out only where it sits in the orthogonal quadrature,
+    as in a real Bracewell row). Derivation:
+    tests/physics/notes/sensitivity_null.md.
+    """
+
+    if bias_leakage <= 0.0:
         return 0.0
-    return 2.0 * phase_fluctuation_rms**2 / phase_dynamic_null * bias_leakage
+    s_moment, d_moment = bias_cross_moments(result, wavelength_weights)
+    return 4.0 * float(bias_leakage) * s_moment / d_moment if d_moment > 0.0 else 0.0
 
 
 def _chip_null_depth(
@@ -284,6 +335,7 @@ def realized_null_depth_mc(
     mode_group_indices: NDArray[np.intp] | None = None,
     fiber_phase_noise_rms_rad: float = 0.0,
     wavelength_weights: NDArray[np.float64] | None = None,
+    return_dark_fields: bool = False,
 ) -> RealizedNullResult:
     """Monte-Carlo realized null depth on the dark ports.
 
@@ -337,6 +389,8 @@ def realized_null_depth_mc(
             inputs produced by a splitter after a physical aperture.
         fiber_phase_noise_rms_rad: IID per-mode-per-realization residual
             fiber phase noise (KILO ``FiberConfig.phase_noise_rms_rad``).
+        return_dark_fields: Also return the static-subtracted dark fields
+            and the bias response used by :func:`bias_cross_moments`.
         wavelength_weights: Detected stellar photon rate per bin (any
             normalization), shape ``(n_wl,)``. ``None`` weights bins equally.
 
@@ -503,6 +557,16 @@ def realized_null_depth_mc(
         dtype=np.float64,
     )
     samples_by_wavelength_kilo = np.empty_like(samples_by_wavelength)
+    dark_field_deviations = (
+        np.empty((n_wl, n_azimuths * n_per_az, dark.size), dtype=np.complex128)
+        if return_dark_fields
+        else None
+    )
+    bias_dark_response = (
+        np.empty((n_azimuths, n_wl, dark.size, n_modes), dtype=np.complex128)
+        if return_dark_fields
+        else None
+    )
     null_per_wl_kilo = np.empty(n_wl, dtype=np.float64)
     # Accumulate all (wl, az, draw) samples for the *pooled* median/std.
     # Earlier the dataclass reported mean-of-per-wl-medians and mean-of-
@@ -611,6 +675,17 @@ def realized_null_depth_mc(
             start = az_idx * n_per_az
             pooled[start : start + n_per_az] = ratio
             pooled_kilo[start : start + n_per_az] = ratio_kilo
+            if return_dark_fields:
+                static_out = u_k @ field_az
+                static_norm = math.sqrt(float(np.sum(np.abs(static_out) ** 2)))
+                scale = np.where(total > 0.0, np.sqrt(np.where(total > 0.0, total, 1.0)), 1.0)
+                dark_field_deviations[k, start : start + n_per_az] = (
+                    out[:, dark] / scale[:, np.newaxis]
+                    - static_out[dark][np.newaxis, :] / static_norm
+                )
+                bias_dark_response[az_idx, k] = (
+                    u_k[dark, :] * field_az[np.newaxis, :] / static_norm
+                )
 
         null_per_wl_kilo[k] = float(np.mean(pooled_kilo))
         total_pool_size += pooled.size
@@ -645,6 +720,8 @@ def realized_null_depth_mc(
         n_realizations_per_azimuth=n_per_az,
         samples_by_wavelength=samples_by_wavelength,
         samples_by_wavelength_kilo=samples_by_wavelength_kilo,
+        dark_field_deviations=dark_field_deviations,
+        bias_dark_response=bias_dark_response,
     )
 
 

@@ -47,56 +47,88 @@ so T(0) is not zero. The test integrates `T - T(0)` independently with
 
 ## Null fluctuation with a static bias
 
-The setpoint residual and the dither are a static phase offset `b`. For
-leakage quadratic in the phase, `L = (x + b)^T Q (x + b)` with random phase
-`x ~ N(0, C)` (piston and fiber phase):
+### Model
+
+The setpoint residual and dither are modeled as an unknown static phase offset
+`b_k` on each chip input mode `k`. The offsets are independent across inputs,
+with `E[b_k b_l] = beta^2 delta_kl`, and the same in every wavelength bin.
+
+The trim loop (`photon_limited_setpoint_trim`) publishes only a leakage budget
+over `n_trim_modes` sensed degrees of freedom, not which actuators they are.
+Taking them as i.i.d. chip-input phases assumes two things:
+- the residuals of separately sensed actuators are uncorrelated;
+- they spread over all inputs rather than lining up with a particular
+  eigenvector of the chip.
+
+Pol arms with per-arm deployed unitaries are separate chips, so their offsets
+are independent too.
+
+### Derivation
+
+To linear order, the bias adds the dark field `i sum_k c_dk b_k`, where
+`c_dk = U_dk a_k / sqrt(P_static)` and `a` is the input field. A fluctuation
+draw `x` (piston, fiber phase, scintillation) has a static-subtracted dark
+field `dE_d(x)`. That is the draw's dark field over the square root of its own
+total output power, minus the static dark field over `sqrt(P_static)`.
+
+The leakage term bilinear in `b` and `x` is
 
 ```text
-Var L = 2 tr(QCQC) + 4 b^T QCQ b.
+sum_l w_l 2 Re sum_d conj(i sum_k c_dk b_k) dE_d(x) = 2 sum_k b_k g_k(x),
+g_k(x) = sum_l w_l sum_d Im(conj(c_dk) dE_d(x)).
 ```
 
-Assume `QC` has `N_eff` equal nonzero eigenvalues `q c` and that `b` lies in
-their span. Then:
+Its variance over `x` at fixed `b` is `4 b^T Cov(g) b`. Averaged over `b`:
 
 ```text
-sigma_phase^2 = 2 tr(QCQC) = 2 N_eff (q c)^2,   L_phase,dyn = tr(QC) = N_eff q c,
-4 b^T QCQ b = 4 q c L_b = 2 (sigma_phase^2 / L_phase,dyn) L_b,   L_b = b^T Q b.
+cross = 4 beta^2 S,    S = mean_a sum_k Var_r g_k     (within azimuth),
+L_b   = beta^2 D,      D = mean_a sum_l w_l sum_dk |c_dk|^2,
+cross = 4 L_b S / D.
 ```
 
-Both moments come from a phase-only MC leg: piston and fiber phase on,
-scintillation off. `L_phase,dyn` is that leg's mean minus the static chip
-null. Amplitude (scintillation) errors sit in the orthogonal quadrature and do
-not beat with a phase bias. The stage publishes
+`L_b` is the published setpoint plus dither leakage, and it fixes `beta^2`.
+The cross term needs no equal-eigenvalue assumption and has no unstable
+denominator. It couples phase and amplitude fluctuations as the output rows
+dictate:
+- In a real Bracewell row, `c` is real and an amplitude fluctuation gives a
+  real `dE`, so it drops out.
+- In a complex row (a three-input DFT, or a retuned spectro row fed by
+  splitter copies), amplitude fluctuations do beat with a phase bias.
 
-```text
-sigma_L^2 = sigma_MC^2 + 2 (sigma_phase^2 / L_phase,dyn) L_b,
-L_b = setpoint + dither leakage.
-```
+The static field's beat with `b` is constant in `x`, so it only shifts the
+mean. Two terms are neglected. One is the trilinear `E_static x b` term, which
+is suppressed by `sqrt(L_static * M)` relative to the kept one. The other is
+the `x`-dependence of the bias response.
 
-`sigma_MC` comes from the full MC, amplitude included. When the run has no
-amplitude noise, the main MC already is the phase-only leg.
+Pol arms combine as
+`cross = 4 L_b sum_arm w_arm^2 S_arm / sum_arm w_arm D_arm`. In
+`characterization.spectro` the rows are the retuned spectro rows, and `L_b` is
+the spectro ports' share of the budget.
 
-The first version used `2 CV_MC^2 L_dyn L_b`, taking the CV of the full MC.
-That CV is normalized by the total mean (static leakage included) and its
-moments include amplitude noise. On the toys below it was 6.5x low and 4.1x
-high in RMS.
+### Pinned toys
 
-`test_bias_cross_term_matches_direct_biased_monte_carlo` uses a two-input
-nuller at 1.25 um with a 0.02 rad bias, applied as a deterministic input phase
-in a direct MC. Bias leakage is `L_b = a1 a2 (1 - cos b) / (a1^2 + a2^2)`.
+`test_bias_cross_term_matches_bias_averaged_direct_monte_carlo` uses a 0.02 rad
+bias per input, 1.25 um, and 2e4 draws. The reference averages the direct MC
+variance over every sign pattern `b in {+-beta}^M`, which reproduces
+`E[b b^T] = beta^2 I` with no bias-sampling noise.
 
-| Inputs `a` | Piston (rad) | Intensity RMS | Direct MC | Prediction | Old form |
-|---|---|---|---|---|---|
-| (1, 0.98) | 0.003 | 0 | 4.288e-5 | 4.298e-5 | 6.62e-6 |
-| (1, 1) | 0 | 0.01 | 1.777e-5 | 1.777e-5 | 7.33e-5 |
-| (1, 0.98) | 0.003 | 0.01 | 8.514e-5 | 8.528e-5 | 8.24e-5 |
+| Case | Direct MC RMS | New | Old phase-only form |
+|---|---|---|---|
+| (a) Bracewell, inputs (1, 0.98), 0.003 rad piston, 1% intensity | 9.539e-5 | 9.542e-5 | 9.540e-5 |
+| (b) Bracewell, 0.02 rad static phase error, 0.003 rad piston | 7.352e-5 | 7.355e-5 | 4.13e-4 |
+| (c) three-input DFT nulled row, 1% intensity, no piston | 4.806e-5 | 4.808e-5 | 8.37e-6 |
 
-The predictions are within 0.2% of the direct MC (2e5 draws). The residual is
-the non-quadratic `1 - cos` leakage plus MC noise, and the test pins it at 1%.
-In general the form is an approximation: it is exact only for equal
-eigenvalues and misses how `b` aligns with the eigenvectors of `QC`. A
-two-input nuller has one dynamic eigenvector, so it does not exercise that
-error.
+The residual is at most 4e-4 relative, which is the linearization error.
+
+With 2000 random Gaussian bias draws in place of the sign patterns, the
+agreement is 0.5-2%. With 200 draws it was 5-9% high, which is bias-draw
+sampling noise: a quadratic form in `b` has O(1) relative spread per draw.
+
+The old form `2 (sigma_phase^2 / L_phase,dyn) L_b` fails in two ways:
+- In (b), the phase-only variance contains the beat between the random phase
+  and the static error, which subtracting the static null from the mean does
+  not remove. Its denominator can also go negative or near zero.
+- In (c), the phase-only leg is empty.
 
 The disk floor comes from sky points incoherent with the on-axis star and adds
 no variance. `null_instability = sigma_L / effective_null`, so consumers that
@@ -132,8 +164,8 @@ sigma (phase in rad, fractional intensity), the leakage variances are
 `2 (sigma^2/2)^2` and `2 (sigma^2/8)^2`. Piston therefore carries 16/17 of the
 variance, where weighting by input variance would give it 1/2.
 
-The bias cross term is phase driven, so it averages at the piston bandwidth
-and is added to the piston leg's variance. On equal inputs with 0.003 rad
-piston, 1% intensity RMS, a 0.02 rad bias, and bandwidths of 2000 Hz (piston)
-and 11.1 Hz (amplitude), `f_eff` goes from 12.5 Hz without the term to 73.9 Hz
-with it. Leaving it out overstated the averaged systematic variance 5.9x.
+The bias cross term is split by leg. Each part is `4 L_b S / D`, with `S`
+taken from that leg's own draws (piston-only or amplitude-only), and it is
+added to that leg's variance, since it averages at that leg's bandwidth. A
+real Bracewell row puts no amplitude part on the amplitude leg; a complex row
+does.

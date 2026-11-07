@@ -1958,32 +1958,43 @@ def test_detection_curve_auto_amplitude_servo_derives_sigma_i_and_f_eff(
         n_realizations_per_azimuth=payload["n_realizations_per_azimuth"],
         seed=0,
     )
+    from nullsim.physics.realized_null import bias_cross_variance
+
+    leg_common["return_dark_fields"] = True
     piston_leg = realized_null_depth_mc(
         ao_piston_opd_rms_per_sub_m=payload["ao_piston_opd_rms_per_sub_m"],
         **leg_common,
     )
-    # The setpoint bias beats with the phase-only leg (no fiber noise here,
-    # so it is the piston leg), normalized by that leg's dynamic mean; the
-    # phase-driven cross term joins the piston leg of the blend.
+    amplitude_leg = realized_null_depth_mc(
+        ao_piston_opd_rms_per_sub_m=0.0,
+        scintillation_index_per_sub=expected_residual.sigma_I_residual,
+        **leg_common,
+    )
+    full = realized_null_depth_mc(
+        ao_piston_opd_rms_per_sub_m=payload["ao_piston_opd_rms_per_sub_m"],
+        scintillation_index_per_sub=expected_residual.sigma_I_residual,
+        **leg_common,
+    )
+    # The setpoint bias beats with each draw's dark field (pinned against a
+    # direct biased MC in tests/physics); in the blend each leg carries the
+    # cross term computed from its own draws.
     bias_leakage = payload["null_fluctuation_bias_leakage"]
     assert bias_leakage > 0.0
-    cross = (
-        2.0 * piston_leg.null_fluctuation_rms ** 2
-        / (piston_leg.mean_null_depth - piston_leg.ideal_null_depth)
-        * bias_leakage
-    )
+    weights = np.ones(1)
+    cross = bias_cross_variance(full, weights, bias_leakage)
+    assert cross > 0.0
     assert payload["null_fluctuation_bias_cross_variance"] == pytest.approx(
         cross, rel=1e-10,
     )
     assert payload["null_fluctuation_rms"] == pytest.approx(
         math.sqrt(payload["null_fluctuation_rms_mc"] ** 2 + cross), rel=1e-10,
     )
-    v_phi = piston_leg.null_fluctuation_rms ** 2 + cross
-    v_I = realized_null_depth_mc(
-        ao_piston_opd_rms_per_sub_m=0.0,
-        scintillation_index_per_sub=expected_residual.sigma_I_residual,
-        **leg_common,
-    ).null_fluctuation_rms ** 2
+    v_phi = piston_leg.null_fluctuation_rms ** 2 + bias_cross_variance(
+        piston_leg, weights, bias_leakage,
+    )
+    v_I = amplitude_leg.null_fluctuation_rms ** 2 + bias_cross_variance(
+        amplitude_leg, weights, bias_leakage,
+    )
     diagnostics = payload["effective_systematic_bandwidth_diagnostics"]
     assert diagnostics["piston_leakage_variance"] == pytest.approx(v_phi, rel=1e-10)
     assert diagnostics["amplitude_leakage_variance"] == pytest.approx(v_I, rel=1e-10)
