@@ -496,3 +496,102 @@ def test_sky_projection_rejects_wrong_shape() -> None:
         project_positions_to_sky_plane_m(
             positions_enu_m=np.zeros((3, 4)), altitude_deg=60.0, azimuth_deg=0.0
         )
+
+
+def _bracewell_85m_throughput(
+    separations_rad: np.ndarray,
+    wavelengths_m: np.ndarray,
+    **kwargs: object,
+) -> np.ndarray:
+    combiner = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=np.complex128) / math.sqrt(2.0)
+    return compute_planet_throughput_vs_separation(
+        u_stack=np.repeat(combiner[:, :, np.newaxis], wavelengths_m.size, axis=2),
+        wavelengths_m=wavelengths_m,
+        positions_m=np.array([[-42.5, 0.0], [42.5, 0.0]]),
+        dark_indices=np.array([1]),
+        coupling_per_sub=np.ones(2),
+        sub_areas_m2=np.ones(2),
+        sub_diameters_m=None,
+        separations_rad=separations_rad,
+        **kwargs,
+    )
+
+
+def test_adaptive_pa_sampling_resolves_long_baseline_fringes() -> None:
+    """Row 37: two-element 85 m pair at 19.07 mas over J band (20 bins).
+
+    The exact PA average of (1 - cos(2 pi B theta cos PA / lambda)) / 2 is
+    (1 - J0(2 pi B theta / lambda)) / 2, here band-averaged to 0.488898.
+    With 2 pi B theta / lambda ~ 33 rad, 36 fixed PA samples alias the
+    J0 average; the adaptive count (ceil(4 pi B theta / lambda_min)) must
+    not.
+    """
+
+    from scipy.special import j0  # noqa: WPS433  (test-only import)
+
+    edges_um = np.linspace(1.25 - 0.075, 1.25 + 0.075, 21)
+    wavelengths_m = 0.5 * (edges_um[1:] + edges_um[:-1]) * 1e-6
+    theta = np.array([19.07 * _RAD_PER_MAS])
+    exact = float(np.mean(0.5 * (1.0 - j0(2.0 * math.pi * 85.0 * theta[0] / wavelengths_m))))
+
+    t = _bracewell_85m_throughput(theta, wavelengths_m, n_pa_samples=36)
+    assert exact == pytest.approx(0.488898, abs=1e-4)
+    assert t[0] == pytest.approx(0.488898, abs=1e-3)
+    assert t[0] == pytest.approx(exact, rel=1e-9)
+
+
+def test_photon_weights_select_band_bins() -> None:
+    """All weight in one bin returns that bin's monochromatic throughput."""
+
+    wavelengths_m = np.array([1.2e-6, 1.3e-6])
+    seps = np.array([3.0, 7.0]) * _RAD_PER_MAS
+    mono = _bracewell_85m_throughput(seps, wavelengths_m[1:])
+    weighted = _bracewell_85m_throughput(
+        seps, wavelengths_m, wavelength_weights=np.array([0.0, 5.0]),
+    )
+    np.testing.assert_allclose(weighted, mono, rtol=1e-12)
+
+
+def test_piston_covariance_matches_monte_carlo_over_piston_draws() -> None:
+    """Row 36: the G-matrix expectation equals an explicit piston average.
+
+    The Monte Carlo reference feeds each Gaussian piston draw in as a
+    unit-modulus input transport state exp(i 2 pi x / lambda), which the
+    primitive averages after per-state normalization (unchanged by a pure
+    phase), so it shares none of the closed-form code path.
+    """
+
+    rng = np.random.default_rng(11)
+    n_modes, n_draws = 4, 40_000
+    q, _ = np.linalg.qr(
+        rng.normal(size=(n_modes, n_modes)) + 1j * rng.normal(size=(n_modes, n_modes))
+    )
+    wavelengths_m = np.array([1.2e-6, 1.3e-6])
+    u_stack = np.repeat(q[:, :, np.newaxis], wavelengths_m.size, axis=2)
+    a = rng.normal(size=(n_modes, n_modes))
+    covariance_m2 = (60e-9) ** 2 * (a @ a.T / n_modes + 0.5 * np.eye(n_modes))
+    common = dict(
+        u_stack=u_stack,
+        wavelengths_m=wavelengths_m,
+        positions_m=rng.uniform(-4.0, 4.0, size=(n_modes, 2)),
+        dark_indices=np.array([1, 2, 3]),
+        coupling_per_sub=rng.uniform(0.5, 1.0, n_modes),
+        sub_areas_m2=np.ones(n_modes),
+        sub_diameters_m=None,
+        separations_rad=np.array([0.0, 5.0, 20.0, 60.0]) * _RAD_PER_MAS,
+    )
+
+    closed_form = compute_planet_throughput_vs_separation(
+        piston_covariance_m2=covariance_m2, **common,
+    )
+    pistons_m = rng.multivariate_normal(np.zeros(n_modes), covariance_m2, size=n_draws)
+    phases = np.exp(
+        2j * np.pi * pistons_m[:, np.newaxis, :] / wavelengths_m[np.newaxis, :, np.newaxis]
+    )
+    monte_carlo = compute_planet_throughput_vs_separation(
+        input_transport_scales=phases, **common,
+    )
+    no_piston = compute_planet_throughput_vs_separation(**common)
+
+    np.testing.assert_allclose(closed_form, monte_carlo, rtol=0.01)
+    assert np.max(np.abs(closed_form / no_piston - 1.0)) > 0.05

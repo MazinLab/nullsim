@@ -1,123 +1,115 @@
 """Stellar-disk leakage for a partially-resolved uniform-brightness source.
 
-For a uniform-brightness disk of angular diameter theta_star, the
-incoherent leakage fraction reaching the dark ports is the area-weighted
-integral of the dark-port throughput across the disk:
+For a uniform-brightness disk of angular radius rho_0 = theta_star / 2,
+the incoherent leakage reaching the dark ports is the area-weighted
+average of the position-angle-averaged dark throughput T(r):
 
-    null_disk = (1 / A_disk) * iint T(r) dA
-              = (2 / rho_0**2) * int_0^rho_0 r * T(r) dr
+    <T>_disk = (2 / rho_0**2) * int_0^rho_0 r * T(r) dr
 
-where T(r) is the position-angle-averaged dark-port throughput and
-rho_0 = theta_star / 2 is the disk radius. The AO-realized on-axis null
-and this disk-floor add linearly to the dark-port background, so we
-sum (not max) them in :func:`effective_null_with_disk_floor`.
+(Guyon et al. 2013: each sky point propagates coherently through the
+chip, intensities add incoherently over the disk). The realized-null
+Monte Carlo already evaluates the star at r = 0, so its mean contains
+T(0). The disk floor added on top of it is therefore the excess
 
-Port of KILO ``kilo/performance.py`` ``stellar_disk_null_floor``
-(lines 1130-1209) and ``effective_null_with_disk_floor`` (lines
-1263-1298). KILO comment (lines 1267-1273) is explicit about why these
-two contributions add linearly rather than max-combine: the AO residual
-is the time-varying on-axis mean shift, and the disk integral is the
-static off-axis throughput rolloff over the resolved disk -- both feed
-the Poisson background.
+    disk_floor = <T(r) - T(0)>_disk,
+
+not <T>_disk, which would count the static on-axis leakage twice
+(review 2026-11-07 Issue 17).
+
+The integral uses Gauss-Legendre nodes in r on [0, rho_0] with weight
+2 r / rho_0**2, evaluating T on its own grid inside the stellar radius
+rather than interpolating a coarse separation grid. The integrand is
+r * T(r) with T(r) - T(0) ~ r**2 near axis, a low-order polynomial over
+a disk much smaller than a fringe, so 16 nodes are exact to rounding.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 from numpy.typing import NDArray
 
-__all__ = ["stellar_disk_null_floor", "effective_null_with_disk_floor"]
+__all__ = [
+    "disk_radial_quadrature",
+    "stellar_disk_null_floor",
+    "effective_null_with_disk_floor",
+]
+
+ThroughputFn = Callable[[NDArray[np.float64]], NDArray[np.float64]]
+
+
+def disk_radial_quadrature(
+    stellar_diameter_rad: float,
+    n_nodes: int = 16,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Radial nodes and weights for a uniform-disk average.
+
+    Returns ``(r_rad, weights)`` with ``sum(weights * f(r_rad))`` equal to
+    ``(2 / rho_0**2) int_0^rho_0 r f(r) dr``. The weights sum to one.
+    """
+
+    if n_nodes < 1:
+        raise ValueError(f"n_nodes must be >= 1, got {n_nodes}.")
+    rho_0 = 0.5 * float(stellar_diameter_rad)
+    x, gl_weights = np.polynomial.legendre.leggauss(int(n_nodes))
+    r = 0.5 * rho_0 * (x + 1.0)
+    # dr = rho_0/2 dx and 2 r / rho_0^2 dr = (r / rho_0) dx.
+    return r, gl_weights * r / rho_0
 
 
 def stellar_disk_null_floor(
-    throughputs: NDArray[np.float64] | tuple[float, ...] | list[float],
-    separations_rad: NDArray[np.float64] | tuple[float, ...] | list[float],
+    throughput_fn: ThroughputFn,
     stellar_diameter_rad: float,
+    *,
+    on_axis_throughput: float | None = None,
+    n_nodes: int = 16,
 ) -> float:
-    """Stellar-leakage null floor from a partially-resolved uniform disk.
+    """Disk-averaged dark throughput in excess of the on-axis value.
 
     Args:
-        throughputs: Position-angle-averaged dark-port throughput at each
-            separation (dimensionless, in ``[0, 1]``).
-        separations_rad: Monotonically increasing angular separations in
-            radians. Must cover ``[0, rho_0]`` where ``rho_0 =
-            stellar_diameter_rad / 2``.
+        throughput_fn: Maps separations in radians, shape ``(n,)``, to the
+            position-angle-averaged dark throughput at each, shape ``(n,)``.
         stellar_diameter_rad: Stellar angular diameter in radians.
+        on_axis_throughput: The T(0) already counted by the on-axis null.
+            Defaults to ``throughput_fn(0)``. Pass the unsmoothed value when
+            ``throughput_fn`` includes pointing-jitter smoothing, so the
+            jitter leakage of the star is kept.
+        n_nodes: Gauss-Legendre nodes in r.
 
     Returns:
-        The dimensionless disk-integrated null floor in ``[0, 1]``.
-
-    Raises:
-        ValueError: If ``stellar_diameter_rad / 2`` exceeds the largest
-            separation in ``separations_rad``.
+        ``<T(r)>_disk - T(0)``. For a point star (zero diameter) this is
+        ``throughput_fn(0) - on_axis_throughput``, zero by default.
     """
 
     if stellar_diameter_rad <= 0.0:
-        return 0.0
-
-    rho_0 = stellar_diameter_rad / 2.0
-    r = np.asarray(separations_rad, dtype=np.float64)
-    t = np.asarray(throughputs, dtype=np.float64)
-    if r.shape != t.shape:
+        r = np.zeros(1, dtype=np.float64)
+        weights = np.ones(1, dtype=np.float64)
+    else:
+        r, weights = disk_radial_quadrature(stellar_diameter_rad, n_nodes)
+    t = np.asarray(throughput_fn(np.concatenate(([0.0], r))), dtype=np.float64)
+    if t.shape != (r.size + 1,):
         raise ValueError(
-            "stellar_disk_null_floor: throughputs and separations_rad "
-            f"shape mismatch (got {t.shape} vs {r.shape})."
+            "stellar_disk_null_floor: throughput_fn returned shape "
+            f"{t.shape}; expected ({r.size + 1},)."
         )
-    if r.size == 0:
-        return 0.0
-    if r.size > 1 and not np.all(np.diff(r) > 0.0):
-        raise ValueError(
-            "stellar_disk_null_floor: separations_rad must be strictly "
-            "monotonically increasing (np.interp on unsorted xp returns "
-            f"silent garbage). Got {r.tolist()}."
-        )
-    if rho_0 > r.max():
-        raise ValueError(
-            "stellar_disk_null_floor: stellar disk radius rho_0="
-            f"{rho_0:.3e} rad exceeds separations_rad.max()="
-            f"{r.max():.3e} rad."
-        )
-
-    # Anchor (r=0, T=0): on-axis throughput is identically zero for a
-    # nulling instrument by construction.
-    r_full = np.concatenate(([0.0], r))
-    t_full = np.concatenate(([0.0], t))
-    inside = r_full < rho_0
-    t_at_rho = float(np.interp(rho_0, r_full, t_full))
-    r_eval = np.concatenate((r_full[inside], [rho_0]))
-    t_eval = np.concatenate((t_full[inside], [t_at_rho]))
-    order = np.argsort(r_eval)
-    r_eval = r_eval[order]
-    t_eval = t_eval[order]
-
-    integral = float(np.trapezoid(2.0 * r_eval * t_eval, r_eval))
-    return integral / (rho_0 * rho_0)
+    t_on_axis = float(t[0]) if on_axis_throughput is None else float(on_axis_throughput)
+    return float(weights @ t[1:]) - t_on_axis
 
 
 def effective_null_with_disk_floor(
     null_val_dark: float,
-    throughputs: NDArray[np.float64] | tuple[float, ...] | list[float],
-    separations_rad: NDArray[np.float64] | tuple[float, ...] | list[float],
+    throughput_fn: ThroughputFn,
     stellar_diameter_rad: float,
+    *,
+    n_nodes: int = 16,
 ) -> float:
-    """Combine the AO-realized on-axis null with the resolved-disk floor.
+    """Realized on-axis null plus the resolved-disk excess.
 
-    Both contributions feed the dark-port Poisson background linearly:
-    one is the time-varying on-axis mean shift from AO piston + servo
-    residuals, the other is the static off-axis throughput rolloff
-    integrated over the resolved disk.
-
-    Args:
-        null_val_dark: AO-realized on-axis null depth (dimensionless).
-        throughputs: PA-averaged dark-port throughput vs separation.
-        separations_rad: Monotonically increasing separations in radians.
-        stellar_diameter_rad: Stellar angular diameter in radians.
-
-    Returns:
-        Effective null depth = ``null_val_dark + disk_floor``.
+    Both feed the dark-port background linearly. ``null_val_dark`` already
+    contains the on-axis T(0), so only the excess over it is added.
     """
 
-    disk_floor = stellar_disk_null_floor(
-        throughputs, separations_rad, stellar_diameter_rad,
+    return float(null_val_dark) + stellar_disk_null_floor(
+        throughput_fn, stellar_diameter_rad, n_nodes=n_nodes,
     )
-    return float(null_val_dark) + float(disk_floor)

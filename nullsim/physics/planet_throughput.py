@@ -16,11 +16,27 @@ position-angle-averaged. The denominator uses the on-axis stellar
 ``|E_star_k|^2 = eta_k * A_k`` so the returned throughput captures both
 the angular coupling rolloff and the MZI routing efficiency.
 
-Band-averaging — pass ``unitaries_by_wavelength=[(U_wl, lambda_wl), ...]``
-to mean across multiple wavelengths. Long baselines wrap ~25 fringe
-cycles at J band over the keck pair, so the band-averaged throughput
-can differ from the monochromatic value by O(50%) at the most chromatic
-separations (KILO performance.py docstring lines 1035-1046).
+Band averaging weights each wavelength bin by its detected photon rate
+(``wavelength_weights``; equal weights when omitted). Long baselines wrap
+~25 fringe cycles at J band over the keck pair, so the band-averaged
+throughput can differ from the monochromatic value by O(50%) at the most
+chromatic separations (KILO performance.py docstring lines 1035-1046).
+
+Position angles are sampled uniformly with at least
+``ceil(4 pi B_max theta / lambda_min)`` points (capped at 4096), the
+Nyquist count for the highest fringe harmonic ``2 pi B_max theta /
+lambda`` of the PA-periodic integrand, so the PA mean converges for
+long baselines at wide separations.
+
+An optional piston covariance ``C`` (m^2) averages the dark power over
+Gaussian piston, the same disturbance the realized-null MC applies to the
+star. For ``phi = k x`` with ``x ~ N(0, C)``,
+``E[exp(i(phi_m - phi_n))] = exp(-k^2 (C_mm + C_nn - 2 C_mn) / 2)``, so
+
+    E sum_d |U_d (X * e^{i phi})|^2 = X^H (Q * G) X,
+    Q_mn = sum_d conj(U_dm) U_dn,   G_mn = exp(-k^2 (C_mm + C_nn - 2 C_mn) / 2)
+
+(the Gaussian characteristic function; ``*`` is the elementwise product).
 
 Port of KILO ``kilo/performance.py`` ``compute_planet_throughput_vs_separation``
 (lines 1010-1128) and ``kilo/injection.py`` ``planet_input_field``
@@ -37,6 +53,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from nullsim.physics.imaging import compute_beam_patterns
+from nullsim.physics.realized_null import normalized_wavelength_weights
 from nullsim.physics.ruilier_cassaing import angular_coupling_factor
 
 __all__ = [
@@ -45,6 +62,8 @@ __all__ = [
     "compute_planet_throughput_vs_separation",
     "dark_port_transmission_map",
 ]
+
+_MAX_PA_SAMPLES = 4096
 
 
 def stellar_input_field(
@@ -133,6 +152,8 @@ def compute_planet_throughput_vs_separation(
     separations_rad: NDArray[np.float64] | Sequence[float],
     n_pa_samples: int = 36,
     input_transport_scales: NDArray[np.complex128] | None = None,
+    wavelength_weights: NDArray[np.float64] | None = None,
+    piston_covariance_m2: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
     """Band- and PA-averaged planet throughput vs separation.
 
@@ -152,8 +173,10 @@ def compute_planet_throughput_vs_separation(
         sub_diameters_m: Sub-aperture diameter per mode in m, ``(M,)`` or
             ``None`` (skip the angular-coupling rolloff).
         separations_rad: Separations to evaluate, shape ``(n_sep,)``.
-        n_pa_samples: Number of uniformly-spaced position angles in
-            ``[0, 2*pi)``.
+        n_pa_samples: Minimum number of uniformly spaced position angles
+            in ``[0, 2*pi)``. Raised per separation to
+            ``ceil(4 pi B_max theta / lambda_min)`` (at most 4096), with
+            ``B_max`` the longest baseline between ``positions_m`` rows.
         input_transport_scales: Optional complex amplitude scale at the chip
             input, shape ``(n_transport_states, n_wl, M)``. This folds
             pointing-dependent delay-line loss and chromatic phase into the
@@ -161,6 +184,11 @@ def compute_planet_throughput_vs_separation(
             normalized by its own transported on-axis stellar power so common
             delay-line attenuation remains in the detector photon rate, while
             differential loss and phase still affect dark-port routing.
+        wavelength_weights: Detected photon rate per bin (any
+            normalization), shape ``(n_wl,)``. ``None`` weights bins equally.
+        piston_covariance_m2: Optional per-mode piston OPD covariance in
+            m^2, shape ``(M, M)``. When given, the dark power is the
+            expectation over Gaussian piston (module docstring).
 
     Returns:
         Throughput array of shape ``(n_sep,)``.
@@ -202,7 +230,38 @@ def compute_planet_throughput_vs_separation(
             "compute_planet_throughput_vs_separation: dark_indices out of range."
         )
     seps = np.asarray(separations_rad, dtype=np.float64)
-    pa_angles = np.linspace(0.0, 2.0 * np.pi, n_pa_samples, endpoint=False)
+    band_weights = normalized_wavelength_weights(wavelength_weights, n_wl)
+    positions = np.asarray(positions_m, dtype=np.float64)
+    baseline_max_m = float(np.max(np.linalg.norm(
+        positions[:, np.newaxis, :] - positions[np.newaxis, :, :], axis=-1,
+    )))
+    n_pa_per_sep = np.maximum(
+        int(n_pa_samples),
+        np.minimum(
+            np.ceil(
+                4.0 * np.pi * baseline_max_m * np.abs(seps)
+                / float(np.min(wavelengths_arr))
+            ),
+            _MAX_PA_SAMPLES,
+        ).astype(int),
+    )
+    pa_trig = [
+        (np.sin(pa), np.cos(pa))
+        for pa in (
+            np.linspace(0.0, 2.0 * np.pi, int(n_pa), endpoint=False)
+            for n_pa in n_pa_per_sep
+        )
+    ]
+    covariance = None
+    if piston_covariance_m2 is not None:
+        covariance = np.asarray(piston_covariance_m2, dtype=np.float64)
+        if covariance.shape != (n_modes, n_modes):
+            raise ValueError(
+                "compute_planet_throughput_vs_separation: piston_covariance_m2 "
+                f"must have shape ({n_modes}, {n_modes}); got {covariance.shape}."
+            )
+        variance = np.diag(covariance)
+        structure_m2 = variance[:, np.newaxis] + variance[np.newaxis, :] - 2.0 * covariance
     transport = _input_transport_scales(
         input_transport_scales,
         n_wl=n_wl,
@@ -221,11 +280,14 @@ def compute_planet_throughput_vs_separation(
     # cell (20 wl x 70 sep x 6 states x 36 PA); batching the PA/state axes
     # into one einsum per (wl, sep) is identical math up to summation
     # order (review 2026-06-10 Issue 31a).
-    sin_pa = np.sin(pa_angles)
-    cos_pa = np.cos(pa_angles)
     for w_idx in range(n_wl):
         u_dark = u_array[dark_idx, :, w_idx]  # (n_dark, M)
         wavelength = float(wavelengths_arr[w_idx])
+        if covariance is not None:
+            k = 2.0 * np.pi / wavelength
+            dark_form = (u_dark.conj().T @ u_dark) * np.exp(
+                -0.5 * k * k * structure_m2
+            )  # Q * G, (M, M)
         transport_wl = transport[:, w_idx, :]  # (n_states, M)
         transported_star_power = np.sum(
             base_power[np.newaxis, :] * np.abs(transport_wl) ** 2,
@@ -247,9 +309,10 @@ def compute_planet_throughput_vs_separation(
                 amplitudes = base_amplitudes
 
             # (n_pa, M) planet phase factors for this (wl, sep).
+            sin_pa, cos_pa = pa_trig[i]
             opd = sep * (
-                np.outer(sin_pa, positions_m[:, 0])
-                + np.outer(cos_pa, positions_m[:, 1])
+                np.outer(sin_pa, positions[:, 0])
+                + np.outer(cos_pa, positions[:, 1])
             )
             planet_phase = np.exp(1j * (2.0 * np.pi / wavelength) * opd)
             planet_fields = (
@@ -257,12 +320,16 @@ def compute_planet_throughput_vs_separation(
                 * planet_phase[np.newaxis, :, :]
                 * transport_wl[:, np.newaxis, :]
             )  # (n_states, n_pa, M)
-            outputs = np.einsum("dm,spm->spd", u_dark, planet_fields)
-            dark_power = np.sum(np.abs(outputs) ** 2, axis=2)  # (n_states, n_pa)
+            if covariance is None:
+                outputs = np.einsum("dm,spm->spd", u_dark, planet_fields)
+                dark_power = np.sum(np.abs(outputs) ** 2, axis=2)  # (n_states, n_pa)
+            else:
+                dark_power = np.einsum(
+                    "spm,mn,spn->sp", planet_fields.conj(), dark_form, planet_fields,
+                ).real
             per_transport = np.mean(dark_power, axis=1) / transported_star_power
-            throughputs[i] += float(np.mean(per_transport))
+            throughputs[i] += band_weights[w_idx] * float(np.mean(per_transport))
 
-    throughputs /= float(n_wl)
     return throughputs
 
 

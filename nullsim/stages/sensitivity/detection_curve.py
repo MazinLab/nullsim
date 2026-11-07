@@ -15,10 +15,12 @@ and writes:
 
 - ``planet_throughputs`` shape (n_sep,) — PA- and band-averaged.
 - ``separations_mas`` shape (n_sep,) — the evaluation grid.
-- ``disk_null_floor`` scalar — stellar-disk leakage fraction.
+- ``disk_null_floor`` scalar — resolved-disk leakage in excess of the
+  on-axis value already in the realized null.
 - ``realized_null_depth`` scalar — AO-piston-driven mean leakage.
-- ``null_instability`` scalar — dark-port std/mean (the eps in KILO's
-  systematic-noise term).
+- ``null_fluctuation_rms`` scalar — RMS of the leakage fluctuation in
+  null-depth units; ``null_instability`` is it divided by the effective
+  null, and ``null_instability_mc`` is the band CV of the Monte Carlo.
 - ``residual_starlight_contrast`` shape (n_sep,) — optional external
   residual stellar-leakage profile.
 - ``effective_null_with_disk_by_separation`` shape (n_sep,) — realized,
@@ -67,6 +69,7 @@ from nullsim.physics.planet_throughput import (
 )
 from nullsim.physics.realized_null import (
     RealizedNullResult,
+    band_leakage_statistics,
     piston_covariance_with_common_mode_m2,
     realized_null_depth_mc,
 )
@@ -478,7 +481,14 @@ def _angular_jitter_kernel(
     separations_mas: NDArray[np.float64],
     sigma_mas: float,
 ) -> NDArray[np.float64]:
-    """Return a row-normalized Gaussian kernel on a 1-D separation grid."""
+    """Return the Gaussian smoothing matrix for a profile on a 1-D grid.
+
+    The profile is linearly interpolated onto a fine grid (step sigma/8
+    within 6 sigma of every node, plus the nodes), and the Gaussian is
+    integrated there with trapezoid weights, so nonuniform node spacing
+    does not bias the average toward the densely sampled side (review
+    2026-11-07 row 30). Rows are normalized over the grid's own range.
+    """
 
     separations = np.asarray(separations_mas, dtype=np.float64)
     if separations.ndim != 1 or separations.size == 0:
@@ -487,12 +497,33 @@ def _angular_jitter_kernel(
         raise ValueError("separations_mas must be finite.")
     if not math.isfinite(float(sigma_mas)) or sigma_mas <= 0.0:
         raise ValueError("sigma_mas must be finite and positive.")
-    delta = separations[:, np.newaxis] - separations[np.newaxis, :]
-    weights = np.exp(-0.5 * (delta / float(sigma_mas)) ** 2)
-    row_sums = np.sum(weights, axis=1, keepdims=True)
-    if not np.all(row_sums > 0.0):
-        raise ValueError("angular jitter convolution produced an empty kernel row.")
-    return weights / row_sums
+    if separations.size == 1:
+        return np.ones((1, 1), dtype=np.float64)
+    sigma = float(sigma_mas)
+    offsets = sigma * np.linspace(-6.0, 6.0, 97)
+    fine = np.unique(np.concatenate([
+        separations,
+        np.clip(
+            (separations[:, np.newaxis] + offsets[np.newaxis, :]).ravel(),
+            separations[0],
+            separations[-1],
+        ),
+    ]))
+    spacing = np.diff(fine)
+    trapezoid = 0.5 * (
+        np.concatenate(([0.0], spacing)) + np.concatenate((spacing, [0.0]))
+    )
+    weights = (
+        np.exp(-0.5 * ((separations[:, np.newaxis] - fine[np.newaxis, :]) / sigma) ** 2)
+        * trapezoid[np.newaxis, :]
+    )
+    weights /= np.sum(weights, axis=1, keepdims=True)
+    # Linear interpolation from the nodes onto the fine grid, column by node.
+    interpolation = np.stack(
+        [np.interp(fine, separations, column) for column in np.eye(separations.size)],
+        axis=1,
+    )
+    return weights @ interpolation
 
 
 def _resolve_pointing_jitter_rms_mas(
@@ -691,7 +722,8 @@ def _opd_leakage_fraction(opd_rms_nm: float, wavelength_m: float) -> float:
     Photon-counting focal-plane control heritage (e.g. MEC/SCExAO speckle
     nulling) motivates a slow science-port setpoint trim. Its residual bias
     and deliberate dither are known OPD terms, so their leakage is charged
-    directly without adding to the instability CV.
+    directly. They add no variance of their own, only the bias cross term
+    with the random piston (see the null-instability block in ``apply``).
     """
 
     if opd_rms_nm < 0.0 or not math.isfinite(float(opd_rms_nm)):
@@ -900,6 +932,7 @@ def _ideal_realized_null_for_stack(
     u_stack: NDArray[np.complex128],
     stellar_field: NDArray[np.complex128],
     dark_indices: NDArray[np.intp],
+    wavelength_weights: NDArray[np.float64],
 ) -> RealizedNullResult:
     """Chip-only realized-null summary for one deployed arm stack."""
 
@@ -946,15 +979,19 @@ def _ideal_realized_null_for_stack(
             "sensitivity.detection_curve: stellar_field must be 1-D, 2-D, or 3-D."
         )
     n_az = int(fields_per_az_wl.shape[0])
-    ideal = float(np.mean([
-        _cn(u_stack[:, :, k], fields_per_az_wl[az_idx, k], dark_indices)
+    ideal = float(wavelength_weights @ np.array([
+        np.mean([
+            _cn(u_stack[:, :, k], fields_per_az_wl[az_idx, k], dark_indices)
+            for az_idx in range(n_az)
+        ])
         for k in range(n_wl)
-        for az_idx in range(n_az)
     ]))
-    ideal_kilo = float(np.mean([
-        _cn_kilo(u_stack[:, :, k], fields_per_az_wl[az_idx, k], dark_indices)
+    ideal_kilo = float(wavelength_weights @ np.array([
+        np.mean([
+            _cn_kilo(u_stack[:, :, k], fields_per_az_wl[az_idx, k], dark_indices)
+            for az_idx in range(n_az)
+        ])
         for k in range(n_wl)
-        for az_idx in range(n_az)
     ]))
     return RealizedNullResult(
         mean_null_depth=ideal,
@@ -971,8 +1008,13 @@ def _ideal_realized_null_for_stack(
 def _combine_realized_null_results(
     results: Sequence[RealizedNullResult],
     weights: NDArray[np.float64],
+    wavelength_weights: NDArray[np.float64],
 ) -> RealizedNullResult:
-    """Incoherently combine per-arm realized-null distributions."""
+    """Incoherently combine per-arm realized-null distributions.
+
+    Arm dark power adds (flux-weighted samples, paired by draw), then the
+    band statistics follow :func:`band_leakage_statistics`.
+    """
 
     if len(results) == 1:
         return results[0]
@@ -989,13 +1031,9 @@ def _combine_realized_null_results(
             combined_samples = np.zeros(first_shape, dtype=np.float64)
             for weight, sample in zip(weights_arr, sample_arrays, strict=True):
                 combined_samples += float(weight) * sample
-            mean_per_wl = np.mean(combined_samples, axis=1)
-            std_per_wl = np.std(combined_samples, axis=1)
-            cv_per_wl = np.divide(
-                std_per_wl,
-                mean_per_wl,
-                out=np.zeros_like(std_per_wl),
-                where=mean_per_wl > 0.0,
+            n_azimuths = max(result.n_azimuths for result in results)
+            band_mean, band_rms = band_leakage_statistics(
+                combined_samples, wavelength_weights, n_azimuths,
             )
             all_samples = combined_samples.reshape(-1)
 
@@ -1010,7 +1048,9 @@ def _combine_realized_null_results(
                     combined_kilo = np.zeros(first_shape, dtype=np.float64)
                     for weight, sample in zip(weights_arr, kilo_arrays, strict=True):
                         combined_kilo += float(weight) * sample
-                    mean_kilo = float(np.mean(combined_kilo))
+                    mean_kilo = float(
+                        wavelength_weights @ np.mean(combined_kilo, axis=1)
+                    )
                 else:
                     mean_kilo = float(sum(
                         float(weight) * float(result.mean_null_depth_kilo)
@@ -1023,10 +1063,11 @@ def _combine_realized_null_results(
                 ))
 
             return RealizedNullResult(
-                mean_null_depth=float(np.mean(mean_per_wl)),
+                mean_null_depth=band_mean,
                 median_null_depth=float(np.median(all_samples)),
                 std_null_depth=float(np.std(all_samples)),
-                null_instability=float(np.mean(cv_per_wl)),
+                null_instability=band_rms / band_mean if band_mean > 0.0 else 0.0,
+                null_fluctuation_rms=band_rms,
                 ideal_null_depth=float(sum(
                     float(weight) * float(result.ideal_null_depth)
                     for weight, result in zip(weights_arr, results, strict=True)
@@ -1037,7 +1078,7 @@ def _combine_realized_null_results(
                 )),
                 mean_null_depth_kilo=mean_kilo,
                 n_samples=int(all_samples.size),
-                n_azimuths=max(result.n_azimuths for result in results),
+                n_azimuths=n_azimuths,
                 n_realizations_per_azimuth=max(
                     result.n_realizations_per_azimuth for result in results
                 ),
@@ -1049,13 +1090,16 @@ def _combine_realized_null_results(
             for weight, result in zip(weights_arr, results, strict=True)
         ))
 
+    # Unpaired fallback (no stored samples): arms treated as fully
+    # correlated, which bounds the combined RMS from above.
     mean = weighted("mean_null_depth")
-    std = weighted("std_null_depth")
+    rms = weighted("null_fluctuation_rms")
     return RealizedNullResult(
         mean_null_depth=mean,
         median_null_depth=weighted("median_null_depth"),
-        std_null_depth=std,
-        null_instability=0.0 if mean <= 0.0 else std / mean,
+        std_null_depth=weighted("std_null_depth"),
+        null_instability=0.0 if mean <= 0.0 else rms / mean,
+        null_fluctuation_rms=rms,
         ideal_null_depth=weighted("ideal_null_depth"),
         ideal_null_depth_kilo=weighted("ideal_null_depth_kilo"),
         mean_null_depth_kilo=weighted("mean_null_depth_kilo"),
@@ -2405,9 +2449,8 @@ def _ft_published_f_3db_hz(state: SimulationState) -> float | None:
 def _resolve_effective_bandwidth_hz(
     *,
     params: Any,
-    sigma_phi_piston_rad: float,
-    sigma_I_residual: float,
-    n_modes: int,
+    piston_leakage_variance: float,
+    amplitude_leakage_variance: float,
     resolved_amp_servo_bandwidth_hz: float | None = None,
     resolved_f_piston_hz: float | None = None,
 ) -> float | None:
@@ -2416,7 +2459,7 @@ def _resolve_effective_bandwidth_hz(
     Precedence:
 
     1. ``params.effective_systematic_bandwidth_hz_override`` (explicit).
-    2. The variance-weighted KILO blend
+    2. The leakage-variance-weighted blend
        (:func:`effective_systematic_bandwidth_hz`) when
        ``params.auto_amplitude_servo_residual=True`` (Tier 2.5b).
     3. ``None`` — performance stage uses its own default.
@@ -2452,9 +2495,8 @@ def _resolve_effective_bandwidth_hz(
         else float(params.auto_f_piston_hz)
     )
     return effective_systematic_bandwidth_hz(
-        sigma_phi_piston_rad=sigma_phi_piston_rad,
-        sigma_I_residual=sigma_I_residual,
-        n_modes=n_modes,
+        piston_leakage_variance=piston_leakage_variance,
+        amplitude_leakage_variance=amplitude_leakage_variance,
         f_piston_hz=f_piston_hz,
         f_amp_hz=f_amp_hz,
     )
@@ -2465,7 +2507,8 @@ def _effective_bandwidth_diagnostics(
     params: Any,
     sigma_phi_piston_rad: float,
     sigma_I_residual: float,
-    n_modes: int,
+    piston_leakage_variance: float,
+    amplitude_leakage_variance: float,
     piston_covariance_m2: NDArray[np.float64] | None,
     resolved_amp_servo_bandwidth_hz: float | None,
     effective_bandwidth_hz: float | None,
@@ -2476,7 +2519,7 @@ def _effective_bandwidth_diagnostics(
     if params.effective_systematic_bandwidth_hz_override is not None:
         source = "params.effective_systematic_bandwidth_hz_override"
     elif params.auto_amplitude_servo_residual:
-        source = "variance_weighted_piston_scintillation_blend"
+        source = "leakage_variance_weighted_piston_scintillation_blend"
     else:
         source = "performance.default_servo_bw_hz"
     piston_model = (
@@ -2491,10 +2534,13 @@ def _effective_bandwidth_diagnostics(
         ),
         "sigma_phi_piston_rad": float(sigma_phi_piston_rad),
         "sigma_I_residual": float(sigma_I_residual),
-        "n_modes": int(n_modes),
+        "piston_leakage_variance": float(piston_leakage_variance),
+        "amplitude_leakage_variance": float(amplitude_leakage_variance),
         "piston_rms_model": piston_model,
         "piston_covariance_used_in_realized_null_mc": piston_covariance_m2 is not None,
-        "piston_covariance_directionality_used_in_f_eff": False,
+        "piston_covariance_directionality_used_in_f_eff": (
+            piston_covariance_m2 is not None and piston_leakage_variance > 0.0
+        ),
         "resolved_amp_servo_bandwidth_hz": (
             None
             if resolved_amp_servo_bandwidth_hz is None
@@ -2511,11 +2557,10 @@ def _effective_bandwidth_diagnostics(
             else "params.auto_f_piston_hz (fallback)"
         ),
         "model": (
-            "f_eff is a scalar variance-weighted bandwidth. It uses the "
-            "resolved piston RMS (the trace RMS for covariance-driven piston "
-            "MC) and the injected fractional-intensity RMS; covariance "
-            "directionality is propagated through realized_null_depth_mc, not "
-            "through the scalar f_eff term."
+            "1/f_eff = w_phi/f_piston + w_I/f_amp with w_i the share of the "
+            "photon-weighted band leakage variance from realized-null MC runs "
+            "with only piston and only amplitude perturbations (same seeds). "
+            "sigma_phi_piston_rad and sigma_I_residual are provenance only."
         ),
     }
 
@@ -2899,6 +2944,65 @@ def _planet_input_transport_scales(
     )
 
 
+def _photon_wavelength_weights(
+    state: SimulationState,
+    wavelength_grid_um: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], str]:
+    """Detected stellar photon rate per wavelength bin, normalized to one.
+
+    Reads the upstream detector's per-port, per-bin rates (the same rates
+    whose port sums give the band totals that multiply the null), summed
+    over ports, before saturation and MKID energy redistribution. Falls
+    back to bin width times upstream transmission without a detector.
+    """
+
+    n_wl = int(np.asarray(wavelength_grid_um).size)
+    detector = _find_detector_component(state)
+    if detector is not None:
+        for key in (
+            "pre_energy_response_port_rate_hz_per_wavelength",
+            "uncapped_port_rate_hz_per_wavelength",
+        ):
+            rates = detector.get(key)
+            if rates is None:
+                continue
+            rates_arr = np.asarray(rates, dtype=np.float64)
+            if rates_arr.ndim != 2 or rates_arr.shape[1] != n_wl:
+                continue
+            per_bin = np.sum(rates_arr, axis=0)
+            if np.all(np.isfinite(per_bin)) and np.sum(per_bin) > 0.0:
+                return per_bin / float(np.sum(per_bin)), f"detector:{key}"
+    return (
+        _residual_starlight_wavelength_weights(state, wavelength_grid_um),
+        "bin_width_times_transmission",
+    )
+
+
+def _mode_piston_covariance_m2(
+    *,
+    sigma_opd_m: float,
+    covariance_m2: NDArray[np.float64] | None,
+    mode_group_indices: NDArray[np.intp] | None,
+    n_modes: int,
+) -> NDArray[np.float64] | None:
+    """Per-chip-mode piston covariance matching the realized-null MC draws."""
+
+    groups = (
+        np.arange(n_modes, dtype=np.intp)
+        if mode_group_indices is None
+        else np.asarray(mode_group_indices, dtype=np.intp)
+    )
+    if covariance_m2 is not None:
+        cov = np.asarray(covariance_m2, dtype=np.float64)
+        if cov.shape == (n_modes, n_modes):
+            return cov
+        return cov[np.ix_(groups, groups)]
+    if sigma_opd_m <= 0.0:
+        return None
+    same_group = groups[:, np.newaxis] == groups[np.newaxis, :]
+    return float(sigma_opd_m) ** 2 * same_group.astype(np.float64)
+
+
 def _detector_stellar_and_static_leakage_rates_hz(
     state: SimulationState,
 ) -> tuple[float | None, float | None]:
@@ -3212,17 +3316,19 @@ class DetectionCurve(BaseStage):
         # value. Matches KILO's detection_space model where the dark-port
         # null is the calibration-limited floor (kilo/studies/sensitivity.py
         # L155 + L207) and not derived from the chip's own optimized null.
-        # Tier 1.3 fix: the MC ``null_instability`` is ALWAYS propagated
-        # regardless of this override; the override only replaces the
-        # null-depth scalar.
+        # The leakage fluctuation ``null_fluctuation_rms`` (null-depth units)
+        # comes from the MC and the trim bias regardless of this override;
+        # ``null_instability`` is that RMS divided by the effective null in
+        # force, so effective null x null_instability is the RMS either way.
         effective_null_override: float | None = PydanticField(default=None, gt=0.0)
         # Residual static OPD bias left by a slow dark-port trim loop. The loop
         # licenses a small bounded value; the leakage cost is charged directly
-        # but does not enter the null-instability CV.
+        # and enters the fluctuation only through its cross term with the
+        # random piston.
         null_setpoint_residual_nm: float = PydanticField(default=0.0, ge=0.0)
         # RMS deliberate dark-port trim dither. This is a known modulation, so
-        # its leakage is charged to the effective null without inflating the MC
-        # instability term.
+        # its leakage is charged to the effective null and enters the
+        # fluctuation only through its cross term with the random piston.
         setpoint_dither_rms_nm: float = PydanticField(default=0.0, ge=0.0)
         # Photon-limited auto mode: derive the trim dither amplitude and the
         # held setpoint jointly from this run's detected stellar rate and
@@ -3430,35 +3536,11 @@ class DetectionCurve(BaseStage):
             n_wl=len(wavelengths_m),
             n_apertures=n_delay_apertures,
         )
-        throughput_per_arm_before_pointing_jitter = np.stack(
-            [
-                compute_planet_throughput_vs_separation(
-                    u_stack=arm_stack,
-                    wavelengths_m=wavelengths_m,
-                    positions_m=positions_m,
-                    dark_indices=dark_indices,
-                    coupling_per_sub=coupling_per_sub,
-                    sub_areas_m2=sub_areas_m2,
-                    sub_diameters_m=(
-                        sub_diameters_m if params.include_angular_coupling else None
-                    ),
-                    separations_rad=separations_rad,
-                    n_pa_samples=params.n_pa_samples,
-                    input_transport_scales=planet_transport_scales,
-                )
-                for arm_stack in unitary_stacks
-            ],
-            axis=0,
-        )
-        throughput_per_arm = _angular_jitter_convolve_profile(
-            throughput_per_arm_before_pointing_jitter,
-            separations_mas=separations_mas,
-            sigma_mas=pointing_jitter_rms_mas,
-        )
-        throughputs = np.average(
-            throughput_per_arm,
-            axis=0,
-            weights=unitary_arm_weights,
+        # One set of photon weights for every band average: realized null,
+        # its fluctuation, planet throughput, disk floor, residual starlight.
+        wavelength_weights, wavelength_weights_source = _photon_wavelength_weights(
+            state,
+            np.asarray(chip_wavelengths_um, dtype=np.float64),
         )
         (
             piston_temporal_subaperture_diameter_m,
@@ -3486,6 +3568,62 @@ class DetectionCurve(BaseStage):
             piston_residual_diagnostics[
                 "fringe_observability_temporal_subaperture_diameter_source"
             ] = piston_temporal_subaperture_diameter_source
+        mode_group_indices: NDArray[np.intp] | None = None
+        mode_group_source: str | None = None
+        split_indices = splitter_physical_indices(state, unitary_stacks[0].shape[1])
+        if split_indices is not None:
+            mode_group_indices, mode_group_source = split_indices
+        # The planet sees the same piston as the star (review 2026-11-07
+        # row 36): average its dark power over the MC's piston covariance.
+        mode_piston_covariance_m2 = _mode_piston_covariance_m2(
+            sigma_opd_m=sigma_OPD_m,
+            covariance_m2=piston_covariance_m2,
+            mode_group_indices=mode_group_indices,
+            n_modes=n_modes,
+        )
+
+        def planet_throughput_per_arm(seps_rad: NDArray[np.float64]) -> NDArray[np.float64]:
+            return np.stack(
+                [
+                    compute_planet_throughput_vs_separation(
+                        u_stack=arm_stack,
+                        wavelengths_m=wavelengths_m,
+                        positions_m=positions_m,
+                        dark_indices=dark_indices,
+                        coupling_per_sub=coupling_per_sub,
+                        sub_areas_m2=sub_areas_m2,
+                        sub_diameters_m=(
+                            sub_diameters_m if params.include_angular_coupling else None
+                        ),
+                        separations_rad=seps_rad,
+                        n_pa_samples=params.n_pa_samples,
+                        input_transport_scales=planet_transport_scales,
+                        wavelength_weights=wavelength_weights,
+                        piston_covariance_m2=mode_piston_covariance_m2,
+                    )
+                    for arm_stack in unitary_stacks
+                ],
+                axis=0,
+            )
+
+        def arm_averaged_throughput(seps_rad: NDArray[np.float64]) -> NDArray[np.float64]:
+            return np.average(
+                planet_throughput_per_arm(seps_rad), axis=0, weights=unitary_arm_weights,
+            )
+
+        throughput_per_arm_before_pointing_jitter = planet_throughput_per_arm(
+            separations_rad
+        )
+        throughput_per_arm = _angular_jitter_convolve_profile(
+            throughput_per_arm_before_pointing_jitter,
+            separations_mas=separations_mas,
+            sigma_mas=pointing_jitter_rms_mas,
+        )
+        throughputs = np.average(
+            throughput_per_arm,
+            axis=0,
+            weights=unitary_arm_weights,
+        )
 
         # Tier 2.3b/2.5b: optionally derive σ_I and f_eff from physics
         # instead of using the manual scalar / override.
@@ -3513,66 +3651,88 @@ class DetectionCurve(BaseStage):
             n_per_az = max(
                 int(params.n_mc_realizations) // int(params.n_azimuths), 1
             )
-        mode_group_indices: NDArray[np.intp] | None = None
-        mode_group_source: str | None = None
-        split_indices = splitter_physical_indices(state, unitary_stacks[0].shape[1])
-        if split_indices is not None:
-            mode_group_indices, mode_group_source = split_indices
         has_mc_perturbation = (
             sigma_OPD_m > 0.0
             or piston_covariance_m2 is not None
             or np.any(np.asarray(sigma_I_per_sub, dtype=np.float64) > 0.0)
             or float(params.fiber_phase_noise_rms_rad) > 0.0
         )
-        if n_per_az > 0 and has_mc_perturbation:
-            mc_per_arm = tuple(
-                realized_null_depth_mc(
-                    u_stack=arm_stack,
-                    stellar_field=per_az_field,
-                    dark_indices=dark_indices,
-                    ao_piston_opd_rms_per_sub_m=sigma_OPD_m,
-                    ao_piston_opd_covariance_m2=piston_covariance_m2,
-                    wavelengths_m=wavelengths_m,
-                    n_realizations_per_azimuth=n_per_az,
-                    seed=params.mc_seed,
-                    scintillation_index_per_sub=sigma_I_per_sub,
-                    mode_group_indices=mode_group_indices,
-                    fiber_phase_noise_rms_rad=float(params.fiber_phase_noise_rms_rad),
-                )
+        mc_kwargs: dict[str, Any] = {
+            "stellar_field": per_az_field,
+            "dark_indices": dark_indices,
+            "ao_piston_opd_rms_per_sub_m": sigma_OPD_m,
+            "ao_piston_opd_covariance_m2": piston_covariance_m2,
+            "wavelengths_m": wavelengths_m,
+            "n_realizations_per_azimuth": n_per_az,
+            "seed": params.mc_seed,
+            "scintillation_index_per_sub": sigma_I_per_sub,
+            "mode_group_indices": mode_group_indices,
+            "fiber_phase_noise_rms_rad": float(params.fiber_phase_noise_rms_rad),
+            "wavelength_weights": wavelength_weights,
+        }
+
+        def run_mc(**overrides: Any) -> tuple[tuple[RealizedNullResult, ...], RealizedNullResult]:
+            per_arm = tuple(
+                realized_null_depth_mc(u_stack=arm_stack, **{**mc_kwargs, **overrides})
                 for arm_stack in unitary_stacks
             )
+            return per_arm, _combine_realized_null_results(
+                per_arm, unitary_arm_weights, wavelength_weights,
+            )
+
+        run_realized_mc = n_per_az > 0 and has_mc_perturbation
+        if run_realized_mc:
+            mc_per_arm, mc = run_mc()
         else:
             mc_per_arm = tuple(
                 _ideal_realized_null_for_stack(
                     u_stack=arm_stack,
                     stellar_field=per_az_field,
                     dark_indices=dark_indices,
+                    wavelength_weights=wavelength_weights,
                 )
                 for arm_stack in unitary_stacks
             )
-        mc = _combine_realized_null_results(mc_per_arm, unitary_arm_weights)
+            mc = _combine_realized_null_results(
+                mc_per_arm, unitary_arm_weights, wavelength_weights,
+            )
 
-        # Stellar disk integration
+        # Stellar disk: the realized null already holds the on-axis T(0), so
+        # only the resolved-disk excess <T(r) - T(0)> is added (review
+        # 2026-11-07 Issue 17). T is evaluated on its own quadrature nodes
+        # inside the stellar radius. With pointing jitter the disk sees the
+        # smoothed T, while T(0) stays the unsmoothed value the MC contains,
+        # so the jitter leakage of the star is kept.
         stellar_diameter_rad = 0.0
         if state.scene.star_angular_diameter_mas is not None:
             stellar_diameter_rad = float(state.scene.star_angular_diameter_mas) * _RAD_PER_MAS
-        try:
-            disk_floor = stellar_disk_null_floor(
-                throughputs, separations_rad, stellar_diameter_rad,
+        if pointing_jitter_rms_mas > 0.0:
+            jitter_mas = float(pointing_jitter_rms_mas)
+
+            def disk_throughput(r_rad: NDArray[np.float64]) -> NDArray[np.float64]:
+                r_mas = np.asarray(r_rad, dtype=np.float64) / _RAD_PER_MAS
+                grid_mas = np.unique(np.concatenate([
+                    r_mas,
+                    np.arange(0.0, float(np.max(r_mas)) + 6.0 * jitter_mas, jitter_mas / 8.0),
+                ]))
+                smoothed = _angular_jitter_convolve_profile(
+                    arm_averaged_throughput(grid_mas * _RAD_PER_MAS),
+                    separations_mas=grid_mas,
+                    sigma_mas=jitter_mas,
+                )
+                return np.interp(r_mas, grid_mas, smoothed)
+
+            on_axis_throughput: float | None = float(
+                arm_averaged_throughput(np.zeros(1, dtype=np.float64))[0]
             )
-        except ValueError as exc:
-            stellar_radius_mas = (
-                None
-                if state.scene.star_angular_diameter_mas is None
-                else 0.5 * float(state.scene.star_angular_diameter_mas)
-            )
-            raise ValueError(
-                "sensitivity.detection_curve cannot compute finite stellar-disk "
-                "leakage because separations_mas does not cover the stellar "
-                f"radius ({stellar_radius_mas} mas). Extend separations_mas "
-                "to include the stellar radius or set scene.star.angular_diameter_mas "
-                "to 0 for point-source smoke tests."
-            ) from exc
+        else:
+            disk_throughput = arm_averaged_throughput
+            on_axis_throughput = None
+        disk_floor = stellar_disk_null_floor(
+            disk_throughput,
+            stellar_diameter_rad,
+            on_axis_throughput=on_axis_throughput,
+        )
         wavelength_center_m = float(wavelengths_m[len(wavelengths_m) // 2])
         base_effective_null = float(mc.mean_null_depth) + float(disk_floor)
 
@@ -3580,7 +3740,6 @@ class DetectionCurve(BaseStage):
         # disk-floor base null with the supplied calibration-limited floor.
         # Residual-starlight profiles are applied below on top of this base
         # using their configured combine mode.
-        null_instability_out = float(mc.null_instability)
         if params.effective_null_override is not None:
             base_effective_null = float(params.effective_null_override)
             effective_null_scalar_source = "effective_null_override"
@@ -3674,10 +3833,7 @@ class DetectionCurve(BaseStage):
             params=params,
             separations_mas=separations_mas,
             wavelength_grid_um=np.asarray(chip_wavelengths_um, dtype=np.float64),
-            wavelength_weights=_residual_starlight_wavelength_weights(
-                state,
-                np.asarray(chip_wavelengths_um, dtype=np.float64),
-            ),
+            wavelength_weights=wavelength_weights,
             config_dir=_config_dir_from_context(self.context),
         )
         residual_starlight_profile = _angular_jitter_convolve_profile(
@@ -3720,12 +3876,51 @@ class DetectionCurve(BaseStage):
                 dtype=np.float64,
             )
 
+        # Null fluctuation (review 2026-11-07 Issue 19). The MC gives the
+        # random part sigma_MC of the band leakage. A deterministic offset b
+        # (setpoint residual and dither) couples to the random piston x
+        # through the cross term of the quadratic leakage L = (x+b)^T Q (x+b):
+        # Var L = 2 tr(QCQC) + 4 b^T QCQ b. If Q C has N_eff equal nonzero
+        # eigenvalues, CV_MC^2 = 2/N_eff and 4 b^T QCQ b = 2 CV_MC^2 L_dyn L_b,
+        # with L_dyn = E[x^T Q x] the dynamic part of the MC mean and
+        # L_b = b^T Q b. The disk floor is incoherent with the on-axis
+        # piston and adds no variance; the bias itself is static.
+        dynamic_null = max(float(mc.mean_null_depth) - float(mc.ideal_null_depth), 0.0)
+        bias_leakage = float(null_setpoint_leakage) + float(setpoint_dither_leakage)
+        null_instability_mc = float(mc.null_instability)
+        null_fluctuation_rms = math.sqrt(
+            float(mc.null_fluctuation_rms) ** 2
+            + 2.0 * null_instability_mc ** 2 * dynamic_null * bias_leakage
+        )
+        null_instability_out = (
+            null_fluctuation_rms / float(effective_null) if effective_null > 0.0 else 0.0
+        )
+
         # Resolve the f_eff for the performance stage's systematic-noise
         # term. Precedence:
         #   (1) explicit effective_systematic_bandwidth_hz_override,
-        #   (2) variance-weighted blend when auto_amplitude_servo_residual
-        #       is enabled (Tier 2.5b),
+        #   (2) leakage-variance-weighted blend when
+        #       auto_amplitude_servo_residual is enabled (Tier 2.5b); the leg
+        #       variances come from MC reruns with one perturbation each
+        #       (same seeds, so the draws are those of the full MC),
         #   (3) None (performance stage uses its own default).
+        piston_leakage_variance = 0.0
+        amplitude_leakage_variance = 0.0
+        if (
+            run_realized_mc
+            and params.effective_systematic_bandwidth_hz_override is None
+            and params.auto_amplitude_servo_residual
+        ):
+            _, piston_only = run_mc(
+                scintillation_index_per_sub=0.0, fiber_phase_noise_rms_rad=0.0,
+            )
+            _, amplitude_only = run_mc(
+                ao_piston_opd_rms_per_sub_m=0.0,
+                ao_piston_opd_covariance_m2=None,
+                fiber_phase_noise_rms_rad=0.0,
+            )
+            piston_leakage_variance = float(piston_only.null_fluctuation_rms) ** 2
+            amplitude_leakage_variance = float(amplitude_only.null_fluctuation_rms) ** 2
         resolved_amp_bw_hz = (
             None
             if amp_servo_diagnostics is None
@@ -3740,9 +3935,8 @@ class DetectionCurve(BaseStage):
         resolved_f_piston_hz = _ft_published_f_3db_hz(state)
         effective_bandwidth_hz = _resolve_effective_bandwidth_hz(
             params=params,
-            sigma_phi_piston_rad=sigma_phi_piston_rad,
-            sigma_I_residual=sigma_I_per_sub,
-            n_modes=n_modes,
+            piston_leakage_variance=piston_leakage_variance,
+            amplitude_leakage_variance=amplitude_leakage_variance,
             resolved_amp_servo_bandwidth_hz=resolved_amp_bw_hz,
             resolved_f_piston_hz=resolved_f_piston_hz,
         )
@@ -3750,7 +3944,8 @@ class DetectionCurve(BaseStage):
             params=params,
             sigma_phi_piston_rad=sigma_phi_piston_rad,
             sigma_I_residual=sigma_I_per_sub,
-            n_modes=n_modes,
+            piston_leakage_variance=piston_leakage_variance,
+            amplitude_leakage_variance=amplitude_leakage_variance,
             piston_covariance_m2=piston_covariance_m2,
             resolved_amp_servo_bandwidth_hz=resolved_amp_bw_hz,
             effective_bandwidth_hz=effective_bandwidth_hz,
@@ -3808,6 +4003,9 @@ class DetectionCurve(BaseStage):
             ),
             "planet_delay_transport_applied": planet_transport_scales is not None,
             "wavelengths_m": tuple(float(w) for w in wavelengths_m),
+            "photon_wavelength_weights": tuple(float(w) for w in wavelength_weights),
+            "photon_wavelength_weights_source": wavelength_weights_source,
+            "planet_throughput_piston_averaged": mode_piston_covariance_m2 is not None,
             "n_pa_samples": int(params.n_pa_samples),
             "include_angular_coupling": bool(params.include_angular_coupling),
             "pointing_jitter_rms_mas": float(pointing_jitter_rms_mas),
@@ -3858,6 +4056,10 @@ class DetectionCurve(BaseStage):
             "realized_null_median": float(mc.median_null_depth),
             "realized_null_std": float(mc.std_null_depth),
             "null_instability": null_instability_out,
+            "null_instability_mc": null_instability_mc,
+            "null_fluctuation_rms": float(null_fluctuation_rms),
+            "null_fluctuation_rms_mc": float(mc.null_fluctuation_rms),
+            "null_fluctuation_bias_leakage": float(bias_leakage),
             "ideal_chip_null_depth": float(mc.ideal_null_depth),
             "ideal_chip_null_depth_per_arm": tuple(
                 float(arm_result.ideal_null_depth) for arm_result in mc_per_arm
@@ -3958,12 +4160,13 @@ class DetectionCurve(BaseStage):
             ),
             "source_model": (
                 "Port of KILO performance.compute_planet_throughput_vs_separation "
-                "(lines 1010-1128), stellar_disk_null_floor (lines 1130-1209), "
-                "and azimuth_averaged_realized_null_depth (transport.py lines "
-                "1739-1883). The finite-star term follows the Guyon et al. "
+                "(lines 1010-1128) and azimuth_averaged_realized_null_depth "
+                "(transport.py lines 1739-1883), with photon-weighted band "
+                "statistics. The finite-star term follows the Guyon et al. "
                 "(2013) nuller model: each sky point is propagated coherently "
                 "through U, and intensities are integrated incoherently over "
-                "the stellar disk."
+                "the stellar disk; only the excess over the on-axis leakage "
+                "is added to the realized null."
             ),
         }
         results = state.results.add_component(component_name, payload)

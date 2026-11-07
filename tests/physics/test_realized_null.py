@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 
 from nullsim.physics.realized_null import (
+    band_leakage_statistics,
+    normalized_wavelength_weights,
     piston_covariance_with_common_mode_m2,
     realized_null_depth_mc,
 )
@@ -446,53 +448,69 @@ def test_negative_n_realizations_per_azimuth_rejected() -> None:
         )
 
 
-def test_per_wavelength_cv_average_does_not_pool_samples() -> None:
-    """Tier 4.5: null_instability is now per-λ CV averaged, not pooled.
+def test_band_statistics_two_bin_toy_by_hand() -> None:
+    """Photon-weighted band leakage N = 0.25 L0 + 0.75 L1 per paired draw.
 
-    Construct a unitary that gives different mean nulls at two
-    wavelengths. The pooled std/mean (pre-fix) would mix the band-to-
-    band drift into the CV; the per-λ-then-average (post-fix) ignores
-    that drift and reflects only the per-realization fluctuation.
+    Two azimuths x two draws. By hand: N = [3.25, 0.75 | 1.25, 4.25], so
+    mean 2.375, within-azimuth variances 1.5625 and 2.25, and
+    sigma_MC = sqrt(1.90625).
     """
-    n_modes = 4
-    rng = np.random.default_rng(1)
-    A = rng.normal(size=(n_modes, n_modes)) + 1j * rng.normal(size=(n_modes, n_modes))
-    q, _ = np.linalg.qr(A)
-    field = np.ones(n_modes, dtype=np.complex128) / math.sqrt(n_modes)
 
-    # Two wavelength bins, same unitary → same per-realization stats.
-    # If null_instability is per-λ-then-averaged, it equals the
-    # single-wavelength CV. If it's pooled, the n_wl×n_real samples
-    # would have a slightly different std/mean due to extra averaging
-    # of independent draws.
-    u_stack_2wl = q[:, :, np.newaxis].repeat(2, axis=2)
-    dark = np.array([1, 2, 3], dtype=np.intp)
-    res_2wl = realized_null_depth_mc(
-        u_stack=u_stack_2wl,
-        stellar_field=field,
-        dark_indices=dark,
+    samples = np.array([[1.0, 3.0, 2.0, 2.0], [4.0, 0.0, 1.0, 5.0]])
+    weights = normalized_wavelength_weights(np.array([1.0, 3.0]), 2)
+    mean, rms = band_leakage_statistics(samples, weights, n_azimuths=2)
+    assert mean == pytest.approx(2.375, rel=1e-15)
+    assert rms == pytest.approx(math.sqrt(1.90625), rel=1e-15)
+
+
+def test_null_instability_is_cv_of_photon_weighted_band_leakage() -> None:
+    """Issue 18: the CV is that of the band sum of paired draws, not the
+    mean of per-bin CVs. Two bins of a random 4-mode chip share each piston
+    draw, so per-bin leakages correlate and the band CV differs from the
+    per-bin average. Check against the returned samples directly.
+    """
+
+    rng = np.random.default_rng(1)
+    n_modes = 4
+    q, _ = np.linalg.qr(
+        rng.normal(size=(n_modes, n_modes)) + 1j * rng.normal(size=(n_modes, n_modes))
+    )
+    weights = np.array([5.0, 1.0])
+    res = realized_null_depth_mc(
+        u_stack=q[:, :, np.newaxis].repeat(2, axis=2),
+        stellar_field=np.ones(n_modes, dtype=np.complex128) / 2.0,
+        dark_indices=np.array([1, 2, 3], dtype=np.intp),
         ao_piston_opd_rms_per_sub_m=10.0e-9,
         wavelengths_m=np.array([1.25e-6, 1.65e-6]),
         n_realizations=2000,
         seed=42,
+        wavelength_weights=weights,
     )
-    # Run each wavelength independently and compare the average of CVs.
-    cv_per_wl = []
-    for wl in (1.25e-6, 1.65e-6):
-        res_single = realized_null_depth_mc(
-            u_stack=q[:, :, np.newaxis],
-            stellar_field=field,
-            dark_indices=dark,
-            ao_piston_opd_rms_per_sub_m=10.0e-9,
-            wavelengths_m=np.array([wl]),
-            n_realizations=2000,
-            seed=42,
-        )
-        cv_per_wl.append(res_single.null_instability)
-    # The per-λ-averaged CV from the 2-wl call should equal the mean of
-    # the two single-λ calls (modulo RNG ordering of the per-λ draws).
-    expected_cv = float(np.mean(cv_per_wl))
-    assert res_2wl.null_instability == pytest.approx(expected_cv, rel=0.10)
+    samples = np.asarray(res.samples_by_wavelength)
+    band = (weights / weights.sum()) @ samples
+    assert res.mean_null_depth == pytest.approx(np.mean(band), rel=1e-12)
+    assert res.null_fluctuation_rms == pytest.approx(np.std(band), rel=1e-12)
+    assert res.null_instability == pytest.approx(np.std(band) / np.mean(band), rel=1e-12)
+    per_bin_cv = np.mean(np.std(samples, axis=1) / np.mean(samples, axis=1))
+    assert abs(res.null_instability / per_bin_cv - 1.0) > 0.02
+
+
+def test_static_azimuth_differences_are_not_instability() -> None:
+    """Row 39: azimuths with different static nulls but no fluctuation give
+    zero CV. Pooling azimuths first made the CV jump to ~1 at any nonzero
+    piston, however small."""
+
+    res = realized_null_depth_mc(
+        u_stack=_make_50_50_combiner(1),
+        stellar_field=np.array([[1.0, 1.0], [1.0, 0.8]], dtype=np.complex128),
+        dark_indices=np.array([1], dtype=np.intp),
+        ao_piston_opd_rms_per_sub_m=1.0e-27,
+        wavelengths_m=np.array([1.25e-6]),
+        n_realizations_per_azimuth=50,
+        seed=0,
+    )
+    assert res.mean_null_depth > 1e-3
+    assert res.null_instability < 1e-12
 
 
 def test_azimuth_marginalization_pools_samples() -> None:

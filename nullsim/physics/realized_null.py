@@ -17,10 +17,14 @@ total stellar rate, so it must stay in fraction-of-power units. A
     returned via ``RealizedNullResult.null_depth_kilo`` for diagnostics that
     need that historical convention.
 
-Mean/std/instability of ``null_k`` across realizations and wavelengths
-gives ``null_depth_dark`` (the per-band mean shift on the dark ports)
-and ``null_instability = std / mean`` (the dark-port CV that drives the
-contrast curve's systematic-noise term ``eps^2 * leak^2 * t / (2 f_servo)``).
+The band statistics follow the detected photons. With photon weights
+``w_lambda`` (detected stellar rate per bin over the band total), each
+paired realization ``(a, r)`` (azimuth, draw; the draw is shared across
+wavelengths) has band leakage ``N_ar = sum_lambda w_lambda null_ar,lambda``.
+``null_depth_dark = mean(N)`` and the fluctuation is the within-azimuth
+spread ``sigma_MC^2 = mean_a Var_r(N_ar)``: static azimuth-to-azimuth
+differences are a slow mean shift, not instability. ``null_instability =
+sigma_MC / mean(N)`` is the band CV that drives the systematic-noise term.
 
 Port of KILO ``kilo/transport.py`` ``_apply_realization_perturbations``
 (lines 1489-1577) and ``azimuth_averaged_realized_null_depth`` (lines
@@ -39,6 +43,8 @@ from numpy.typing import NDArray
 
 __all__ = [
     "RealizedNullResult",
+    "band_leakage_statistics",
+    "normalized_wavelength_weights",
     "piston_covariance_with_common_mode_m2",
     "realized_null_depth_mc",
     "_chip_null_depth_kilo",
@@ -53,6 +59,12 @@ class RealizedNullResult:
     All ``*_null_depth`` fields are dark-port power fractions
     ``sum_{i in dark} |U @ E|_i^2 / sum_i |U @ E|_i^2``. The
     :attr:`null_depth_dark` property is an explicit reporting alias.
+
+    ``mean_null_depth`` is the photon-weighted band leakage mean,
+    ``null_fluctuation_rms`` its within-azimuth RMS, and
+    ``null_instability`` their ratio (the band CV). ``median_null_depth``
+    and ``std_null_depth`` are pooled over (wavelength, azimuth, draw)
+    for diagnostics only.
 
     ``n_azimuths`` and ``n_realizations_per_azimuth`` document the MC
     structure (KILO ``azimuth_averaged_realized_null_depth`` defaults
@@ -76,6 +88,7 @@ class RealizedNullResult:
     # results (e.g. the MC-disabled fallback in detection_curve).
     ideal_null_depth_kilo: float = 0.0
     mean_null_depth_kilo: float = 0.0
+    null_fluctuation_rms: float = 0.0
     samples_by_wavelength: NDArray[np.float64] | None = field(
         default=None, repr=False, compare=False,
     )
@@ -88,6 +101,49 @@ class RealizedNullResult:
         """Alias for :attr:`mean_null_depth` (paperv3 reporting name)."""
 
         return self.mean_null_depth
+
+
+def normalized_wavelength_weights(
+    wavelength_weights: NDArray[np.float64] | None,
+    n_wl: int,
+) -> NDArray[np.float64]:
+    """Return band weights summing to one; ``None`` means equal weights."""
+
+    if wavelength_weights is None:
+        return np.full(n_wl, 1.0 / n_wl, dtype=np.float64)
+    w = np.asarray(wavelength_weights, dtype=np.float64)
+    if w.shape != (n_wl,):
+        raise ValueError(
+            f"wavelength_weights must have shape ({n_wl},); got {w.shape}."
+        )
+    total = float(np.sum(w))
+    if not np.all(np.isfinite(w)) or np.any(w < 0.0) or total <= 0.0:
+        raise ValueError(
+            "wavelength_weights must be finite, non-negative, and not all zero."
+        )
+    return w / total
+
+
+def band_leakage_statistics(
+    samples_by_wavelength: NDArray[np.float64],
+    wavelength_weights: NDArray[np.float64],
+    n_azimuths: int,
+) -> tuple[float, float]:
+    """Mean and within-azimuth RMS of the photon-weighted band leakage.
+
+    ``samples_by_wavelength`` has shape ``(n_wl, n_azimuths * n_draws)``
+    with azimuth-major columns, the draws paired across wavelength. Each
+    column gives ``N = sum_lambda w_lambda L_lambda``. The RMS is
+    ``sqrt(mean_a Var_r(N_ar))``: only draw-to-draw variation within an
+    azimuth counts as instability.
+    """
+
+    samples = np.asarray(samples_by_wavelength, dtype=np.float64)
+    band = np.asarray(wavelength_weights, dtype=np.float64) @ samples
+    per_azimuth = band.reshape(int(n_azimuths), -1)
+    return float(np.mean(band)), float(
+        np.sqrt(np.mean(np.var(per_azimuth, axis=1)))
+    )
 
 
 def _chip_null_depth(
@@ -203,14 +259,19 @@ def realized_null_depth_mc(
     scintillation_index_per_sub: float | NDArray[np.float64] = 0.0,
     mode_group_indices: NDArray[np.intp] | None = None,
     fiber_phase_noise_rms_rad: float = 0.0,
+    wavelength_weights: NDArray[np.float64] | None = None,
 ) -> RealizedNullResult:
     """Monte-Carlo realized null depth on the dark ports.
 
     The MC marginalizes simultaneously over (azimuth, wavelength, realization).
-    Per-wavelength CVs are computed from the pooled (azimuth x realization)
-    sample at that wavelength, then averaged across wavelengths -- matching
-    KILO ``azimuth_averaged_realized_null_depth`` (transport.py L1739) and
-    ``natural_design.py`` L1100-1106. Pre-transported stellar fields per
+    Each draw is shared across wavelengths, so the band leakage of a draw is
+    the photon-weighted sum of its per-bin leakages. The reported mean and
+    CV are those of that band sum, with the variance taken within each
+    azimuth (see :func:`band_leakage_statistics`). This replaces the KILO
+    ``azimuth_averaged_realized_null_depth`` convention (transport.py L1739,
+    ``natural_design.py`` L1100-1106) of averaging per-wavelength CVs of the
+    azimuth-pooled sample, which is not the CV of the detected leakage
+    (review 2026-11-07 Issue 18). Pre-transported stellar fields per
     azimuth are supplied by the caller (see
     :func:`nullsim.stages.delay_lines.geometric.per_aperture_transmission`).
 
@@ -252,12 +313,15 @@ def realized_null_depth_mc(
             inputs produced by a splitter after a physical aperture.
         fiber_phase_noise_rms_rad: IID per-mode-per-realization residual
             fiber phase noise (KILO ``FiberConfig.phase_noise_rms_rad``).
+        wavelength_weights: Detected stellar photon rate per bin (any
+            normalization), shape ``(n_wl,)``. ``None`` weights bins equally.
 
     Returns:
         A :class:`RealizedNullResult` whose ``mean_null_depth`` ==
-        ``null_depth_dark`` is the dark-port power fraction averaged
-        across wavelengths and azimuths, and whose ``null_instability``
-        is the per-wavelength CV averaged across wavelengths.
+        ``null_depth_dark`` is the photon-weighted band dark-port power
+        fraction averaged over azimuths and draws, and whose
+        ``null_instability`` is the band CV ``null_fluctuation_rms /
+        mean_null_depth``.
     """
 
     u = np.asarray(u_stack)
@@ -313,6 +377,7 @@ def realized_null_depth_mc(
             f"realized_null_depth_mc: wavelengths_m shape {wavelengths.shape} "
             f"must equal (n_wl,) = ({n_wl},)."
         )
+    band_weights = normalized_wavelength_weights(wavelength_weights, n_wl)
     if fiber_phase_noise_rms_rad < 0.0:
         raise ValueError(
             f"fiber_phase_noise_rms_rad must be >= 0, got "
@@ -373,8 +438,8 @@ def realized_null_depth_mc(
         ],
         dtype=np.float64,
     )
-    ideal_null = float(np.mean(ideal_per_wl))
-    ideal_null_kilo = float(np.mean(ideal_per_wl_kilo))
+    ideal_null = float(band_weights @ ideal_per_wl)
+    ideal_null_kilo = float(band_weights @ ideal_per_wl_kilo)
 
     if n_per_az <= 0:
         return RealizedNullResult(
@@ -414,11 +479,7 @@ def realized_null_depth_mc(
         dtype=np.float64,
     )
     samples_by_wavelength_kilo = np.empty_like(samples_by_wavelength)
-    null_per_wl = np.empty(n_wl, dtype=np.float64)
     null_per_wl_kilo = np.empty(n_wl, dtype=np.float64)
-    std_per_wl = np.empty(n_wl, dtype=np.float64)
-    cv_per_wl = np.empty(n_wl, dtype=np.float64)
-    median_per_wl = np.empty(n_wl, dtype=np.float64)
     # Accumulate all (wl, az, draw) samples for the *pooled* median/std.
     # Earlier the dataclass reported mean-of-per-wl-medians and mean-of-
     # per-wl-stds under the names ``median_null_depth`` / ``std_null_depth``
@@ -435,8 +496,8 @@ def realized_null_depth_mc(
     # every bin. The previous per-(wavelength, azimuth) draw made the
     # pooled std/median represent artificially independent wavelength
     # samples instead of broadband leakage fluctuation, and cost ~n_wl x
-    # the RNG/draw work (review 2026-06-10 Issue 27d). Per-bin means and
-    # the per-wavelength CV (null_instability) are statistically unchanged.
+    # the RNG/draw work (review 2026-06-10 Issue 27d). The pairing is also
+    # what makes the band-summed leakage of a draw well defined.
     _AZIMUTH_SEED_STRIDE = 10_007
 
     draws_per_az: list[
@@ -527,13 +588,7 @@ def realized_null_depth_mc(
             pooled[start : start + n_per_az] = ratio
             pooled_kilo[start : start + n_per_az] = ratio_kilo
 
-        mean_k = float(np.mean(pooled))
-        std_k = float(np.std(pooled))
-        null_per_wl[k] = mean_k
         null_per_wl_kilo[k] = float(np.mean(pooled_kilo))
-        std_per_wl[k] = std_k
-        median_per_wl[k] = float(np.median(pooled))
-        cv_per_wl[k] = float(std_k / mean_k) if mean_k > 0.0 else 0.0
         total_pool_size += pooled.size
         samples_by_wavelength[k] = pooled
         samples_by_wavelength_kilo[k] = pooled_kilo
@@ -548,15 +603,19 @@ def realized_null_depth_mc(
     pooled_std = float(np.std(all_samples)) if all_samples.size else 0.0
     samples_by_wavelength.setflags(write=False)
     samples_by_wavelength_kilo.setflags(write=False)
+    band_mean, band_rms = band_leakage_statistics(
+        samples_by_wavelength, band_weights, n_azimuths,
+    )
 
     return RealizedNullResult(
-        mean_null_depth=float(np.mean(null_per_wl)),
+        mean_null_depth=band_mean,
         median_null_depth=pooled_median,
         std_null_depth=pooled_std,
-        null_instability=float(np.mean(cv_per_wl)),
+        null_instability=band_rms / band_mean if band_mean > 0.0 else 0.0,
+        null_fluctuation_rms=band_rms,
         ideal_null_depth=ideal_null,
         ideal_null_depth_kilo=ideal_null_kilo,
-        mean_null_depth_kilo=float(np.mean(null_per_wl_kilo)),
+        mean_null_depth_kilo=float(band_weights @ null_per_wl_kilo),
         n_samples=total_pool_size,
         n_azimuths=n_azimuths,
         n_realizations_per_azimuth=n_per_az,

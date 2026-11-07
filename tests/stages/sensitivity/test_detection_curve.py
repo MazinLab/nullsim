@@ -88,12 +88,14 @@ def test_combine_realized_null_results_uses_paired_arm_samples() -> None:
     combined = _combine_realized_null_results(
         (result_a, result_b),
         np.array([0.5, 0.5], dtype=np.float64),
+        np.array([0.5, 0.5], dtype=np.float64),
     )
 
     assert combined.mean_null_depth == pytest.approx(1.0)
     assert combined.median_null_depth == pytest.approx(1.0)
     assert combined.std_null_depth == pytest.approx(0.0)
     assert combined.null_instability == pytest.approx(0.0)
+    assert combined.null_fluctuation_rms == pytest.approx(0.0)
     assert combined.mean_null_depth_kilo == pytest.approx(10.0)
     assert combined.ideal_null_depth == pytest.approx(0.2)
 
@@ -118,6 +120,24 @@ def test_angular_jitter_convolution_smooths_radial_profiles() -> None:
     assert smoothed[0] > 0.0
     assert smoothed[2] > 0.0
     assert smoothed[0] == pytest.approx(smoothed[2])
+
+
+def test_angular_jitter_kernel_is_unbiased_on_nonuniform_grid() -> None:
+    """Row 30: a log-spaced grid must not weight the dense side.
+
+    A linear profile f(r) = r is reproduced exactly by a symmetric kernel
+    away from the grid ends; row normalization on the bare nodes pulls it
+    toward the densely sampled small-r side.
+    """
+
+    separations = np.geomspace(0.2, 300.0, 70)
+    smoothed = _angular_jitter_convolve_profile(
+        separations, separations_mas=separations, sigma_mas=0.5,
+    )
+    interior = (separations > 3.0) & (separations < 290.0)
+    # Old row normalization biased this by 2.7%; the residual 3e-6 is the
+    # trapezoid step error of the sigma/8 fine grid (it halves with the step).
+    np.testing.assert_allclose(smoothed[interior], separations[interior], rtol=1e-5)
 
 
 def test_amp_servo_rate_uses_physical_pickoff_mode_count() -> None:
@@ -372,7 +392,12 @@ def test_detection_curve_identity_unitary_dark_throughput_one(tmp_path: Path) ->
     np.testing.assert_allclose(
         payload["planet_throughputs"], expected_throughput, rtol=1e-12,
     )
-    assert payload["disk_null_floor"] == pytest.approx(expected_throughput, rel=1e-6)
+    # T(r) is flat across the disk, so the resolved disk adds nothing beyond
+    # the on-axis value already in the realized null (Issue 17).
+    assert payload["disk_null_floor"] == pytest.approx(0.0, abs=1e-14)
+    assert payload["effective_null_with_disk"] == pytest.approx(
+        expected_throughput, rel=1e-12,
+    )
     # U=I is not a real null: dark-port fraction of stellar power equals (M-1)/M.
     assert payload["realized_null_depth"] == pytest.approx(expected_throughput, rel=1e-12)
     assert payload["null_instability"] == 0.0  # MC disabled => no fluctuation
@@ -423,35 +448,46 @@ def test_detection_curve_accepts_rectangular_chip_transfer(tmp_path: Path) -> No
     assert payload["realized_null_depth"] == pytest.approx(0.0, abs=1.0e-14)
 
 
-def test_detection_curve_short_grid_for_finite_star_raises(
+def test_detection_curve_disk_floor_is_independent_of_separation_grid(
     tmp_path: Path,
 ) -> None:
-    """Finite-star grids must cover the stellar radius; zero fallback is unphysical."""
+    """Row 38: the disk integral uses its own nodes inside the stellar radius.
+
+    A one-point grid that does not reach the 0.5 mas stellar radius and the
+    default 70-point grid give the same disk floor.
+    """
 
     n_modes = 4
+    rng = np.random.default_rng(5)
+    q, _ = np.linalg.qr(
+        rng.normal(size=(n_modes, n_modes)) + 1j * rng.normal(size=(n_modes, n_modes))
+    )
     state = _keck_like_state(
         n_modes=n_modes,
+        u_stack=q[:, :, np.newaxis],
         wavelengths_um=(1.25,),
         star_diameter_mas=1.0,
-        positions=np.zeros((n_modes, 2)),
         strehl=1.0,
         piston_opd_nm_total=0.0,
     )
-    stage = DetectionCurve(
-        params={
-            "n_bright_ports": 1,
-            "n_dark_ports": n_modes - 1,
-            # Stellar radius is 0.5 mas, so this grid intentionally cannot
-            # support the disk integral.
-            "separations_mas": (0.1,),
-            "include_angular_coupling": False,
-            "n_mc_realizations": 0,
-        },
-        context=_context(tmp_path),
-    )
 
-    with pytest.raises(ValueError, match="separations_mas does not cover"):
-        stage.apply(state)
+    def disk_floor(separations: dict[str, tuple[float, ...]]) -> float:
+        stage = DetectionCurve(
+            params={
+                "n_bright_ports": 1,
+                "n_dark_ports": n_modes - 1,
+                "include_angular_coupling": False,
+                "n_mc_realizations": 0,
+                **separations,
+            },
+            context=_context(tmp_path),
+        )
+        payload = stage.apply(state).results.components["sensitivity.detection_curve"]
+        return float(payload["disk_null_floor"])
+
+    short = disk_floor({"separations_mas": (0.1,)})
+    assert abs(short) > 1e-6  # this chip leaks less off axis: a negative excess
+    assert short == pytest.approx(disk_floor({}), rel=1e-12)
 
 
 def test_per_azimuth_fields_replay_chromatic_delay_line_phase() -> None:
@@ -1313,10 +1349,18 @@ def test_detection_curve_override_preserves_mc_null_instability(tmp_path: Path) 
 
     # The override REPLACES effective_null_with_disk with the floor.
     assert payload["effective_null_with_disk"] == pytest.approx(override_null)
-    # The MC null_instability MUST survive the override unchanged.
-    assert payload["null_instability"] > 0.0
+    # The MC fluctuation MUST survive the override. With no trim bias the
+    # RMS is the MC's, and null_instability is it over the effective null
+    # in force, so effective null x null_instability is the RMS.
+    assert payload["null_fluctuation_rms"] > 0.0
+    assert payload["null_fluctuation_rms"] == pytest.approx(
+        payload["null_fluctuation_rms_mc"], rel=1e-12,
+    )
     assert payload["null_instability"] == pytest.approx(
-        payload["realized_null_std"] / payload["realized_null_depth"], rel=1e-9
+        payload["null_fluctuation_rms"] / override_null, rel=1e-12,
+    )
+    assert payload["null_instability_mc"] == pytest.approx(
+        payload["null_fluctuation_rms_mc"] / payload["realized_null_depth"], rel=1e-12,
     )
     # When the bandwidth override is unset, the payload field is None so
     # the performance stage falls back to its own default f_eff.
@@ -1884,19 +1928,41 @@ def test_detection_curve_auto_amplitude_servo_derives_sigma_i_and_f_eff(
         rel=1.0e-12,
     )
 
-    # f_eff in payload must match the KILO variance-weighted blend.
-    sigma_phi_piston_rad = (
-        payload["ao_piston_opd_rms_per_sub_m"] * (2.0 * math.pi) / 1.25e-6
+    # f_eff weights the legs by their band leakage variance (row 27):
+    # rerun the MC independently with one perturbation each.
+    from nullsim.physics.realized_null import realized_null_depth_mc
+
+    field = np.sqrt(payload["coupling_per_sub"] * payload["sub_areas_m2"]).astype(
+        np.complex128
     )
+    leg_common = dict(
+        u_stack=u_stack,
+        stellar_field=np.broadcast_to(field, (payload["n_azimuths"], n_modes)),
+        dark_indices=payload["dark_indices"],
+        wavelengths_m=np.array([1.25e-6]),
+        n_realizations_per_azimuth=payload["n_realizations_per_azimuth"],
+        seed=0,
+    )
+    v_phi = realized_null_depth_mc(
+        ao_piston_opd_rms_per_sub_m=payload["ao_piston_opd_rms_per_sub_m"],
+        **leg_common,
+    ).null_fluctuation_rms ** 2
+    v_I = realized_null_depth_mc(
+        ao_piston_opd_rms_per_sub_m=0.0,
+        scintillation_index_per_sub=expected_residual.sigma_I_residual,
+        **leg_common,
+    ).null_fluctuation_rms ** 2
+    diagnostics = payload["effective_systematic_bandwidth_diagnostics"]
+    assert diagnostics["piston_leakage_variance"] == pytest.approx(v_phi, rel=1e-10)
+    assert diagnostics["amplitude_leakage_variance"] == pytest.approx(v_I, rel=1e-10)
     expected_f_eff = effective_systematic_bandwidth_hz(
-        sigma_phi_piston_rad=sigma_phi_piston_rad,
-        sigma_I_residual=expected_residual.sigma_I_residual,
-        n_modes=n_modes,
+        piston_leakage_variance=v_phi,
+        amplitude_leakage_variance=v_I,
         f_piston_hz=f_piston_hz,
         f_amp_hz=amp_bw_hz,
     )
     assert payload["effective_systematic_bandwidth_hz"] == pytest.approx(
-        expected_f_eff, rel=1.0e-12
+        expected_f_eff, rel=1.0e-10
     )
     assert (
         payload["effective_systematic_bandwidth_diagnostics"]["piston_rms_model"]
@@ -2208,13 +2274,11 @@ def test_detection_curve_auto_amplitude_servo_can_inject_open_loop_scintillation
         expected_amp_bandwidth_hz, rel=1.0e-12
     )
 
-    sigma_phi_piston_rad = (
-        payload["ao_piston_opd_rms_per_sub_m"] * (2.0 * math.pi) / 1.25e-6
-    )
+    # The MC is off, so neither leg has leakage variance and the blend takes
+    # its widest-bandwidth fallback.
     expected_f_eff = effective_systematic_bandwidth_hz(
-        sigma_phi_piston_rad=sigma_phi_piston_rad,
-        sigma_I_residual=expected_residual.sigma_I_open,
-        n_modes=n_modes,
+        piston_leakage_variance=0.0,
+        amplitude_leakage_variance=0.0,
         f_piston_hz=f_piston_hz,
         f_amp_hz=expected_amp_bandwidth_hz,
     )
