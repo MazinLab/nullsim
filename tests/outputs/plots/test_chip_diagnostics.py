@@ -317,7 +317,7 @@ def _synthetic_characterization_record(tmp_path: Path) -> RunRecord:
         photon_rates=state.photon_rates,
         results=Results(
             components={
-                "chip_optimization.torch": {
+                "chip_optimization": {
                     "optimal_chip_params": det_params,
                     "optimal_u_stack": det_stack,
                 },
@@ -351,3 +351,228 @@ def _synthetic_characterization_record(tmp_path: Path) -> RunRecord:
         run_dir=tmp_path / "cell",
         coord_tuple=(),
     )
+
+
+def _labeled_lines(fig, title: str) -> dict:
+    ax = next(ax for ax in fig.axes if ax.get_title() == title)
+    return {
+        line.get_label(): np.asarray(line.get_ydata(), dtype=float)
+        for line in ax.lines
+        if not line.get_label().startswith("_")
+    }
+
+
+def _null_fraction(outputs: np.ndarray, null_idx: np.ndarray) -> np.ndarray:
+    """Null/total power with arms (last axis) summed incoherently: (M, n_wl, n_pol)."""
+
+    power = np.sum(np.abs(outputs) ** 2, axis=-1)
+    return power[null_idx].sum(axis=0) / power.sum(axis=0)
+
+
+def _record_with(record: RunRecord, field: np.ndarray, components: dict) -> RunRecord:
+    state = record.result.state
+    state = SimulationState(
+        scene=state.scene, geometry=state.geometry,
+        field=Field(amplitudes=field, wavelength_grid_um=state.field.wavelength_grid_um),
+        opd_budget=state.opd_budget, throughput=state.throughput,
+        wavefront=state.wavefront, photon_rates=state.photon_rates,
+        results=Results(components=components),
+    )
+    return RunRecord(
+        config=record.config,
+        result=RunResult(state=state, diagnostics={}, timings=(),
+                         cache_hit_count=0, config_hash="cfg"),
+        run_dir=record.run_dir, coord_tuple=(),
+    )
+
+
+def test_physical_null_sums_polarization_arms_incoherently() -> None:
+    """Review 2026-11-07 row 61: arm B must enter the physical null, not be dropped."""
+
+    import matplotlib.pyplot as plt
+
+    opt, chip, _, wl_grid = _synthetic_chip_state(m=4, n_dark=2, seed=5)
+    stack = _build_unitary_stack_numpy(
+        params_vec=opt, n_modes=4, wavelength_grid_um=wl_grid,
+        wl_design_um=chip.wl_design_um, dac_bits=chip.dac_bits,
+    )
+    rng = np.random.default_rng(9)
+    inputs = rng.normal(size=(4, len(wl_grid), 2)) + 1j * rng.normal(
+        size=(4, len(wl_grid), 2)
+    )
+    inputs[:, :, 1] *= 3.0  # arm B brighter and with its own phases
+    field = np.einsum("oik,ikp->okp", stack, inputs)
+
+    fig = plot_chip_diagnostics(
+        opt_params=opt, chip_params=chip,
+        field_amplitudes=field, wavelength_grid_um=wl_grid,
+        deployed_u_stack=stack,
+    )
+    try:
+        physical = _labeled_lines(fig, "Broadband null spectrum")["Physical pipeline input"]
+    finally:
+        plt.close(fig)
+    null_idx = np.arange(2, 4)
+    assert np.allclose(physical, _null_fraction(field, null_idx), rtol=1e-12)
+    assert not np.allclose(physical, _null_fraction(field[:, :, :1], null_idx), rtol=1e-3)
+
+
+def test_characterization_diagnostics_sum_polarization_arms(tmp_path: Path) -> None:
+    """Row 61 (characterization path): both arms are retuned and summed."""
+
+    import matplotlib.pyplot as plt
+
+    record = _synthetic_characterization_record(tmp_path)
+    components = record.result.state.results.components
+    det_stack = components["chip_optimization"]["optimal_u_stack"]
+    char_stack = components["characterization.spectro"]["optimal_u_stack"]
+    rng = np.random.default_rng(21)
+    inputs = rng.normal(size=(4, 5, 2)) + 1j * rng.normal(size=(4, 5, 2))
+    det_outputs = np.einsum("oik,ikp->okp", det_stack, inputs)
+
+    fig = plot_characterization_chip_diagnostics_for_record(
+        _record_with(record, det_outputs, components)
+    )
+    try:
+        physical = _labeled_lines(fig, "Broadband null spectrum")["Physical pipeline input"]
+    finally:
+        plt.close(fig)
+    expected = _null_fraction(
+        np.einsum("oik,ikp->okp", char_stack, inputs), np.array([3])
+    )
+    assert np.allclose(physical, expected, rtol=1e-12)
+
+
+def test_rebuilt_stack_recovers_input_at_each_bin_wavelength() -> None:
+    """Review 2026-11-07 row 62: off-grid design wavelength, no deployed stack.
+
+    The clean curve uses the per-mode magnitudes of the chip input at the
+    design bin. Recovering that input with U(wl_design) instead of the bin's
+    own U(lambda) scrambles those magnitudes.
+    """
+
+    import matplotlib.pyplot as plt
+
+    m, wl_design = 6, 1.26  # grid bins at 1.20, 1.225, 1.25, 1.275, 1.30
+    wl_grid = tuple(np.linspace(1.20, 1.30, 5).tolist())
+    rng = np.random.default_rng(17)
+    opt = rng.uniform(0.0, 2.0 * np.pi, _n_params(m))
+    chip = ChipOptimizationParams(
+        n_modes=m, n_bright_ports=3, n_dark_ports=3,
+        wl_design_um=wl_design, dac_bits=None,
+    )
+    stack = _build_unitary_stack_numpy(
+        params_vec=opt, n_modes=m, wavelength_grid_um=wl_grid,
+        wl_design_um=wl_design, dac_bits=None,
+    )
+    x_true = (1.0 + rng.uniform(size=(m, 1))) * np.exp(
+        1j * rng.uniform(0.0, 2.0 * np.pi, size=(m, 1))
+    )
+    inputs = np.repeat(x_true, len(wl_grid), axis=1)
+    field = np.einsum("oik,ik->ok", stack, inputs)[:, :, np.newaxis]
+
+    fig = plot_chip_diagnostics(
+        opt_params=opt, chip_params=chip,
+        field_amplitudes=field, wavelength_grid_um=wl_grid,
+    )
+    try:
+        clean = _labeled_lines(fig, "Broadband null spectrum")["Clean input"]
+    finally:
+        plt.close(fig)
+    clean_inputs = np.repeat(np.abs(x_true), len(wl_grid), axis=1).astype(complex)
+    expected = _null_fraction(
+        np.einsum("oik,ik->ok", stack, clean_inputs)[:, :, np.newaxis],
+        np.arange(3, 6),
+    )
+    assert np.allclose(clean, expected, rtol=1e-10)
+
+
+def test_dac_reference_line_uses_unquantized_params_when_published() -> None:
+    """Review 2026-11-07 row 60: the float64 line is the pre-DAC chip."""
+
+    import matplotlib.pyplot as plt
+
+    opt, chip, field, wl_grid = _synthetic_chip_state(m=4, n_dark=2, seed=8)
+    unquantized = opt + 1.0e-3  # stands in for the optimizer's pre-DAC solution
+    title = "Dark depth vs DAC precision"
+
+    fig = plot_chip_diagnostics(
+        opt_params=opt, chip_params=chip,
+        field_amplitudes=field, wavelength_grid_um=wl_grid,
+    )
+    try:
+        assert "published (DAC quantized)" in _labeled_lines(fig, title)
+    finally:
+        plt.close(fig)
+
+    fig = plot_chip_diagnostics(
+        opt_params=opt, chip_params=chip,
+        field_amplitudes=field, wavelength_grid_um=wl_grid,
+        opt_params_unquantized=unquantized,
+    )
+    try:
+        ideal = _labeled_lines(fig, title)["Ideal (float64)"][0]
+    finally:
+        plt.close(fig)
+    # The synthetic field is U(lambda_k) @ ones/2, so the chip input is ones/2.
+    star = np.ones(4, dtype=np.complex128) / 2.0
+    u_float = _build_unitary_stack_numpy(
+        params_vec=unquantized, n_modes=4, wavelength_grid_um=(chip.wl_design_um,),
+        wl_design_um=chip.wl_design_um, dac_bits=None,
+    )[:, :, 0]
+    power = np.abs(u_float @ star) ** 2
+    assert np.isclose(ideal, power[2:].sum() / power.sum(), rtol=1e-10)
+
+
+def test_extract_pairs_deployed_payload_with_its_own_stage_params(
+    tmp_path: Path,
+) -> None:
+    """Review 2026-11-07 Issue 25: match the optimizer stage by component name."""
+
+    from nullsim.outputs.plots.chip_diagnostics import _extract_chip_optimization
+
+    stage = {"n_modes": 4, "n_bright_ports": 2, "n_dark_ports": 2, "dac_bits": 16}
+    config = resolve_config({
+        "run": {"name": "issue25", "seed": 1},
+        "grid": {
+            "wavelength_center_um": 1.25,
+            "wavelength_bandwidth_um": 0.1,
+            "n_wavelength_bins": 3,
+        },
+        "scene": {
+            "star": {"jmag": 5.0, "angular_diameter_mas": 1.0, "distance_pc": 5.0},
+            "planet": {"contrast": 1.0e-6, "separation_mas": 20.0,
+                       "position_angle_deg": 0.0},
+        },
+        "observation": {"integration_time_s": 10.0},
+        "pipeline": {"stages": [
+            {"id": "seed", "type": "chip_optimization.scipy",
+             "wl_design_um": 1.20, **stage},
+            {"id": "refine", "type": "chip_optimization.torch",
+             "wl_design_um": 1.30, **stage},
+            {"id": "chip", "type": "chip.kernel_mzi_mesh",
+             "optimization_source": "chip_optimization.refine"},
+        ]},
+    })
+    params = np.zeros(_n_params(4))
+    record = _record_with(
+        RunRecord(
+            config=config,
+            result=RunResult(
+                state=SimulationState.empty({"wavelength_grid_um": (1.2, 1.25, 1.3)}),
+                diagnostics={}, timings=(), cache_hit_count=0, config_hash="cfg",
+            ),
+            run_dir=tmp_path, coord_tuple=(),
+        ),
+        None,
+        {
+            "chip_optimization": {"optimal_chip_params": params},
+            "chip_optimization.refine": {
+                "optimal_chip_params": params,
+                "optimal_chip_params_unquantized": params + 0.5,
+            },
+        },
+    )
+    _, chip_params, _, unquantized = _extract_chip_optimization(record)
+    assert chip_params.wl_design_um == 1.30
+    assert np.allclose(unquantized, 0.5)

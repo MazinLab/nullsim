@@ -16,6 +16,7 @@ Two labelling contracts inherited from the physics reviews:
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -50,15 +51,21 @@ def hdc_ccf(
     output_dir: Path,
     formats: Iterable[str],
 ) -> tuple[Path, ...]:
-    """Write ``hdc_ccf`` plots for the first record carrying the payload."""
+    """Write ``hdc_ccf`` plots for the first record carrying an accepted payload.
 
-    payload = None
+    Every HDC payload in that record is considered (review 2026-11-07
+    Issue 25): rejected ones are skipped and each accepted one gets its own
+    figure. The first is ``hdc_ccf.<fmt>``; later ones are suffixed with
+    their component name.
+    """
+
+    accepted: list[tuple[str, dict[str, Any]]] = []
     matched_record = None
     for record in collection.records:
-        candidate = _find_payload(record)
-        if candidate is None:
-            continue
-        if not _upstream_converged(record, candidate):
+        for name, candidate in _find_payloads(record):
+            if _upstream_converged(record, candidate):
+                accepted.append((name, candidate))
+                continue
             _LOGGER.warning(
                 "hdc_ccf: skipping the figure for upstream spectro component "
                 "%r because its characterization optimization did not "
@@ -67,17 +74,16 @@ def hdc_ccf(
                 "matching columns for the same reason).",
                 candidate.get("upstream_spectro_component"),
             )
-            continue
-        payload = candidate
-        matched_record = record
-        break
-    if payload is None:
+        if accepted:
+            matched_record = record
+            break
+    if matched_record is None:
         return ()
 
     plot_dir = output_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     record_label = None
-    if matched_record is not None and len(collection.records) > 1:
+    if len(collection.records) > 1:
         from nullsim.outputs.plots._axis_labels import compact_record_label
 
         record_label = compact_record_label(
@@ -85,13 +91,27 @@ def hdc_ccf(
             matched_record.config.run.name,
         )
     written: list[Path] = []
-    for file_format in formats:
-        path = plot_dir / f"hdc_ccf.{file_format}"
-        fig = plot_hdc_ccf(payload, record_label=record_label)
-        fig.savefig(path)
-        plt.close(fig)
-        written.append(path)
+    for index, (name, payload) in enumerate(accepted):
+        stem = "hdc_ccf" if index == 0 else f"hdc_ccf_{_file_suffix(name, index)}"
+        label = record_label
+        if len(accepted) > 1:
+            label = f"{name}  |  {record_label}" if record_label else name
+        for file_format in formats:
+            path = plot_dir / f"{stem}.{file_format}"
+            fig = plot_hdc_ccf(payload, record_label=label)
+            fig.savefig(path)
+            plt.close(fig)
+            written.append(path)
     return tuple(written)
+
+
+def _file_suffix(component_name: str, index: int) -> str:
+    suffix = component_name
+    for prefix in _COMPONENT_PREFIXES:
+        if suffix.startswith(prefix):
+            suffix = suffix[len(prefix):]
+            break
+    return re.sub(r"[^\w-]+", "_", suffix).strip("_") or str(index)
 
 
 def plot_hdc_ccf(
@@ -124,15 +144,15 @@ def _title(payload: dict[str, Any]) -> str:
     return "  |  ".join(parts)
 
 
-def _find_payload(record: RunRecord) -> dict[str, Any] | None:
-    for name, value in record.result.state.results.components.items():
-        if not isinstance(value, dict):
-            continue
-        if name.startswith(_COMPONENT_PREFIXES):
-            return value
-        if _IDENTIFYING_KEYS.issubset(value):
-            return value
-    return None
+def _find_payloads(record: RunRecord) -> list[tuple[str, dict[str, Any]]]:
+    """Every HDC CCF payload in the record, as ``(component name, payload)``."""
+
+    return [
+        (name, value)
+        for name, value in record.result.state.results.components.items()
+        if isinstance(value, dict)
+        and (name.startswith(_COMPONENT_PREFIXES) or _IDENTIFYING_KEYS.issubset(value))
+    ]
 
 
 def _upstream_converged(record: RunRecord, payload: dict[str, Any]) -> bool:
@@ -237,17 +257,21 @@ def _plot_template_weights(ax: plt.Axes, payload: dict[str, Any]) -> None:
     ax.set_ylabel("Matched-filter weight (per channel)")
     ax.grid(True, axis="y", alpha=0.22)
 
-    # Per-channel photon-limited SNR^2 contribution. With w_i = m_i Ptilde_i /
-    # v_i, photon-limited SNR^2 = t sum_i w_i^2 v_i, so channel i contributes
-    # w_i^2 v_i = Ptilde_i^2 / v_i -- NOT w_i^2, which mis-ranks channels
-    # whenever the variance rates differ across the band.
+    # Per-channel photon-limited SNR^2 contribution. The statistic is
+    # w . (H N), so its photon variance is t sum_i u_i^2 v_i with the
+    # published noise weights u = H^T w (physics.hdc.CcfBudget.noise_weights).
+    # The continuum filter H correlates neighbouring channels, so the diagonal
+    # w_i^2 v_i is wrong, and gives zero share to channels with w_i = 0 but
+    # u_i != 0 (review 2026-11-07 row 66). Older payloads without u get no
+    # share curve rather than the diagonal one.
     variance = _variance_rate_per_channel(payload, weights.size)
-    share = _snr_squared_share(weights, variance)
+    noise_weights = _array(payload.get("noise_weights_per_channel"))
+    share = _snr_squared_share(noise_weights, variance)
     if share is not None:
         ax2 = ax.twinx()
         ax2.plot(x, share, "o-", color="#9467bd", linewidth=1.1, markersize=3.2)
         ax2.set_ylim(bottom=0.0)
-        ax2.set_ylabel(r"Share of photon-limited SNR$^2$ ($w_i^2 v_i$)")
+        ax2.set_ylabel(r"Share of photon-limited SNR$^2$ ($u_i^2 v_i$)")
         ax2.tick_params(axis="y", labelcolor="#9467bd")
         ax.set_title("Template weights and photon-limited SNR contribution")
         return
@@ -449,19 +473,22 @@ def _variance_rate_per_channel(
 
 
 def _snr_squared_share(
-    weights: np.ndarray,
+    noise_weights: np.ndarray,
     variance: np.ndarray | None,
 ) -> np.ndarray | None:
-    """Fraction of the photon-limited SNR^2 each channel carries."""
+    """Fraction ``u_i^2 v_i / sum u^2 v`` of the photon variance per channel.
 
-    if variance is None or variance.shape != weights.shape:
+    ``noise_weights`` is ``u = H^T w``, not the template weights ``w``.
+    """
+
+    if variance is None or variance.shape != noise_weights.shape:
         return None
-    contribution = weights * weights * variance
+    contribution = noise_weights * noise_weights * variance
     finite = np.isfinite(contribution) & (variance > 0.0)
     total = float(np.sum(contribution[finite]))
     if not np.isfinite(total) or total <= 0.0:
         return None
-    share = np.full(weights.size, np.nan, dtype=np.float64)
+    share = np.full(noise_weights.size, np.nan, dtype=np.float64)
     share[finite] = contribution[finite] / total
     return share
 

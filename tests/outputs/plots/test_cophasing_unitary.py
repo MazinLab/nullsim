@@ -115,3 +115,22 @@ def test_registered_cophasing_unitary_writes_plot(tmp_path: Path) -> None:
     assert out in written
     assert out.exists()
     assert out.stat().st_size > 3_000
+
+
+def test_analysis_matrix_matches_abcd_measurement_model() -> None:
+    """Review 2026-11-07 row 63: |row . E|^2 must follow 1 + cos(phi_a - phi_b + theta),
+    the model in physics.fringe_observability._measure_abcd_pair_edges."""
+
+    from nullsim.outputs.plots.cophasing_unitary import _analysis_matrix
+
+    offsets = np.array([0.0, 0.5 * np.pi, np.pi, 1.5 * np.pi])
+    matrix = _analysis_matrix(
+        edges=np.array([[0, 1]], dtype=np.int64),
+        phase_offsets_rad=offsets,
+        edge_weights=np.array([1.0]),
+        edge_throughput=1.0,
+    )
+    phi = np.array([0.3, -0.4])  # modal phases 2 pi p / lambda
+    intensity = np.abs(matrix @ np.exp(1j * phi)) ** 2
+    expected = 0.5 * (1.0 + np.cos(phi[0] - phi[1] + offsets))
+    np.testing.assert_allclose(intensity, expected, rtol=1e-12)

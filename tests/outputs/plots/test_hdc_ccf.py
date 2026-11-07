@@ -14,7 +14,7 @@ from nullsim.outputs import RunCollection, RunRecord
 from matplotlib import pyplot as plt
 
 from nullsim.outputs.plots.hdc_ccf import (
-    _find_payload,
+    _find_payloads,
     _snr_squared_share,
     _variance_rate_per_channel,
     hdc_ccf,
@@ -62,6 +62,10 @@ def _payload() -> dict:
         "ccf_variance_rate_hz_per_channel": variance,
         "dark_rate_hz_per_channel": dark,
         "template_weights_per_channel": weights,
+        # u = H^T w with a 3-channel boxcar continuum filter H = I - B.
+        "noise_weights_per_channel": weights - np.convolve(
+            weights, np.ones(3) / 3.0, mode="same"
+        ),
         "snr_vs_resolving_power": snr_vs_r,
         "snr_vs_resolving_power_photon_limited": snr_vs_r_photon,
         "snr_vs_resolving_power_r": r_scan,
@@ -143,18 +147,47 @@ def test_negative_template_weights_survive_to_the_plotted_bars() -> None:
 
 
 def test_snr_squared_share_weights_by_variance_not_by_weight_alone() -> None:
-    """Channel i contributes w_i^2 v_i = Ptilde_i^2 / v_i to the photon-limited
-    SNR^2, so a channel with the same weight but a larger variance rate carries
-    a larger share. Ranking by w_i^2 alone would call them equal."""
+    """Channel i contributes u_i^2 v_i to the photon variance, so a channel
+    with the same noise weight but a larger variance rate carries a larger
+    share. Ranking by u_i^2 alone would call them equal."""
 
-    weights = np.array([1.0, 1.0, -2.0])
+    noise_weights = np.array([1.0, 1.0, -2.0])
     variance = np.array([1.0, 4.0, 1.0])
 
-    share = _snr_squared_share(weights, variance)
+    share = _snr_squared_share(noise_weights, variance)
 
     assert share is not None
     assert share == pytest.approx(np.array([1.0, 4.0, 4.0]) / 9.0)
     assert share[1] > share[0]
+
+
+def test_share_panel_uses_published_noise_weights_not_template_weights() -> None:
+    """Review 2026-11-07 row 66: the continuum filter correlates channels, so
+    the share is u_i^2 v_i / sum u^2 v with u = H^T w. A channel with w_i = 0
+    but u_i != 0 must get a nonzero share."""
+
+    payload = _payload()
+    n = np.asarray(payload["template_weights_per_channel"]).size
+    weights = np.zeros(n)
+    weights[5] = 1.0
+    # 3-channel boxcar continuum filter H = I - B: u = H^T w spreads the
+    # single weight to its neighbours as -1/3 each.
+    noise_weights = weights.copy()
+    noise_weights[4:7] -= 1.0 / 3.0
+    variance = np.asarray(payload["ccf_variance_rate_hz_per_channel"], dtype=float)
+    payload["template_weights_per_channel"] = weights
+    payload["noise_weights_per_channel"] = noise_weights
+
+    fig = plot_hdc_ccf(payload)
+    share_ax = next(
+        ax for ax in fig.axes if "SNR$^2$" in ax.get_ylabel()
+    )
+    plotted = np.asarray(share_ax.get_lines()[0].get_ydata(), dtype=float)
+    plt.close(fig)
+
+    contribution = noise_weights**2 * variance
+    np.testing.assert_allclose(plotted, contribution / contribution.sum(), rtol=1e-12)
+    assert plotted[4] > 0.0 and plotted[6] > 0.0
 
 
 def test_variance_rate_falls_back_to_the_stage_definition() -> None:
@@ -234,11 +267,45 @@ def test_find_payload_matches_stage_component_name() -> None:
     payload = _payload()
     record = _record({"characterization.hdc_ccf_1": payload}, Path("."))
 
-    found = _find_payload(record)
+    found = _find_payloads(record)
 
-    assert found is not None
-    assert found["ccf_snr"] == payload["ccf_snr"]
-    assert found["n_effective_lines"] == payload["n_effective_lines"]
+    assert len(found) == 1
+    name, value = found[0]
+    assert name == "characterization.hdc_ccf_1"
+    assert value["ccf_snr"] == payload["ccf_snr"]
+    assert value["n_effective_lines"] == payload["n_effective_lines"]
+
+
+def test_hdc_ccf_plot_skips_a_rejected_payload_and_plots_the_accepted_ones(
+    tmp_path: Path,
+) -> None:
+    """Review 2026-11-07 Issue 25: a rejected first payload must not hide the
+    accepted ones that follow it in the same record."""
+
+    rejected = _payload()
+    rejected["spectro_solution_accepted"] = False
+    accepted_a = _payload()
+    accepted_a["spectro_solution_accepted"] = True
+    accepted_b = _payload()
+    record = _record(
+        {
+            "characterization.hdc_ccf": rejected,
+            "characterization.hdc_ccf.ccf_a": accepted_a,
+            "characterization.hdc_ccf.ccf_b": accepted_b,
+        },
+        tmp_path,
+    )
+    collection = RunCollection(
+        config=SimpleNamespace(), records=(record,), output_dir=tmp_path
+    )
+
+    written = hdc_ccf(collection, tmp_path, ("png",))
+
+    assert written == (
+        tmp_path / "plots" / "hdc_ccf.png",
+        tmp_path / "plots" / "hdc_ccf_ccf_b.png",
+    )
+    assert all(path.exists() for path in written)
 
 
 def test_registered_hdc_ccf_writes_plot(tmp_path: Path) -> None:

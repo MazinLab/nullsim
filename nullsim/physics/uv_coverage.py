@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from numpy.typing import NDArray
@@ -153,6 +153,52 @@ def baselines_to_uv(
     return u_arr, v_arr
 
 
+def baselines_to_uv_with_origins(
+    baselines: Sequence[Baseline],
+    aperture_origins_enu_m: NDArray[np.floating],
+    hour_angle_rad: float | NDArray[np.floating],
+    declination_rad: float,
+    wavelength_m: float,
+    latitude_rad: float = np.radians(_MAUNAKEA_LAT_DEG),
+) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
+    """Project baselines into (u, v) with rigid intra-telescope pupil offsets.
+
+    Only the ground baseline between telescope origins,
+    ``origin_j - origin_i``, rotates with the Earth and is projected as in
+    ``baselines_to_uv`` (Thompson, Moran & Swenson Eqs. 4.1, 4.3). The
+    remainder of ``vector_enu_m`` is the pupil-frame sub-aperture offset;
+    the pupil tracks the target, so that offset is added unprojected as
+    ``(u, v) += (dE, dN) / wavelength``. Parallactic rotation of the pupil
+    is ignored, the same snapshot convention as the stages'
+    ``project_aperture_positions_for_pointing`` (review 2026-06-10
+    Issue 20). With one aperture per telescope this equals
+    ``baselines_to_uv``.
+
+    Args:
+        baselines: List of ``Baseline``; ``i`` and ``j`` index the rows of
+            ``aperture_origins_enu_m``.
+        aperture_origins_enu_m: ``(N, 3)`` ENU origin (m) of the telescope
+            hosting each aperture.
+        hour_angle_rad, declination_rad, wavelength_m, latitude_rad: as in
+            ``baselines_to_uv``.
+
+    Returns:
+        ``(u, v)`` with the shapes of ``baselines_to_uv``, in cycles per radian.
+    """
+
+    origins = np.asarray(aperture_origins_enu_m, dtype=np.float64)
+    i_idx = np.array([b.i for b in baselines], dtype=np.int64)
+    j_idx = np.array([b.j for b in baselines], dtype=np.int64)
+    origin_vec = origins[j_idx] - origins[i_idx]
+    pupil_vec = np.array([b.vector_enu_m for b in baselines], dtype=np.float64) - origin_vec
+    u, v = baselines_to_uv(
+        [replace(b, vector_enu_m=tuple(float(x) for x in o))
+         for b, o in zip(baselines, origin_vec)],
+        hour_angle_rad, declination_rad, wavelength_m, latitude_rad,
+    )
+    return u + pupil_vec[:, 0] / wavelength_m, v + pupil_vec[:, 1] / wavelength_m
+
+
 def compute_uv_tracks(
     baselines: Sequence[Baseline],
     declination_deg: float,
@@ -248,6 +294,7 @@ def project_positions_to_sky_plane_m(
 __all__ = [
     "Baseline",
     "baselines_to_uv",
+    "baselines_to_uv_with_origins",
     "compute_uv_tracks",
     "enumerate_subaperture_baselines",
     "project_positions_to_sky_plane_m",

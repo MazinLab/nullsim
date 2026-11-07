@@ -1971,11 +1971,19 @@ def _spectral_loss_page(record: RunRecord, page_num: int, total: int) -> plt.Fig
         # injection coupling) — otherwise this curve overstated delivered
         # pre-detector transmission by the chip's 2 dB relative to the
         # per-component panel directly above it (review 2026-06-10
-        # Issue 24).
+        # Issue 24). Detector QE components (detector.*_qe) are divided
+        # back out: this curve stops at the detector (review 2026-11-07
+        # row 64).
         field_applied = np.ones_like(t)
+        detector_qe = np.ones_like(t)
         any_field_applied = False
-        for payload in state.throughput.components.values():
+        for name, payload in state.throughput.components.items():
             if not isinstance(payload, dict):
+                continue
+            if name.startswith("detector.") and "qe" in payload:
+                qe = np.asarray(payload["transmission_fraction"], dtype=np.float64)
+                if qe.shape == t.shape:
+                    detector_qe *= qe
                 continue
             if payload.get("field_amplitude_applied") is not True:
                 continue
@@ -1986,7 +1994,7 @@ def _spectral_loss_page(record: RunRecord, page_num: int, total: int) -> plt.Fig
             if fraction_arr.shape == t.shape:
                 field_applied *= fraction_arr
                 any_field_applied = True
-        t_total = t * field_applied
+        t_total = t * field_applied / detector_qe
         ax2.fill_between(wl, 0, t_total * 100, color=_ACCENT, alpha=0.15)
         ax2.plot(wl, t_total * 100, "-o", color=_ACCENT, linewidth=1.6,
                  markersize=3.0)

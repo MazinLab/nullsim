@@ -7,8 +7,10 @@ spectrum. Direct port of ``kilo/studies/chip_diagnostics.run_study``
 ``state.results.components["chip_optimization_*"]`` payload.
 
 Chip-input field is recovered from the post-chip ``state.field`` by
-inverting the unitary (``U @ inp = out`` → ``inp = U^H @ out``) so no
-extra diagnostic state needs to be captured during the run.
+inverting the unitary at each wavelength bin (``U(λ) @ inp = out`` →
+``inp = U(λ)^H @ out``) so no extra diagnostic state needs to be captured
+during the run. Polarization channels (PBS arms) are kept separate through
+the recovery and their powers add incoherently in every panel.
 """
 
 from __future__ import annotations
@@ -47,7 +49,10 @@ def _plot_port_power(
     dark_idx: NDArray[np.int64],
     spectro_idx: NDArray[np.int64] | None = None,
 ) -> None:
-    """Panel 1: per-port fractional power for the stellar input."""
+    """Panel 1: per-port fractional power for the stellar input.
+
+    ``star_field`` is ``(M,)`` or ``(M, n_pol)``; arm powers add incoherently.
+    """
 
     m = u_center.shape[0]
     spectro_arr = (
@@ -55,8 +60,7 @@ def _plot_port_power(
         if spectro_idx is not None
         else np.empty(0, dtype=np.int64)
     )
-    star_output = u_center @ star_field
-    star_power = np.abs(star_output) ** 2
+    star_power = _output_power(u_center, star_field)
     star_frac = star_power / np.sum(star_power) if np.sum(star_power) > 0 else star_power
 
     for idx in bright_idx:
@@ -132,8 +136,15 @@ def _plot_null_vs_dac(
     wl_design_um: float,
     *,
     null_label: str = "Null",
+    reference_label: str = "Ideal (float64)",
 ) -> dict:
-    """Panel 3: null depth vs DAC bit precision (single-wavelength)."""
+    """Panel 3: null depth vs DAC bit precision (single-wavelength).
+
+    ``opt_params`` should be the optimizer's unquantized solution, so the
+    float64 reference line is the true unquantized chip. When only the
+    published (already DAC-quantized) params exist, the caller passes those
+    with ``reference_label="published (DAC quantized)"``.
+    """
 
     bit_values = list(range(4, 23))
     null_depths: list[float] = []
@@ -147,11 +158,9 @@ def _plot_null_vs_dac(
             dac_bits=bits,
             chromaticity_params=chip_params,
         )
-        u_q = stack[:, :, 0]
-        out = u_q @ star_field
-        total = float(np.sum(np.abs(out) ** 2))
-        null = float(np.sum(np.abs(out[null_idx]) ** 2))
-        null_depths.append(null / total if total > 0 else 0.0)
+        null_depths.append(
+            _null_fraction(_output_power(stack[:, :, 0], star_field), null_idx)
+        )
 
     # Ideal (no quantization)
     stack_ideal = _build_unitary_stack_numpy(
@@ -162,16 +171,12 @@ def _plot_null_vs_dac(
         dac_bits=None,
         chromaticity_params=chip_params,
     )
-    u_ideal = stack_ideal[:, :, 0]
-    out_ideal = u_ideal @ star_field
-    total_ideal = float(np.sum(np.abs(out_ideal) ** 2))
-    ideal_null = (
-        float(np.sum(np.abs(out_ideal[null_idx]) ** 2)) / total_ideal
-        if total_ideal > 0 else 0.0
+    ideal_null = _null_fraction(
+        _output_power(stack_ideal[:, :, 0], star_field), null_idx
     )
 
     ax.semilogy(bit_values, null_depths, "o-", color="C0", markersize=4, linewidth=1.5)
-    ax.axhline(ideal_null, color="gray", linestyle="--", linewidth=1, label="Ideal (float64)")
+    ax.axhline(ideal_null, color="gray", linestyle="--", linewidth=1, label=reference_label)
     for bits, color in ((16, "C2"), (20, "C3")):
         ax.axvline(bits, color=color, linestyle=":", alpha=0.6, linewidth=1)
         ax.text(
@@ -189,64 +194,45 @@ def _plot_null_vs_dac(
 
 def _plot_broadband_null(
     ax: plt.Axes,
-    opt_params: NDArray[np.float64],
-    chip_params: ChipOptimizationParams,
+    *,
+    u_stack: NDArray[np.complex128],
     star_field_design: NDArray[np.complex128],
     wavelength_grid_um: tuple[float, ...],
+    wl_design_um: float,
     null_idx: NDArray[np.int64],
-    deployed_u_stack: NDArray[np.complex128] | None = None,
-    physical_output_fields: NDArray[np.complex128] | None = None,
+    physical_inputs: NDArray[np.complex128] | None = None,
     null_port_label: str = "dark",
 ) -> dict:
     """Panel 4: chip intrinsic and physical per-wavelength null depths.
 
-    Applies the optimized chip unitary stack ``u_stack[:, :, k]`` to a
-    CLEAN nominal stellar field (real-valued, per-mode magnitudes from
+    Applies the chip unitary stack ``u_stack[:, :, k]`` (the deployed
+    chromatic stack when the optimizer published one, else rebuilt from the
+    params at each grid wavelength; F001 / Tier 3.1) to a CLEAN nominal
+    stellar field (real-valued, per-mode magnitudes from
     ``star_field_design``, wavelength-flat — matching the optimizer's
     ``_require_field`` convention) and reports dark-port leakage per
     wavelength. This is the chip's intrinsic chromatic response — phase
-    noise from AO / transport / delay lines does NOT enter here.
+    noise from AO / transport / delay lines does NOT enter here. With
+    several polarization arms the clean magnitude is the incoherent
+    per-mode sum ``sqrt(sum_p |E_p|^2)``.
 
-    When ``deployed_u_stack`` is provided, it's used verbatim — that's
-    the chromatic (M, M, n_wl) stack the broadband optimizer actually
-    evaluated and the chip stage deploys (Tier 3.1 option 2). Without
-    it we fall back to rebuilding from ``opt_params`` via
-    ``_build_unitary_stack_numpy``, which applies a single canonical
-    param vector with per-λ phi/alpha rescaling under the
-    lexicographic layout — for torch-broadband chips that yields the
-    narrow-band design-λ-only null instead of the deployed broadband
-    one (the F001-class chromatic mismatch).
-
-    When ``physical_output_fields`` is provided, this panel also recovers
-    the physical chip input at each wavelength via ``U(λ)^H @ E_out(λ)``
-    and replots its null. That second curve keeps transport, delay-line,
-    and polarization-chain chromatic phases visible instead of hiding
-    them behind the clean-input chip metric.
-
-    Pre-fix this panel read ``state.field.amplitudes`` (the post-chip
-    output ports of a single realization through the full pipeline), so
-    it showed the realized null with phase noise rather than the chip's
-    own broadband null. That conflated chip design quality with AO
-    realization noise.
+    When ``physical_inputs`` (``(M, n_wl, n_pol)``, recovered via
+    ``U(λ)^H @ E_out(λ)``) is provided, this panel also replots the
+    physical pipeline null, with arm powers summed incoherently. That
+    second curve keeps transport, delay-line, and polarization-chain
+    chromatic phases visible instead of hiding them behind the clean-input
+    chip metric.
     """
 
     wl_um = np.asarray(wavelength_grid_um, dtype=np.float64)
-    if deployed_u_stack is not None:
-        u_stack = deployed_u_stack
-    else:
-        u_stack = _build_unitary_stack_numpy(
-            params_vec=opt_params,
-            n_modes=chip_params.n_modes,
-            wavelength_grid_um=tuple(float(w) for w in wl_um),
-            wl_design_um=chip_params.wl_design_um,
-            dac_bits=chip_params.dac_bits,
-            chromaticity_params=chip_params,
-        )
 
     # Clean nominal field: per-mode magnitude from the recovered
     # design-wavelength input, phases stripped, broadcast across
     # wavelengths. Matches ``_require_field`` in chip_optimization.
-    per_mode_mag = np.abs(np.asarray(star_field_design)).astype(np.complex128)
+    design = np.asarray(star_field_design, dtype=np.complex128)
+    per_mode_mag = np.sqrt(
+        np.sum(np.abs(design.reshape(design.shape[0], -1)) ** 2, axis=1)
+    ).astype(np.complex128)
 
     clean_nd = _null_depth_spectrum(
         u_stack,
@@ -269,11 +255,7 @@ def _plot_broadband_null(
 
     physical_nd: NDArray[np.float64] | None = None
     physical_mean: float | None = None
-    if physical_output_fields is not None:
-        physical_inputs = _recover_physical_inputs(
-            u_stack,
-            physical_output_fields,
-        )
+    if physical_inputs is not None:
         physical_nd = _null_depth_spectrum(u_stack, physical_inputs, null_idx)
         physical_mean = float(np.mean(physical_nd))
         ax.semilogy(
@@ -294,7 +276,7 @@ def _plot_broadband_null(
             label=f"Physical pipeline mean: {physical_mean:.2e}",
         )
 
-    ax.axvline(chip_params.wl_design_um, color="0.3", linestyle=":", alpha=0.5, linewidth=1)
+    ax.axvline(wl_design_um, color="0.3", linestyle=":", alpha=0.5, linewidth=1)
     ax.axvspan(wl_um[0], wl_um[-1], color="C0", alpha=0.05)
     ax.set_xlabel(r"Wavelength ($\mu$m)")
     ax.set_ylabel(f"Null depth ({null_port_label} / total)")
@@ -314,64 +296,82 @@ def _plot_broadband_null(
     return result
 
 
+def _output_power(
+    u: NDArray[np.complex128],
+    fields: NDArray[np.complex128],
+) -> NDArray[np.float64]:
+    """Per-port power of ``u @ field``, summed incoherently over arms.
+
+    ``fields`` is ``(M,)`` or ``(M, n_pol)``.
+    """
+
+    fields = np.asarray(fields, dtype=np.complex128)
+    out = u @ fields.reshape(fields.shape[0], -1)
+    return np.sum(np.abs(out) ** 2, axis=1)
+
+
+def _null_fraction(power: NDArray[np.float64], null_idx: NDArray[np.int64]) -> float:
+    """Return null-port power over total power (0 for a dark input)."""
+
+    total = float(power.sum())
+    return float(power[null_idx].sum() / total) if total > 0.0 else 0.0
+
+
+def _as_pol_fields(
+    fields: NDArray[np.complex128],
+    shape: tuple[int, int],
+) -> NDArray[np.complex128]:
+    """Return ``fields`` as ``(M, n_wl, n_pol)``, adding a unit arm axis to 2-D input."""
+
+    fields = np.asarray(fields, dtype=np.complex128)
+    if fields.ndim == 2:
+        fields = fields[:, :, np.newaxis]
+    if fields.ndim != 3 or fields.shape[:2] != shape:
+        raise ValueError(
+            f"chip_diagnostics fields must have shape {shape} or "
+            f"{shape + ('n_pol',)}, got {fields.shape}."
+        )
+    return fields
+
+
 def _null_depth_spectrum(
     u_stack: NDArray[np.complex128],
     input_fields: NDArray[np.complex128],
     null_idx: NDArray[np.int64],
 ) -> NDArray[np.float64]:
-    """Return dark/total power for each wavelength in ``u_stack``."""
+    """Return null/total power for each wavelength in ``u_stack``.
 
-    fields = np.asarray(input_fields, dtype=np.complex128)
-    if fields.shape != (u_stack.shape[0], u_stack.shape[2]):
-        raise ValueError(
-            "chip_diagnostics input_fields must have shape "
-            f"({u_stack.shape[0]}, {u_stack.shape[2]}), got {fields.shape}."
-        )
-    null_depths = np.zeros(u_stack.shape[2], dtype=np.float64)
-    for k in range(u_stack.shape[2]):
-        out = u_stack[:, :, k] @ fields[:, k]
-        power = np.abs(out) ** 2
-        total = float(power.sum())
-        if total > 0.0:
-            null_depths[k] = float(power[null_idx].sum() / total)
-    return null_depths
+    ``input_fields`` is ``(M, n_wl)`` or ``(M, n_wl, n_pol)``; arm powers
+    add incoherently.
+    """
+
+    fields = _as_pol_fields(input_fields, (u_stack.shape[1], u_stack.shape[2]))
+    power = np.sum(np.abs(np.einsum("oik,ikp->okp", u_stack, fields)) ** 2, axis=2)
+    total = power.sum(axis=0)
+    null = power[null_idx].sum(axis=0)
+    return np.divide(null, total, out=np.zeros_like(total), where=total > 0.0)
 
 
 def _recover_physical_inputs(
     u_stack: NDArray[np.complex128],
     physical_output_fields: NDArray[np.complex128],
 ) -> NDArray[np.complex128]:
-    """Recover per-wavelength chip inputs from post-chip output fields."""
+    """Recover ``(M, n_wl, n_pol)`` chip inputs as ``U(λ)^H @ E_out(λ)`` per arm."""
 
-    outputs = np.asarray(physical_output_fields, dtype=np.complex128)
-    if outputs.ndim == 3:
-        outputs = outputs[:, :, 0]
-    if outputs.shape != (u_stack.shape[0], u_stack.shape[2]):
-        raise ValueError(
-            "chip_diagnostics physical_output_fields must have shape "
-            f"({u_stack.shape[0]}, {u_stack.shape[2]}) or "
-            f"({u_stack.shape[0]}, {u_stack.shape[2]}, n_pol), "
-            f"got {outputs.shape}."
-        )
-    recovered = np.empty_like(outputs, dtype=np.complex128)
-    for k in range(u_stack.shape[2]):
-        recovered[:, k] = u_stack[:, :, k].conj().T @ outputs[:, k]
-    return recovered
+    outputs = _as_pol_fields(
+        physical_output_fields, (u_stack.shape[0], u_stack.shape[2])
+    )
+    return np.einsum("oik,okp->ikp", u_stack.conj(), outputs, optimize=True)
 
 
 def _apply_unitary_stack(
     u_stack: NDArray[np.complex128],
     input_fields: NDArray[np.complex128],
 ) -> NDArray[np.complex128]:
-    """Apply ``u_stack[:, :, k]`` to each wavelength input vector."""
+    """Apply ``u_stack[:, :, k]`` to each wavelength input, per arm."""
 
-    fields = np.asarray(input_fields, dtype=np.complex128)
-    if fields.shape != (u_stack.shape[1], u_stack.shape[2]):
-        raise ValueError(
-            "chip_diagnostics input_fields must have shape "
-            f"({u_stack.shape[1]}, {u_stack.shape[2]}), got {fields.shape}."
-        )
-    return np.einsum("oik,ik->ok", u_stack, fields, optimize=True)
+    fields = _as_pol_fields(input_fields, (u_stack.shape[1], u_stack.shape[2]))
+    return np.einsum("oik,ikp->okp", u_stack, fields, optimize=True)
 
 
 def _deployed_stack_or_build(
@@ -413,6 +413,7 @@ def plot_chip_diagnostics(
     field_amplitudes: NDArray[np.complex128],
     wavelength_grid_um: tuple[float, ...],
     deployed_u_stack: NDArray[np.complex128] | None = None,
+    opt_params_unquantized: NDArray[np.float64] | None = None,
     null_idx_override: NDArray[np.int64] | None = None,
     null_port_label: str = "dark",
     title: str | None = None,
@@ -427,6 +428,13 @@ def plot_chip_diagnostics(
     canonical param vector via ``_build_unitary_stack_numpy`` would
     apply per-λ phi/alpha rescaling under the lexicographic layout and
     yield a different off-design chip than what was deployed (F001).
+    Without it the stack is rebuilt at every grid wavelength, so the chip
+    input at each bin is recovered with that bin's own ``U(λ)``.
+
+    ``opt_params_unquantized`` seeds the DAC sweep when the optimizer
+    published its pre-quantization solution; otherwise the sweep starts
+    from the published params and its reference line is labeled as the
+    quantized published chip.
     """
 
     fig = plt.figure(figsize=(12, 9))
@@ -441,28 +449,18 @@ def plot_chip_diagnostics(
     wl_arr = np.asarray(wavelength_grid_um, dtype=np.float64)
     design_bin = int(np.argmin(np.abs(wl_arr - chip_params.wl_design_um)))
 
-    # Prefer the deployed chromatic stack when present; otherwise
-    # rebuild monochromatically at wl_design from canonical params.
-    if deployed_u_stack is not None:
-        u_design = deployed_u_stack[:, :, design_bin]
-    else:
-        stack = _build_unitary_stack_numpy(
-            params_vec=opt_params,
-            n_modes=chip_params.n_modes,
-            wavelength_grid_um=(chip_params.wl_design_um,),
-            wl_design_um=chip_params.wl_design_um,
-            dac_bits=chip_params.dac_bits,
-            chromaticity_params=chip_params,
-        )
-        u_design = stack[:, :, 0]
-
-    # Recover the chip-input stellar field at the design wavelength from
-    # the post-chip ``state.field`` via U^H @ output. Unitary: U^H @ U = I.
-    if field_amplitudes.ndim == 3:
-        out_design = field_amplitudes[:, design_bin, 0]
-    else:
-        out_design = field_amplitudes[:, design_bin]
-    star_field_design = u_design.conj().T @ out_design
+    # Deployed chromatic stack when present, else rebuilt at every grid
+    # wavelength. Chip inputs are recovered per bin and per arm via
+    # U(λ)^H @ output (U^H @ U = I).
+    u_stack = _deployed_stack_or_build(
+        opt_params=opt_params,
+        chip_params=chip_params,
+        wavelength_grid_um=tuple(wavelength_grid_um),
+        deployed_u_stack=deployed_u_stack,
+    )
+    physical_inputs = _recover_physical_inputs(u_stack, field_amplitudes)
+    u_design = u_stack[:, :, design_bin]
+    star_field_design = physical_inputs[:, design_bin, :]
 
     bright_idx = np.arange(0, chip_params.n_bright_ports, dtype=np.int64)
     dark_start = chip_params.n_bright_ports
@@ -488,20 +486,25 @@ def plot_chip_diagnostics(
         spectro_idx,
     )
     _plot_unitary(ax_amp, ax_phase, u_design)
+    published_is_float = opt_params_unquantized is not None or chip_params.dac_bits is None
     _plot_null_vs_dac(
-        ax_dac, opt_params, chip_params, star_field_design, null_idx,
+        ax_dac,
+        opt_params if opt_params_unquantized is None else opt_params_unquantized,
+        chip_params, star_field_design, null_idx,
         wl_design_um=chip_params.wl_design_um,
         null_label=active_null_port_label.capitalize(),
+        reference_label=(
+            "Ideal (float64)" if published_is_float else "published (DAC quantized)"
+        ),
     )
     _plot_broadband_null(
         ax_bb,
-        opt_params=opt_params,
-        chip_params=chip_params,
+        u_stack=u_stack,
         star_field_design=star_field_design,
         wavelength_grid_um=wavelength_grid_um,
+        wl_design_um=chip_params.wl_design_um,
         null_idx=null_idx,
-        deployed_u_stack=deployed_u_stack,
-        physical_output_fields=field_amplitudes,
+        physical_inputs=physical_inputs,
         null_port_label=active_null_port_label,
     )
 
@@ -535,9 +538,15 @@ def _extract_chip_optimization(
     NDArray[np.float64],
     ChipOptimizationParams,
     NDArray[np.complex128] | None,
+    NDArray[np.float64] | None,
 ] | None:
     """Pull the optimal params + ChipOptimizationParams + (optional)
-    precomputed chromatic ``optimal_u_stack`` for a given record.
+    precomputed chromatic ``optimal_u_stack`` + (optional) pre-DAC
+    ``optimal_chip_params_unquantized`` for a given record.
+
+    The ChipOptimizationParams come from the stage that published the
+    deployed payload, matched by component name (review 2026-11-07
+    Issue 25), never from the first optimizer stage in the config.
 
     The torch backend (Tier 3.1 option 2) ships ``optimal_u_stack`` —
     the (M, M, n_wl) chromatic stack the broadband optimizer actually
@@ -563,24 +572,30 @@ def _extract_chip_optimization(
         if u_stack_raw is not None
         else None
     )
+    raw_unquantized = payload.get("optimal_chip_params_unquantized")
+    unquantized = (
+        np.asarray(raw_unquantized, dtype=np.float64)
+        if raw_unquantized is not None
+        else None
+    )
 
-    # Find the matching ChipOptimizationParams in the resolved config.
-    chip_opt_stage = _find_stage(record.config, "chip_optimization.scipy") \
-        or _find_stage(record.config, "chip_optimization.torch")
-    if chip_opt_stage is not None:
-        extra = getattr(chip_opt_stage, "model_extra", None) or {}
+    source_stage = _stage_for_component(record.config, "chip_optimization", source_key)
+    if source_stage is None:
+        return None
+    if source_stage.type != "chip_optimization.ideal_kernel":
+        extra = getattr(source_stage, "model_extra", None) or {}
         chip_params = ChipOptimizationParams(
             **{k: v for k, v in extra.items() if k != "id" and k != "type"}
         )
-        return opt_params, chip_params, u_stack
+        return opt_params, chip_params, u_stack, unquantized
 
     # HWO can use chip_optimization.ideal_kernel as a center-wavelength
     # seed and deploy the resulting physical Clements params through the
     # downstream chip stage. In that case the chromaticity knobs live on
     # chip.kernel_mzi_mesh, not on the optimizer stage.
-    ideal_stage = _find_stage(record.config, "chip_optimization.ideal_kernel")
+    ideal_stage = source_stage
     chip_stage = _find_stage(record.config, "chip.kernel_mzi_mesh")
-    if ideal_stage is None or chip_stage is None:
+    if chip_stage is None:
         return None
     allowed = set(ChipOptimizationParams.model_fields)
     payload_params: dict[str, Any] = {}
@@ -594,7 +609,21 @@ def _extract_chip_optimization(
             }
         )
     chip_params = ChipOptimizationParams(**payload_params)
-    return opt_params, chip_params, u_stack
+    return opt_params, chip_params, u_stack, unquantized
+
+
+def _stage_for_component(config: Any, base_name: str, component_key: str) -> Any:
+    """Return the stage spec that published ``component_key``.
+
+    Mirrors ``unique_component_name``: the first stage of the family to
+    publish takes the bare ``base_name``; later ones get
+    ``<base_name>.<stage id>``.
+    """
+
+    stages = [s for s in config.pipeline.stages if s.type.startswith(f"{base_name}.")]
+    if component_key == base_name:
+        return stages[0] if stages else None
+    return next((s for s in stages if component_key == f"{base_name}.{s.id}"), None)
 
 
 def _deployed_chip_optimization_source(
@@ -625,6 +654,7 @@ def _extract_characterization_spectro(
     NDArray[np.complex128],
     NDArray[np.int64],
     tuple[float, ...],
+    NDArray[np.float64] | None,
 ] | None:
     """Pull the characterization spectro chip payload for diagnostics."""
 
@@ -674,7 +704,13 @@ def _extract_characterization_spectro(
         wl_design_um=wl_design_um,
         dac_bits=dac_bits,
     )
-    return opt_params, chip_params, u_stack, spectro_idx, wavelength_grid_um
+    raw_unquantized = payload.get("optimal_chip_params_unquantized")
+    unquantized = (
+        np.asarray(raw_unquantized, dtype=np.float64)
+        if raw_unquantized is not None
+        else None
+    )
+    return opt_params, chip_params, u_stack, spectro_idx, wavelength_grid_um, unquantized
 
 
 def _characterization_wl_design_um(
@@ -725,9 +761,10 @@ def plot_characterization_chip_diagnostics_for_record(
     char_extracted = _extract_characterization_spectro(record)
     if char_extracted is None:
         return None
-    char_params, char_chip_params, char_stack, spectro_idx, char_wl_um = (
-        char_extracted
-    )
+    (
+        char_params, char_chip_params, char_stack, spectro_idx, char_wl_um,
+        char_unquantized,
+    ) = char_extracted
 
     state = record.result.state
     if state.field.amplitudes is None:
@@ -735,7 +772,7 @@ def plot_characterization_chip_diagnostics_for_record(
     detection_extracted = _extract_chip_optimization(record)
     if detection_extracted is None:
         return None
-    det_params, det_chip_params, det_stack_raw = detection_extracted
+    det_params, det_chip_params, det_stack_raw, _ = detection_extracted
     field_wl_um = tuple(float(w) for w in state.field.wavelength_grid_um)
     if len(field_wl_um) != char_stack.shape[2]:
         return None
@@ -754,7 +791,7 @@ def plot_characterization_chip_diagnostics_for_record(
         deployed_u_stack=det_stack_raw,
     )
     chip_inputs = _recover_physical_inputs(det_stack, state.field.amplitudes)
-    char_outputs = _apply_unitary_stack(char_stack, chip_inputs)[:, :, np.newaxis]
+    char_outputs = _apply_unitary_stack(char_stack, chip_inputs)
 
     title = (
         f"Characterization Chip Diagnostics (M = {char_chip_params.n_modes}, "
@@ -768,6 +805,7 @@ def plot_characterization_chip_diagnostics_for_record(
         field_amplitudes=char_outputs,
         wavelength_grid_um=char_wl_um,
         deployed_u_stack=char_stack,
+        opt_params_unquantized=char_unquantized,
         null_idx_override=spectro_idx,
         null_port_label="spectro",
         title=title,
@@ -789,7 +827,7 @@ def chip_diagnostics(
     extracted = _extract_chip_optimization(record)
     if extracted is None:
         return ()
-    opt_params, chip_params, deployed_u_stack = extracted
+    opt_params, chip_params, deployed_u_stack, opt_params_unquantized = extracted
 
     state = record.result.state
     if state.field.amplitudes is None:
@@ -807,6 +845,7 @@ def chip_diagnostics(
         field_amplitudes=state.field.amplitudes,
         wavelength_grid_um=tuple(wavelength_grid_um),
         deployed_u_stack=deployed_u_stack,
+        opt_params_unquantized=opt_params_unquantized,
         save_path=None,
     )
     _append_record_label_to_suptitle(fig, collection, record)

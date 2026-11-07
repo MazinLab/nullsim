@@ -187,7 +187,10 @@ def _analysis_matrix(
         for phase_i, phase in enumerate(phase_offsets_rad):
             row = edge_i * phase_offsets_rad.size + phase_i
             matrix[row, int(mode_a)] = scale
-            matrix[row, int(mode_b)] = scale * np.exp(1j * float(phase))
+            # e^{-i theta} on mode_b reproduces the measurement model
+            # 1 + V cos(phi_a - phi_b + theta) of
+            # physics.fringe_observability._measure_abcd_pair_edges.
+            matrix[row, int(mode_b)] = scale * np.exp(-1j * float(phase))
     return matrix
 
 

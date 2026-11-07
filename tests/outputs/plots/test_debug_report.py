@@ -543,3 +543,38 @@ def test_ft_disturbance_panel_renders_photon_kalman_payload(tmp_path: Path) -> N
     assert "uncorr sigma" in blob          # computed von Karman input
     assert "19.3 nm effective" in blob     # post-fusion broadband floor
     assert "atmosphere" in blob            # superseded OPD component listed
+
+
+def test_pre_detector_transmission_divides_out_detector_qe(tmp_path: Path) -> None:
+    """Review 2026-11-07 row 64: the cumulative curve stops before the detector."""
+    from matplotlib import pyplot as plt
+
+    from nullsim.outputs.plots.debug_report import _spectral_loss_page
+
+    record = _record_with_phase_b_payloads(tmp_path)
+    state = record.result.state
+    wl = state.throughput.wavelength_grid_um
+    pre_detector = np.array([0.5, 0.6, 0.55])
+    throughput = replace(
+        state.throughput,
+        transmission_fraction=tuple(pre_detector * 0.7),
+        components={
+            **state.throughput.components,
+            "detector.mkid_qe": {
+                "wavelength_grid_um": wl,
+                "transmission_fraction": (0.7, 0.7, 0.7),
+                "qe": 0.7,
+            },
+        },
+    )
+    record = replace(
+        record,
+        result=replace(record.result, state=replace(state, throughput=throughput)),
+    )
+    fig = _spectral_loss_page(record, 1, 1)
+    try:
+        ax = next(ax for ax in fig.axes if ax.get_ylabel() == "Transmission (%)")
+        plotted = np.asarray(ax.lines[0].get_ydata(), dtype=float)
+    finally:
+        plt.close(fig)
+    np.testing.assert_allclose(plotted, pre_detector * 100.0, rtol=1e-12)

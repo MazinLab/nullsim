@@ -6,6 +6,11 @@ grid of (u, v) tracks at Y-band, intra-telescope baselines colored ``C0``,
 inter-telescope baselines colored ``C3``. Both ``±(u, v)`` are scattered
 to show the Hermitian symmetry.
 
+Only the telescope origins are projected with hour angle; intra-telescope
+sub-aperture offsets ride rigid in the tracking pupil, so intra-telescope
+baselines are fixed points in (u, v) (review 2026-11-07 row 65, matching the
+science path's projection since review 2026-06-10 Issue 20).
+
 The plot is config-derivable: it reads telescope ENU positions,
 sub-aperture count, pupil template, and Maunakea latitude from the
 resolved config.
@@ -33,6 +38,7 @@ from nullsim.outputs.plots.subaperture_layout import (
 from nullsim.physics.pupil_geometry import optimize_subaperture_positions
 from nullsim.physics.uv_coverage import (
     Baseline,
+    baselines_to_uv_with_origins,
     compute_uv_tracks,
     enumerate_subaperture_baselines,
 )
@@ -54,24 +60,55 @@ _DEFAULT_INTEGRATION_CONFIGS: tuple[tuple[str, float, float], ...] = (
 )
 
 
+def _uv_tracks(
+    baselines: Sequence[Baseline],
+    aperture_origins_enu_m: np.ndarray | None,
+    dec_deg: float,
+    ha_start_deg: float,
+    ha_end_deg: float,
+    wavelength_m: float,
+    latitude_deg: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    n_steps = max(50, int((ha_end_deg - ha_start_deg) * 4))
+    if aperture_origins_enu_m is None:
+        return compute_uv_tracks(
+            baselines, dec_deg, ha_start_deg, ha_end_deg, n_steps,
+            wavelength_m, latitude_deg,
+        )
+    return baselines_to_uv_with_origins(
+        baselines,
+        aperture_origins_enu_m,
+        np.radians(np.linspace(ha_start_deg, ha_end_deg, n_steps)),
+        np.radians(dec_deg),
+        wavelength_m,
+        np.radians(latitude_deg),
+    )
+
+
 def plot_uv_coverage_grid(
     baselines: Sequence[Baseline],
     *,
     wavelength_m: float,
+    aperture_origins_enu_m: np.ndarray | None = None,
     declinations_deg: Sequence[float] = _DEFAULT_DECLINATIONS_DEG,
     integration_configs: Sequence[tuple[str, float, float]] = _DEFAULT_INTEGRATION_CONFIGS,
     latitude_deg: float = 19.8283,
     save_path: Path | None = None,
 ) -> plt.Figure:
-    """Render the (u, v) coverage grid figure. Direct port of KILO ``run_study``."""
+    """Render the (u, v) coverage grid figure. Port of KILO ``run_study``.
+
+    ``aperture_origins_enu_m`` (``(N, 3)``, the telescope origin of each
+    aperture) projects only the origins and keeps pupil offsets rigid;
+    without it every baseline is projected whole, which is exact only when
+    each aperture is its own telescope.
+    """
 
     # Global axis limit from the largest baseline + widest HA sweep.
     uv_limit = 0.0
     for dec in declinations_deg:
         for _, ha_start, ha_end in integration_configs:
-            n_steps = max(50, int((ha_end - ha_start) * 4))
-            u, v = compute_uv_tracks(
-                baselines, dec, ha_start, ha_end, n_steps,
+            u, v = _uv_tracks(
+                baselines, aperture_origins_enu_m, dec, ha_start, ha_end,
                 wavelength_m, latitude_deg,
             )
             uv_limit = max(
@@ -94,9 +131,8 @@ def plot_uv_coverage_grid(
 
     for i, dec in enumerate(declinations_deg):
         for j, (label, ha_start, ha_end) in enumerate(integration_configs):
-            n_steps = max(50, int((ha_end - ha_start) * 4))
-            u, v = compute_uv_tracks(
-                baselines, dec, ha_start, ha_end, n_steps,
+            u, v = _uv_tracks(
+                baselines, aperture_origins_enu_m, dec, ha_start, ha_end,
                 wavelength_m, latitude_deg,
             )
 
@@ -159,7 +195,9 @@ def _placeholder_figure(message: str) -> plt.Figure:
 # ---------------------------------------------------------------------------
 
 
-def _extract_baselines_from_config(config) -> list[Baseline]:
+def _extract_baselines_from_config(config) -> tuple[list[Baseline], np.ndarray]:
+    """Return the sub-aperture baselines and each aperture's telescope origin."""
+
     tel_stage = _find_stage(config, "telescope.fixed_aperture")
     if tel_stage is None:
         raise ValueError(
@@ -182,11 +220,12 @@ def _extract_baselines_from_config(config) -> list[Baseline]:
     sub_positions_pupil, _d_sub = optimize_subaperture_positions(
         n_sub, diameter_m, pupil,
     )
-    return enumerate_subaperture_baselines(
+    baselines = enumerate_subaperture_baselines(
         telescope_enu_m=telescope_enu_m,
         subaperture_pupil_m=np.asarray(sub_positions_pupil, dtype=np.float64),
         n_subapertures_per_telescope=n_sub,
     )
+    return baselines, np.repeat(telescope_enu_m, n_sub, axis=0)
 
 
 @register_plot
@@ -201,7 +240,9 @@ def uv_coverage_grid(
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        baselines = _extract_baselines_from_config(collection.config)
+        baselines, aperture_origins_enu_m = _extract_baselines_from_config(
+            collection.config
+        )
     except ValueError as exc:
         fig = _placeholder_figure(str(exc))
     else:
@@ -221,6 +262,7 @@ def uv_coverage_grid(
         fig = plot_uv_coverage_grid(
             baselines,
             wavelength_m=wavelength_m,
+            aperture_origins_enu_m=aperture_origins_enu_m,
             save_path=None,
         )
         fig.suptitle(
