@@ -215,8 +215,11 @@ def test_amplitude_and_joint_observability_judge_each_delay_state() -> None:
         good_min, blind_min = _per_delay_state_singular_values_torch(
             fn, 2, **kwargs
         ).numpy().min(axis=1)
-        assert blind_min < good_min
-        return float(np.sqrt(good_min * blind_min))
+        assert blind_min < 0.5 * good_min
+        # Not the geometric mean: the blind mode's singular value is exactly 0
+        # on some LAPACK builds (Linux CI), which would make the floor 0 and
+        # the floor-normalized hinge 0/0.
+        return float(0.5 * good_min)
 
     amp_floor = floor_between_states(
         _amplitude_observability_singular_values_torch, amp2
